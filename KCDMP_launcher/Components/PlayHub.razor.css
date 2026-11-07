@@ -1,0 +1,116 @@
+.play-hub {
+    width: min(1100px, 92vw);
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+    pointer-events: auto;
+}
+
+.hub-setup {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 12px 18px;
+    background: rgba(var(--kcd-shadow-rgb), 0.85);
+    border: 1px solid var(--kcd-warn);
+    color: var(--kcd-parchment);
+    font-size: 16px;
+}
+
+.hub-setup span:nth-child(2) { flex: 1; }
+
+.hub-setup-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--kcd-warn);
+    flex: none;
+}
+
+.hub-cards {
+    display: flex;
+    align-items: stretch;
+    gap: 18px;
+}
+
+.hub-card {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    padding: 26px 30px;
+    background: rgba(var(--kcd-shadow-rgb), 0.88);
+    border: 1px solid var(--kcd-oak-lit);
+    box-shadow: 0 0 40px rgba(var(--kcd-shadow-rgb), 0.9);
+}
+
+.hub-card.dim { opacity: 0.6; }
+
+.hub-card-title {
+    font-family: var(--kcd-font-special);
+    color: var(--kcd-gold);
+    font-size: 30px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+}
+
+.hub-card-sub {
+    color: var(--kcd-muted);
+    font-size: 15px;
+    margin: 6px 0 16px;
+}
+
+.hub-steps {
+    margin: 0 0 18px;
+    padding-left: 22px;
+    color: var(--kcd-parchment);
+    font-size: 16px;
+    line-height: 1.7;
+    flex: 1;
+}
+
+.hub-steps b { color: var(--kcd-gold-bright); font-weight: normal; }
+
+.hub-live {
+    color: var(--kcd-online);
+    font-size: 15px;
+    margin-bottom: 12px;
+}
+
+.hub-go {
+    align-self: flex-start;
+    min-width: 220px;
+    font-size: 18px;
+    padding: 12px 28px;
+}
+
+.hub-or {
+    align-self: center;
+    font-family: var(--kcd-font-special);
+    color: var(--kcd-muted);
+    font-size: 18px;
+    text-transform: uppercase;
+}
+
+.hub-notes {
+    color: var(--kcd-muted);
+    font-size: 14px;
+    text-align: center;
+}
+
+.hub-notes b { color: var(--kcd-parchment); font-weight: normal; }
+
+.hub-direct { text-align: center; }
+
+.hub-link {
+    color: var(--kcd-gold);
+    cursor: pointer;
+    text-decoration: underline;
+    text-underline-offset: 3px;
+}
+
+.hub-link:hover { color: var(--kcd-gold-bright); }
+
+@media (max-width: 900px) {
+    .hub-cards { flex-direction: column; }
+    .hub-or { margin: -6px 0; }
+}

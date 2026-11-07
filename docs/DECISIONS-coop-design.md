@@ -1,0 +1,43 @@
+# Co-op design decisions (settled)
+
+The maintainer's settled decisions for the split-save co-op design
+(WO-112 onwards). Recorded by WO-115 so every later WO reads them from one
+place. A row changes only when the maintainer changes it; a WO that finds a
+decision unworkable reports that instead of editing it here.
+
+| topic | decision |
+|---|---|
+| world | one world: the host's own save. The joiner never loads their own world in co-op |
+| join | joiner waits at the menu, receives the host's save, loads it; **host's world pauses** meanwhile |
+| joiner saving | locked all session; only the host writes world saves |
+| per-player | inventory incl. money, equipment, skills, perks, stats, health, status effects, position |
+| world-shared | quests, NPCs, horses, merchants, crime, reputation, **renown** |
+| first join | the joiner **chooses** (WO-125): **Bring my character** = their own newest Henry save, or **Start fresh** = a genuinely new starting Henry, **never a copy of the host's Henry**, not even on a new game. Every later join to that world restores the joiner's own Henry for it |
+| Henry files | **per world**, keyed by the save's playthrough seed; one world's Henry is never overwritten from another's; nothing is copied from the host. Stale worlds are cleaned up (90 days unjoined by default) |
+| matched pairs | a joiner's Henry for a world is only ever a snapshot taken at a host world save: anything after the last pair is **lost** on quit or crash, **never duplicated** |
+| "own" saves | a save with the host world's seed is **never** the joiner's own: not as the Bring source, not as the leave route's target, not in the Continue check. Such files are left alone (only warned about); saves the mod makes never stay in a playline |
+| no own save to leave to | the failed-load route back to the main menu (an empty listed file), with the launcher explaining the "Game load failed" box; never stuck, never a host-seed copy |
+| non-Henry stretches | prologue / Godwin: **no join**, detected and refused cleanly, the host never paused; what to do in them together belongs to quest sync |
+| story progress stat | always from the **host's** world (hidden stat id 8) |
+| host reload | the joiner reloads with the host; the joiner's Henry **rewinds** to the snapshot matching the host's save |
+| Henry snapshots | taken **when the host's game saves**, as a matched pair with the world (keyed by the host save's md5) |
+| saddlebags | per rider |
+| whistle | each player's horse comes to its own rider |
+| dialogue | world clock **keeps running** |
+| punishment | the Henry in the dialogue pays or is punished; **no time skip** |
+| sleeping | **both players must agree** (prompt); if declined, the sleeper gets the benefits without a skip |
+| death | respawn at the game's blackout wake-up spots; grave with everything except quest items |
+| fist knockdown | not a death: no grave, wake in place |
+| grave | lootable **by anyone for 3 in-game days**, then gone for everyone |
+| execution | a death: respawn outside that town + grave; **the crime is cleared** |
+| distance | **leash** (WO-114): a warning at **600 m**, a 10 s countdown past **650 m**, then the joiner is brought beside the host (the maintainer's numbers; the host decides, the joiner is the one brought back); no far-apart play |
+| respawn placement | (WO-114) a death wakes at the spot nearest the other player within 600 m of them, at least 100 m from the death and not the same spot as last time; none: beside them. No partner: the nearest spot ≥ 100 m |
+| fast travel | (WO-114) **only the host fast-travels**; the joiner is brought along when the host arrives; the joiner's own fast travel is refused with a message |
+| friendly fire | **on by default**, host lever `mp_friendly_fire on/off`, session-wide; shipped in 0.29.0 (WO-121). A partner's fist knockdown is never a death |
+| pausing | **no pausing in a co-op session, either direction**: neither player's menu, dialogue or cutscene stops the other's world (planned) |
+| cutscenes | whether story cutscenes play for both at once belongs to quest sync (later) |
+| privacy | the rule is about the **public repo**. Saves moving between the maintainer's own machines may carry account names |
+
+Design background: `docs/WO-112-split-save.md`. Where WO-112 laid out options
+(renown R1/R2, time T1–T3, punishment J1–J3, first join F1–F3, graves E1–E3),
+the rows above are the choices.

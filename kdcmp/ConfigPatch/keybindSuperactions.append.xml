@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="us-ascii"?>
+<!-- Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
+     GPLv3 section 7 additional terms: NOTICE. This project's own material only; Kingdom Come: Deliverance II and
+     its content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
+
+     WO-148: only OUR additions to the game's Libs/Config/keybindSuperactions.xml. The game's own file is never shipped.
+     On the player's machine the agent's keys-pak verb (KcdMpClient.exe, run by Setup and by the
+     launcher before every game start) reads the player's own copy out of the game's Data paks,
+     inserts the lines between the kdcmp_patch tags just before the end of its keybinds root, and writes the result into
+     Mods\kdcmp\Data\kdcmp_keys.pak (dotnet/KcdMp.Client/KeybindPak.cs). -->
+<kdcmp_patch target="Libs/Config/keybindSuperactions.xml" insert="end-of-root:keybinds">
+	<!-- KCD2MP (WO-6): multiplayer dice board input. Every control below is
+	     confirmed unclaimed ANYWHERE else in this file (checked against the
+	     full sorted list of every input="..." value used), but that alone
+	     was NOT sufficient proof of safety, learned the hard way: the Numpad
+	     operator keys (originally used for cast/bank/yield) turned out to be
+	     bound to engine-level debug toggles (AI/animation debug draw) that
+	     live entirely outside this XML, invisible to any check of this file's
+	     own contents. F1 (photo mode), F3 (flight mode) and F10 (poly/anim
+	     debug) are the same story among the F-keys. Every key actually used
+	     below was pressed live, one at a time, and confirmed to visibly do
+	     NOTHING before being wired up: the only real proof. H is ALSO in the
+	     "confirmed unclaimed in this file" set and is NOT safe: it opens a
+	     Modding Tools debug menu, hardcoded outside this XML same as the
+	     Numpad-operator/F1/F3/F10 traps. Bank/yield moved off F11/F12 to U/Y
+	     on request, freeing F11/F12 for a future invite-accept/decline bind.
+	     Hidden from the rebind menu (no ui_name/ui_tooltip, keyboard="hidden")
+	     since these are fixed defaults, not meant for player rebinding;
+	     mp_dice_mark/cast/bank/yield/cancel remain the console fallback.
+	     map="interaction" observed active whether standing or seated.
+
+	     WO-33: kcd2mp_dice_cast (F9) / kcd2mp_dice_bank (F11) /
+	     kcd2mp_dice_yield (F12) are ALSO the real invite/accept/decline binds
+	     outside an active match; no new keys added, since kdcmp.lua's
+	     handleAction only routes these three to the dice-board meaning while
+	     KCD2MP.dice.open is true, and to invite/accept/decline otherwise.
+	     Reusing them cost no new live key-testing: all three were already
+	     confirmed safe and unclaimed elsewhere when first wired up above.
+	     mp_invite dice / mp_accept / mp_decline remain the console fallback.
+	     See kdcmp.lua handleAction. -->
+	<superaction name="kcd2mp_dice_mark_1" ui_group="" keyboard="hidden">
+		<action name="kcd2mp_dice_mark_1" map="interaction" />
+		<control input="f2" controller="keyboard" />
+	</superaction>
+
+	<superaction name="kcd2mp_dice_mark_2" ui_group="" keyboard="hidden">
+		<action name="kcd2mp_dice_mark_2" map="interaction" />
+		<control input="f4" controller="keyboard" />
+	</superaction>
+
+	<superaction name="kcd2mp_dice_mark_3" ui_group="" keyboard="hidden">
+		<action name="kcd2mp_dice_mark_3" map="interaction" />
+		<control input="f5" controller="keyboard" />
+	</superaction>
+
+	<superaction name="kcd2mp_dice_mark_4" ui_group="" keyboard="hidden">
+		<action name="kcd2mp_dice_mark_4" map="interaction" />
+		<control input="f6" controller="keyboard" />
+	</superaction>
+
+	<superaction name="kcd2mp_dice_mark_5" ui_group="" keyboard="hidden">
+		<action name="kcd2mp_dice_mark_5" map="interaction" />
+		<control input="f7" controller="keyboard" />
+	</superaction>
+
+	<superaction name="kcd2mp_dice_mark_6" ui_group="" keyboard="hidden">
+		<action name="kcd2mp_dice_mark_6" map="interaction" />
+		<control input="f8" controller="keyboard" />
+	</superaction>
+
+	<superaction name="kcd2mp_dice_cast" ui_group="" keyboard="hidden">
+		<action name="kcd2mp_dice_cast" map="interaction" />
+		<control input="f9" controller="keyboard" />
+	</superaction>
+
+	<!-- Back on F11/F12: U/Y worked fine, but np_decimal (below) turned out not
+	     to be a recognised control name at all: silently no-op, not a
+	     hidden debug bind like the earlier traps, just an unverified guess at
+	     this engine's name for that key. Simplest fix: use only keys already
+	     proven end-to-end (F11/F12), and put cancel on U, which is confirmed
+	     both unclaimed AND actually wired correctly. Y is unused again. -->
+	<superaction name="kcd2mp_dice_bank" ui_group="" keyboard="hidden">
+		<action name="kcd2mp_dice_bank" map="interaction" />
+		<control input="f11" controller="keyboard" />
+	</superaction>
+
+	<superaction name="kcd2mp_dice_yield" ui_group="" keyboard="hidden">
+		<action name="kcd2mp_dice_yield" map="interaction" />
+		<control input="f12" controller="keyboard" />
+	</superaction>
+
+	<superaction name="kcd2mp_dice_cancel" ui_group="" keyboard="hidden">
+		<action name="kcd2mp_dice_cancel" map="interaction" />
+		<control input="u" controller="keyboard" />
+	</superaction>
+
+	<!-- KCD2MP (WO-154): the mod menu. None of these keys is named anywhere in the game's own
+	     Libs/Config/defaultProfile.xml or keybindSuperactions.xml (the 1.5.5 files, retail and
+	     Modding Tools identical, every input= and keyboard= value checked), and none is a key
+	     CryEngine keeps for itself (the console key, ScrollLock, Pause): Insert, PgUp, PgDn and End
+	     are read only by the console while it is open. NOT YET PRESSED LIVE one at a time (the WO-6
+	     rule above): that is the first item of the menu's live check.
+	     kcd2mp_menu_toggle's key is the player's choice: settings.json MenuKey (insert, np_add or
+	     np_subtract), written in here by the keys-pak verb when it builds the pak (KeybindPak.cs);
+	     "insert" below is the default. The other three are fixed. Hidden from the rebind menu like
+	     the dice keys; mp_menu open|close|up|down|change is the console fallback. -->
+	<superaction name="kcd2mp_menu_toggle" ui_group="" keyboard="hidden">
+		<action name="kcd2mp_menu_toggle" map="interaction" />
+		<control input="insert" controller="keyboard" />
+	</superaction>
+
+	<superaction name="kcd2mp_menu_up" ui_group="" keyboard="hidden">
+		<action name="kcd2mp_menu_up" map="interaction" />
+		<control input="pgup" controller="keyboard" />
+	</superaction>
+
+	<superaction name="kcd2mp_menu_down" ui_group="" keyboard="hidden">
+		<action name="kcd2mp_menu_down" map="interaction" />
+		<control input="pgdn" controller="keyboard" />
+	</superaction>
+
+	<superaction name="kcd2mp_menu_change" ui_group="" keyboard="hidden">
+		<action name="kcd2mp_menu_change" map="interaction" />
+		<control input="end" controller="keyboard" />
+	</superaction>
+
+	<!-- KCD2MP (WO-178): the quicksave key. The work order asked for F10; this build binds F10 itself (the Modding Tools
+	     build's debug map: togglepdrawhelpers), and the other F keys are the game's debug keys or the dice and invite keys
+	     above. Home is the nearest key the game names only in its own menus (resetting a key binding, map "menu"), never
+	     in play. kcd2mp_quicksave's key is the player's choice: settings.json QuickSaveKey (home, delete, np_add or
+	     np_subtract; never the menu key), written in here by the keys-pak verb (KeybindPak.cs WithQuickSaveKey). -->
+	<superaction name="kcd2mp_quicksave" ui_group="" keyboard="hidden">
+		<action name="kcd2mp_quicksave" map="interaction" />
+		<control input="home" controller="keyboard" />
+	</superaction>
+
+	<!-- KCD2MP (WO-202 VI): the mark key. One press marks the moment on both machines (a "Marked" toast on each; the menu's and the
+	     console's marks stay). Every letter is a key of the game's own "haste" action map (defaultProfile.xml haste_keya..z, U and Y
+	     too), the F keys are the game's or the mod's, and H, F1, F3, F10 and the numpad are the Modding Tools build's debug traps; the
+	     period key is named in neither of the game's two files (every input= and keyboard= value of the 1.5.5 files checked). Its live
+	     press (the WO-6 rule above): docs/WO-202-findings.md. -->
+	<superaction name="kcd2mp_mark" ui_group="" keyboard="hidden">
+		<action name="kcd2mp_mark" map="interaction" />
+		<control input="period" controller="keyboard" />
+	</superaction>
+</kdcmp_patch>

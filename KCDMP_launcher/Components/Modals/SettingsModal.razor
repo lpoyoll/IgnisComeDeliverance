@@ -1,0 +1,148 @@
+@* Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
+   GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
+   content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
+   Portions from the original project, marczukmichal/kcd2-multiplayer; its author keeps their copyright (AUTHORS). *@
+@inherits ModalBase
+@using KCDMP_launcher.Models
+@using KCDMP_launcher.Pages
+@using System.Windows.Forms
+@using System.Threading
+
+@if (IsVisible)
+{
+    <div class="modal-overlay @(isClosing ? "closing" : "" )">
+        <div class="modal-box" @onclick:stopPropagation="true">
+
+            <div class="modal-frame-top modal-frame-bg"></div>
+
+            <div class="modal-content" style="text-align: left;">
+                <div class="modal-title" style="text-align: center;">LAUNCHER SETTINGS</div>
+
+                <div class="kcd-input-group">
+                    <label class="kcd-label">Game Executable Path (Modding Tools build)</label>
+
+                    <div style="display: flex; gap: 10px;">
+                        <input class="kcd-input" @bind="Settings.GamePath" style="flex-grow: 1;" />
+
+                        <button class="kcd-btn" @onclick="BrowseGamePath" style="padding: 8px 15px; font-size: 12px;">
+                            BROWSE
+                        </button>
+                    </div>
+
+                    @if (!string.IsNullOrWhiteSpace(Settings.GamePath) && !Home.IsModdingToolsBuild(Settings.GamePath))
+                    {
+                        <div class="kcd-hint" style="color: var(--kcd-warn);">
+                            This does not look like the Modding Tools build. Multiplayer needs
+                            KCD2Mod\Bin\Win64ReleaseSteamLTO_DLL\KingdomCome.exe — the retail
+                            executable has no debug API and no module DLLs to hook.
+                        </div>
+                    }
+                </div>
+
+                <div class="kcd-input-group">
+                    <label class="kcd-label">Multiplayer DLL Path</label>
+                    <input class="kcd-input" @bind="Settings.DllPath" />
+                </div>
+
+                <div class="kcd-input-group">
+                    <label class="kcd-label">Agent Path (KcdMpClient.exe)</label>
+                    <input class="kcd-input" @bind="Settings.AgentPath" />
+                </div>
+
+                <div class="kcd-input-group">
+                    <label class="kcd-label">Master Server URL</label>
+                    <input class="kcd-input" @bind="Settings.MasterServerUrl" />
+                </div>
+
+                <div class="kcd-input-group">
+                    <label class="kcd-label">Master Server Path (auto-started when this URL is loopback)</label>
+                    <input class="kcd-input" @bind="Settings.MasterServerPath" />
+                </div>
+
+                <div class="kcd-input-group">
+                    <label class="kcd-label">Server Info Port</label>
+                    <input class="kcd-input" type="number" @bind="Settings.ServerInfoPort" />
+                </div>
+
+                <div class="kcd-input-group">
+                    <label class="kcd-label">Relay Path (used when hosting)</label>
+                    <input class="kcd-input" @bind="Settings.RelayPath" />
+                </div>
+
+                <div class="kcd-input-group">
+                    <label class="kcd-label">Host Port</label>
+                    <input class="kcd-input" type="number" @bind="Settings.HostPort" />
+                </div>
+
+                <div class="kcd-input-group">
+                    <label class="kcd-label" style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                        @* WO-154: the effective value (off unless the player chose on); a click is the player's choice *@
+                        <input type="checkbox" @bind="Settings.VoiceChatOn" />
+                        Voice Chat Enabled
+                    </label>
+                </div>
+
+                <div class="kcd-input-group">
+                    <label class="kcd-label" style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                        @* WO-175 S2: on by default; RESTORE SAVES in the bar below puts one back *@
+                        <input type="checkbox" @bind="Settings.BackupSavesBeforeSession" />
+                        Back up my saves before each session
+                    </label>
+                </div>
+
+                <div class="kcd-input-group">
+                    <label class="kcd-label" style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                        @* WO-207 C.2: on by default (the game sleeps behind another window otherwise, and the partner falls behind) *@
+                        <input type="checkbox" @bind="Settings.KeepGameRunningInBackground" />
+                        @KcdMp.Wire.KeepAwakeSetting.Label
+                    </label>
+                </div>
+
+                @* WO-127: advanced. Both players must pick the same one. *@
+                <div class="kcd-input-group">
+                    <label class="kcd-label">Advanced: Steam app for Steam connections</label>
+                    <select class="kcd-input" value="@Settings.SteamAppId" @onchange="e => Settings.SteamAppId = uint.TryParse(e.Value?.ToString(), out var a) ? a : 2429020u">
+                        <option value="2429020">KCD2 Modding Tools (2429020) - default</option>
+                        <option value="480">Spacewar (480) - Valve's test app</option>
+                        <option value="1771300">KCD2 retail (1771300)</option>
+                    </select>
+                    <div class="kcd-hint">Both players must use the same one. Leave it unless the tester page says otherwise.</div>
+                </div>
+
+                <div class="modal-actions">
+                    <button class="kcd-btn primary" @onclick="OnSave">SAVE & CLOSE</button>
+                    <button class="kcd-btn" @onclick="CloseModalAsync">CANCEL</button>
+                </div>
+            </div>
+
+            <div class="modal-frame-bottom modal-frame-bg"></div>
+        </div>
+    </div>
+}
+
+@code {
+    [Parameter] public AppSettings Settings { get; set; } = new();
+    [Parameter] public EventCallback OnSave { get; set; }
+
+    private void BrowseGamePath()
+    {
+        var thread = new Thread(() =>
+        {
+            var dialog = new OpenFileDialog();
+            dialog.Filter = "KingdomCome.exe|KingdomCome.exe|Executables (*.exe)|*.exe|All Files (*.*)|*.*";
+            // Both builds use this filename, so the title has to say which one.
+            dialog.Title = "Select KingdomCome.exe from the Modding Tools build (KCD2Mod\\Bin\\Win64ReleaseSteamLTO_DLL)";
+
+            if (dialog.ShowDialog() == DialogResult.OK)
+            {
+                Settings.GamePath = dialog.FileName;
+
+                InvokeAsync(StateHasChanged);
+            }
+        });
+
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        thread.Join();
+    }
+}

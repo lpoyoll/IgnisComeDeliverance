@@ -1,0 +1,494 @@
+// Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
+// GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
+// content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
+// WO-129: engine-free checks of the gait fix's pure half (native/KCDMP/gait_logic.h).
+// Exit code 0 = all passed. Run by tools\Build-Installer.ps1.
+//
+// The regression this guards: WO-121 wrote the stream's m/s straight into the
+// engine's pseudo-speed, which the engine reads as a logical speed CLASS
+// (id = (int)(x + 0.5) - 1 into a 3-entry table on the avatars). 1.4 m/s read
+// as walk by luck, 3.05 m/s (a jog) as sprint, and every sprint the player
+// streams (4.66-5.28 m/s) as id 3-4: out of range, no pace tag, a slide
+// ("requested logical speed id 4 is out of range 3" in both field logs).
+#include <cmath>
+#include <cstdio>
+#include <thread>
+#include <vector>
+
+#include "gait_logic.h"
+
+using namespace kcdmp::gait;
+
+int wo114_wake_tests(int* passed);   // wo114_wake_tests.cpp
+int wo133_port_gate_tests(int* passed);   // wo133_port_gate_tests.cpp
+int wo136_rules_tests(int* passed);        // wo136_rules_tests.cpp
+int wo137_rules_tests(int* passed);        // wo137_rules_tests.cpp
+int wo138_rules_tests(int* passed);        // wo138_rules_tests.cpp
+int wo139_rules_tests(int* passed);        // wo139_rules_tests.cpp
+int wo140_rules_tests(int* passed);        // wo140_rules_tests.cpp
+int wo141_rules_tests(int* passed);        // wo141_rules_tests.cpp
+int wo143_rules_tests(int* passed);        // wo143_rules_tests.cpp
+int wo148_x64_tests(int* passed);          // wo148_x64_tests.cpp
+int wo151_tests(int* passed);              // wo151_tests.cpp
+int wo155_rules_tests(int* passed);        // wo155_rules_tests.cpp
+int wo163_tests(int* passed);              // wo163_tests.cpp (WO-163: sync GUID offsets, MP-FIGHTSNAP)
+int wo165_tests(int* passed);              // wo165_tests.cpp (WO-165: the replay's call site, structs, outcome)
+int wo166_tests(int* passed);              // wo166_tests.cpp (WO-166: the quest write gates, the striking window, the line limiter)
+int wo167_tests(int* passed);              // wo167_tests.cpp (WO-167: a watched swing installed or not, the stand-in walk pulse)
+int wo170_tests(int* passed);
+int wo171_tests(int* passed);              // wo171_tests.cpp (WO-171: the marker picture's names and the literal swap)
+int wo174_tests(int* passed);              // wo174_tests.cpp (WO-174: the scripted-brawl guard's name rules)
+int wo176_tests(int* passed);              // wo176_tests.cpp (WO-176: the arranged-fight guard's rules, the fallback that routes nowhere, B2's referral)
+int wo177_tests(int* passed);              // wo177_tests.cpp (WO-177: the native log rotation)
+int wo190_tests(int* passed);              // wo190_tests.cpp (WO-190: trace limits, idle watch, stand-in weapon, re-queue gate, gait hold, swing takeover)
+int wo195_tests(int* passed);              // wo195_tests.cpp (WO-195: the dead copy's gates and its release mask)
+int wo200_tests(int* passed);              // wo200_tests.cpp (WO-200: the two gates' rules, the node gate's prologue)
+int wo201_tests(int* passed);              // wo201_tests.cpp (WO-201: B1's save-path cancel read out of its code, the per-frame rule)
+int wo202_tests(int* passed);              // wo202_tests.cpp (WO-202: the crash capture's rules, the field fixes' rules)
+int wo204_tests(int* passed);              // wo204_tests.cpp (WO-204: nearest_player_v2's Evaluate shape and compares, the quiet windows)
+int wo206_tests(int* passed);              // wo206_tests.cpp (WO-206: the per-copy pipe and log names)
+int wo208_tests(int* passed);              // wo208_tests.cpp (WO-208: the switch word, the talk's own-view rule, the owner's rules)
+int wo209_tests(int* passed);              // wo209_tests.cpp (WO-209: the switch word, the opponent mirror, the copy's own attack, the owner on every copy)
+int wo210_tests(int* passed);              // wo210_tests.cpp (WO-210: the switch word, the whole-body families, the watchdog, the clinch-loop detector)
+int wo211_tests(int* passed);              // wo211_tests.cpp (WO-211: the UI-dispatch guard, the overflow reseat, build ids)
+int wo214_tests(int* passed);              // wo214_tests.cpp (WO-214: one bind, the owner's base, combat end)
+int wo213_tests(int* passed);              // wo213_tests.cpp (WO-213: bands, the play-out delay, late postures)
+int wo203_tests(int* passed);              // wo203_tests.cpp (WO-203: every area's rules, one file per area)
+int wo197_tests(int* passed);              // wo197_tests.cpp (WO-197: the recoil and clinch polls, the kept main actions, the pair request)
+int wo194_tests(int* passed);              // wo194_tests.cpp (WO-194: the hold, its release, the time gate, the FastForward stop)
+int wo187_tests(int* passed);              // wo187_tests.cpp (WO-187: opponent wishes, guard hold, idle restore, per-weapon 0x10)
+int wo178_tests(int* passed);              // wo178_tests.cpp (WO-178: the hostility answer's rules, C4's hold and engine-like cap)
+int wo173_tests(int* passed);              // wo173_tests.cpp (WO-173: the reaction tail's sites, one blow once, the cap, the correction)
+int wo172_tests(int* passed);              // wo172_tests.cpp (WO-172: C1's dead gate)              // wo170_tests.cpp (WO-170: the figure guard's relayed-swing ledger, the put-back, the automation kept off)
+
+static int g_fail = 0, g_pass = 0;
+#define CHECK(cond, ...) do { if (cond) ++g_pass; else { ++g_fail; std::printf("FAIL  %s:%d  ", __FILE__, __LINE__); std::printf(__VA_ARGS__); std::printf("\n"); } } while (0)
+
+int main() {
+    // ---- the class bands -------------------------------------------------
+    CHECK(speed_class(0.0f) == 0.0f, "standing is class 0");
+    CHECK(speed_class(0.09f) == 0.0f, "below 0.1 m/s is standing");
+    CHECK(speed_class(NAN) == 0.0f, "NaN is standing");
+    CHECK(speed_class(-1.0f) == 0.0f, "negative is standing");
+    CHECK(speed_class(1.0f) == 1.0f && speed_class(1.4f) == 1.0f && speed_class(1.67f) == 1.0f && speed_class(2.0f) == 1.0f, "walk band");
+    CHECK(speed_class(3.02f) == 2.0f && speed_class(3.05f) == 2.0f && speed_class(3.5f) == 2.0f, "run band");
+    CHECK(speed_class(4.66f) == 3.0f && speed_class(5.28f) == 3.0f && speed_class(8.9f) == 3.0f, "sprint band");
+
+    // ---- what the engine makes of it (round(x)-1), and the clamp -----------
+    const int range = 3;   // the avatars' table (the field warnings: "out of range 3")
+    for (float mps : {0.2f, 1.4f, 1.67f, 2.0f, 3.05f, 4.66f, 4.71f, 5.28f, 7.0f}) {
+        const float cls = clamp_class(speed_class(mps), range);
+        const int id = engine_logical_id(cls);
+        CHECK(id >= 0 && id < range, "%.2f m/s -> class %.0f -> engine id %d, inside the %d-entry table", mps, cls, id, range);
+    }
+    // the WO-121 behaviour, for the record: m/s written raw
+    CHECK(engine_logical_id(4.71f) == 4 && engine_logical_id(4.71f) >= range, "raw 4.71 m/s was id 4 (the field warning)");
+    CHECK(engine_logical_id(3.05f) == 2, "raw 3.05 m/s read as id 2 (sprint) -- a jog shown as a sprint");
+    CHECK(engine_logical_id(clamp_class(speed_class(3.05f), range)) == 1, "3.05 m/s now reads as id 1 (run)");
+    CHECK(clamp_class(3.0f, 2) == 2.0f, "a 2-class body clamps a sprint to its top class");
+    CHECK(clamp_class(3.0f, 0) == 3.0f && clamp_class(3.0f, -1) == 3.0f, "unknown range caps at 3");
+    CHECK(clamp_class(1.0f, 1) == 1.0f, "a 1-class body keeps walk");
+
+    // ---- WO-154 5: the class with hysteresis -------------------------------
+    {
+        // the field's trot: 2.5-3.0 m/s around the walk/run boundary -- one class, no flapping
+        float cls = 1.0f;
+        int flips = 0;
+        const float trot[] = {2.30f, 2.50f, 2.35f, 2.60f, 2.45f, 2.90f, 2.30f, 3.00f, 2.28f, 2.70f};
+        float plain = speed_class(trot[0]);
+        int plainFlips = 0;
+        for (float s : trot) {
+            const float n = speed_class_hyst(s, cls); if (n != cls) ++flips; cls = n;
+            const float q = speed_class(s); if (q != plain) ++plainFlips; plain = q;
+        }
+        CHECK(flips == 1 && plainFlips == 7, "a pace wavering 2.28-3.00 m/s: 1 class change with the band, %d without (%d)", plainFlips, flips);
+        CHECK(speed_class_hyst(2.50f, 1.0f) == 1.0f, "walk stays walk at 2.50 (up needs 2.55)");
+        CHECK(speed_class_hyst(2.56f, 1.0f) == 2.0f, "walk -> run at 2.56");
+        CHECK(speed_class_hyst(2.30f, 2.0f) == 2.0f, "run stays run at 2.30 (down needs below 2.25)");
+        CHECK(speed_class_hyst(2.20f, 2.0f) == 1.0f, "run -> walk at 2.20");
+        CHECK(speed_class_hyst(4.10f, 2.0f) == 2.0f && speed_class_hyst(4.25f, 2.0f) == 3.0f, "run -> sprint only at 4.20+");
+        CHECK(speed_class_hyst(3.85f, 3.0f) == 3.0f && speed_class_hyst(3.75f, 3.0f) == 2.0f, "sprint -> run only below 3.80");
+        CHECK(speed_class_hyst(0.11f, 0.0f) == 0.0f && speed_class_hyst(0.14f, 0.0f) == 1.0f, "standing -> walk at 0.13+");
+        CHECK(speed_class_hyst(0.08f, 1.0f) == 1.0f && speed_class_hyst(0.05f, 1.0f) == 0.0f, "walk -> standing below 0.07");
+        CHECK(speed_class_hyst(6.0f, 1.0f) == 3.0f && speed_class_hyst(0.0f, 3.0f) == 0.0f, "a jump over classes is one change");
+        CHECK(speed_class_hyst(3.0f, -1.0f) == speed_class(3.0f), "no class yet: the plain class");
+    }
+
+    // ---- the table ---------------------------------------------------------
+    {
+        static Table<16, 8> t;
+        int dummy[64];
+        void* a = &dummy[0]; void* b = &dummy[16];
+        CHECK(t.find(a) == nullptr && t.live() == 0, "empty table");
+        const int ia = t.insert(a, 100);
+        CHECK(ia >= 0 && t.holds(ia, a) && t.live() == 1, "insert a");
+        CHECK(t.insert(a, 100) == ia && t.live() == 1, "a second insert finds the same slot");
+        t.publish(ia, 2.0f, 1.5f, -0.5f, 100);
+        float c = 0, x = 0, y = 0;
+        CHECK(t.read(a, 110, 30, &c, &x, &y) && c == 2.0f && x == 1.5f && y == -0.5f, "read back");
+        CHECK(!t.read(a, 131, 30, &c, &x, &y), "older than the stale window: ignored");
+        CHECK(!t.read(b, 100, 30, &c, &x, &y), "an unknown actor: nothing");
+        const int ib = t.insert(b, 100);
+        t.remove(ia);
+        CHECK(t.find(a) == nullptr && t.live() == 1, "remove a");
+        CHECK(t.find(b) != nullptr, "b still found past a's tombstone");
+        CHECK(t.insert(a, 200) >= 0 && t.live() == 2 && t.find(ib >= 0 ? b : a) != nullptr, "a tombstone is reused");
+        // fill up: a full probe window refuses, never corrupts
+        int refused = 0;
+        for (int i = 0; i < 40; ++i) if (t.insert(&dummy[i + 1], 1) < 0) ++refused;
+        CHECK(refused > 0 && t.live() <= 16, "a full table refuses inserts (%d refused, %d live)", refused, t.live());
+    }
+
+    // ---- concurrent readers while the main thread publishes ------------------
+    {
+        static Table<256> t;
+        static int bodies[40];
+        std::vector<int> idx;
+        for (int i = 0; i < 40; ++i) idx.push_back(t.insert(&bodies[i], 0));
+        std::atomic<bool> stop{false};
+        std::atomic<long> reads{0}, torn{0};
+        std::vector<std::thread> workers;
+        for (int w = 0; w < 4; ++w)
+            workers.emplace_back([&] {
+                while (!stop.load()) {
+                    for (int i = 0; i < 40; ++i) {
+                        float c, x, y;
+                        if (t.read(&bodies[i], 0, 1u << 30, &c, &x, &y)) {
+                            ++reads;
+                            if (!(c == 0.0f || c == 1.0f || c == 2.0f || c == 3.0f)) ++torn;
+                        }
+                    }
+                }
+            });
+        // publish until the readers have really raced it (not just started)
+        for (int frame = 0; frame < 20000 || reads.load() < 200000; ++frame) {
+            for (int i = 0; i < 40; ++i) t.publish(idx[i], static_cast<float>(frame % 4), 1.0f, 2.0f, 0);
+            if (frame > 50000000) break;
+        }
+        stop = true;
+        for (auto& th : workers) th.join();
+        CHECK(reads.load() > 0 && torn.load() == 0, "%ld concurrent reads, %ld torn classes", reads.load(), torn.load());
+    }
+
+    // WO-114: the wake spot within the leash (wo114_wake_tests.cpp)
+    {
+        int wp = 0;
+        const int wf = wo114_wake_tests(&wp);
+        g_pass += wp;
+        g_fail += wf;
+    }
+    // WO-133: the file-armed port trigger never fires in a session (wo133_port_gate_tests.cpp)
+    {
+        int pp = 0;
+        const int pf = wo133_port_gate_tests(&pp);
+        g_pass += pp;
+        g_fail += pf;
+    }
+    // WO-136: who an NPC turns to in a fight with both players; who takes over at the host's death
+    {
+        int rp = 0;
+        const int rf = wo136_rules_tests(&rp);
+        g_pass += rp;
+        g_fail += rf;
+    }
+    // WO-137: quest time sets are the host's; quests only; the config logged on a change
+    {
+        int qp = 0;
+        const int qf = wo137_rules_tests(&qp);
+        g_pass += qp;
+        g_fail += qf;
+    }
+    // WO-138: the native NPC sender's gates, the frame meter, the PauseGame gate
+    {
+        int np = 0;
+        const int nf = wo138_rules_tests(&np);
+        g_pass += np;
+        g_fail += nf;
+    }
+    // WO-139: trespass levels, the context allow-list, the punishment's time sets
+    {
+        int cp = 0;
+        const int cf = wo139_rules_tests(&cp);
+        g_pass += cp;
+        g_fail += cf;
+    }
+    // WO-140: the gated skip ids, the picker's edges, the thunk frame, the clock pull
+    {
+        int sp = 0;
+        const int sf = wo140_rules_tests(&sp);
+        g_pass += sp;
+        g_fail += sf;
+    }
+    // WO-141: synced stances, who owns the body, the 30-byte wire, in step, the pace, the one-shot
+    {
+        int ap = 0;
+        const int af = wo141_rules_tests(&ap);
+        g_pass += ap;
+        g_fail += af;
+    }
+    // WO-143: hands in step, the gait plan, the quieter log, the one-shot throttle, the look budget
+    {
+        int hp = 0;
+        const int hf = wo143_rules_tests(&hp);
+        g_pass += hp;
+        g_fail += hf;
+    }
+    // WO-148: the hooks' instruction-boundary check, every shipped hook's prologue, the log's thread column
+    {
+        int xp = 0;
+        const int xf = wo148_x64_tests(&xp);
+        g_pass += xp;
+        g_fail += xf;
+    }
+
+    // WO-155: the friendly-fire knockdown window
+    {
+        int fp = 0;
+        const int ff = wo155_rules_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+
+    // WO-163: the sync-attack GUID offsets and the MP-FIGHTSNAP accumulator
+    {
+        int fp = 0;
+        const int ff = wo163_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+
+    // WO-165: the replay's call-site parser, the structs we hand the engine, the outcome rule
+    {
+        int fp = 0;
+        const int ff = wo165_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+
+    // WO-166: the quest direct write's runtime and type gates (the field's 635 cases), C3's striking window, C5's line limiter
+    {
+        int fp = 0;
+        const int ff = wo166_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+
+    // WO-167: a watched swing's action status (shown = installed), the walk pulse for a fresh spawn
+    {
+        int fp = 0;
+        const int ff = wo167_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+
+    // WO-170: the figure guard (relayed swings licence one blow each, the rest is put back), the automation kept off
+    {
+        int fp = 0;
+        const int ff = wo170_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+
+    // WO-172: C1's dead gate (a soul's IsDead or the mod's mark; a reload's revival)
+    {
+        int fp = 0;
+        const int ff = wo172_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+
+    // WO-187: the opponent wishes, the guard hold, the figure's linger, the idle restore, the per-weapon perfect-blocked length
+    {
+        int fp = 0;
+        const int ff = wo187_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+
+    // WO-190: the animation trace's limits, the idle watch, the stand-in's weapon, the re-queue gate, the gait hold, the swing takeover
+    {
+        int fp = 0;
+        const int ff = wo190_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+
+    // WO-194: shared in-game cutscenes -- the hold, its release, the time gate, the FastForward stop
+    {
+        int fp = 0;
+        const int ff = wo194_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+
+    // WO-195: a dead copy is never held, wished or engaged; the release mask
+    {
+        int fp = 0;
+        const int ff = wo195_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+
+    // WO-200: the out-port tap and the node gate -- quiet clocks, captures, puppets, the host's closure rules, talker-only routing
+    {
+        int fp = 0;
+        const int ff = wo200_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+
+    // WO-201: the native half's rules
+    {
+        int fp = 0;
+        const int ff = wo201_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+
+    // WO-202: the crash capture's rules, the field fixes' rules
+    {
+        int fp = 0;
+        const int ff = wo202_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+
+    // WO-206: the per-copy pipe and log names (the test bench)
+    {
+        int fp = 0;
+        const int ff = wo206_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+
+    // WO-208: the switch word and its twins, the talk's own-view rule, the copy animation owner's rules
+    {
+        int fp = 0;
+        const int ff = wo208_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+
+    // WO-209: the switch word and its twins, the opponent mirror
+    {
+        int fp = 0;
+        const int ff = wo209_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+
+    // WO-210: the switch word, the whole-body families, the watchdog's verdicts, the clinch-loop detector
+    {
+        int fp = 0;
+        const int ff = wo210_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+
+    // WO-211: the UI-dispatch guard, the overflow reseat, build ids
+    {
+        int fp = 0;
+        const int ff = wo211_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+
+    // WO-213: bands, the play-out delay, late postures
+    {
+        int fp = 0;
+        const int ff = wo213_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+
+    // WO-214: a turn is a change, one bind per body, the owner's base, a combat action ends with its fight
+    {
+        int fp = 0;
+        const int ff = wo214_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+
+    // WO-204: nearest_player_v2 (Act I) and the copy animation owner's rules
+    {
+        int fp = 0;
+        const int ff = wo204_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+
+    // WO-203: every area's rules
+    {
+        int fp = 0;
+        const int ff = wo203_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+
+    // WO-197: the recoil and clinch polls, the main actions A6 keeps, the pair request
+    {
+        int fp = 0;
+        const int ff = wo197_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+
+    // WO-178: the hostility answer's rules, C4's hold and engine-like cap
+    {
+        int fp = 0;
+        const int ff = wo178_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+
+    // WO-177: the native log rotation
+    {
+        int fp = 0;
+        const int ff = wo177_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+
+    // WO-176: the arranged-fight guard's rules, the fallback that routes nowhere, B2's referral
+    {
+        int fp = 0;
+        const int ff = wo176_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+
+    // WO-174: the scripted-brawl guard's name rules
+    {
+        int fp = 0;
+        const int ff = wo174_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+
+    // WO-173: the reaction tail's sites, one blow once, the capped raw path, the health correction, down / up
+    {
+        int fp = 0;
+        const int ff = wo173_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+
+    // WO-171: the marker picture's names and the literal swap
+    {
+        int fp = 0;
+        const int ff = wo171_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+
+    // WO-151: the fault guard, the argument that owns its value, the frame-rate line
+    {
+        int fp = 0;
+        const int ff = wo151_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+
+    std::printf("%d passed, %d failed\n", g_pass, g_fail);
+    return g_fail == 0 ? 0 : 1;
+}

@@ -1,0 +1,912 @@
+// Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
+// GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
+// content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
+// Portions from the original project, marczukmichal/kcd2-multiplayer; its author keeps their copyright (AUTHORS).
+using ILogger = Serilog.ILogger;
+
+namespace KcdMp.Server.Features.ClientHandling;
+
+/// <summary>
+/// Helper class for client handling.
+///
+/// All members are thread-safe: connects and disconnects arrive on the accept
+/// loop while broadcasts and the info endpoint read the list concurrently, so
+/// the lock lives here rather than at each call site.
+/// </summary>
+public class ClientHandler
+{
+	private readonly ILogger _logger;
+	private readonly List<ClientSession> _clients = [];
+	private readonly HashSet<ClientSession> _readyClients = [];
+	private readonly object _lock = new();
+	private readonly int _maxPlayers;
+
+	// WO-76 (docs/WO-75-audit-findings.md s1): a free-list pool of the wire's
+	// byte-wide session ids. ClientSession.Id stays a byte until PR #3 widens
+	// it to uint; until then, an ever-incrementing counter wraps after 256
+	// connections in one relay lifetime and two live sessions can end up
+	// sharing an id. Reserved only here, when a handshake actually completes
+	// (TryMarkReady) -- a probe, a version mismatch, or a rejected-for-full
+	// connection never burns one -- and released back to the pool on
+	// disconnect (RemoveClient), so a long-lived relay can serve far more
+	// than 256 total connections without ever handing out a live-colliding id.
+	//
+	// WO-110 R4 (docs/WO-109-audit.md R4): LOWEST FREE ID FIRST, not FIFO.
+	// Damage/NPC authority is "the lowest ready id" (DamageAuthority below).
+	// With a FIFO pool a host-agent reconnect got a NEW id from the back of
+	// the queue (0 -> 2), so the joiner (1) became the authority for the rest
+	// of the session: NPC ownership, the pause side, the damage rule and
+	// weather silently inverted. A sorted pool hands a reconnecting client
+	// its old id back (nothing else can have taken it: only a new connection
+	// allocates, and it takes the lowest free), so authority stays put.
+	private readonly SortedSet<byte> _freeIds = new(Enumerable.Range(0, 256).Select(i => (byte)i));
+	private byte? _lastAuthorityId;   // WO-110 R4: for the MP-AUTHORITY-OWNER change log
+
+	// ---- WO-66 claim-update validation tunables ----
+	//
+	// Config-backed like Tcp:Port / Echo, with the shipped defaults inline.
+	// MaxSpeedMps: plausibility cap on how fast a claimed NPC may move between
+	// two ACCEPTED updates from its claim holder. The fastest legitimate mover
+	// on this channel is a world horse (the rescan tracks Horse-class
+	// entities); 40 m/s is roughly 3x a KCD2 horse gallop -- teleport-class
+	// garbage is orders of magnitude past it, so the headroom costs nothing.
+	// SlackMeters absorbs jitter when elapsed time between packets is tiny.
+	// Semantics ported from KCD2Online's npc_registry.cpp:240-248 (WO-64
+	// Phase 3): reject if distance > MaxSpeedMps * elapsed + SlackMeters.
+	private readonly double _maxNpcSpeedMps;
+	private readonly double _npcSpeedSlackMeters;
+
+	// ---- WO-81 claim-lifecycle logging tunables ----
+	//
+	// A claim transition (grant/release/reassignment) happens orders of
+	// magnitude less often than a per-tick position update, so unlike a hot
+	// path there is no real cost argument for shipping this off by default --
+	// and the project is actively bug-hunting the claim system on a live field
+	// report (a 2026-09-11 session describing NPC jitter that "fought over
+	// authority" when players stood close together). Visibility now is worth
+	// more than saving a few log lines nobody asked to see, so this defaults
+	// ON rather than requiring an operator to discover and flip a flag before
+	// the next incident. Same section as the WO-66 gates it instruments.
+	private readonly bool _claimLifecycleLoggingEnabled;
+	private readonly double _contestedGapSeconds;
+
+	public ClientHandler(ILogger logger, IConfiguration configuration)
+	{
+		_logger = logger;
+
+		// WO-76 (docs/WO-75-audit-findings.md s1): 0 was accepted at face
+		// value and refused every handshake (TryMarkReady's count-vs-limit
+		// check can never pass), bricking the relay with no indication why.
+		int configuredMaxPlayers = configuration.GetValue("ServerInfo:MaxPlayers", 64);
+		_maxPlayers = Math.Max(1, configuredMaxPlayers);
+		if (_maxPlayers != configuredMaxPlayers)
+			logger.Warning("[!] ServerInfo:MaxPlayers={Configured} is invalid; clamped to {Effective}.",
+				configuredMaxPlayers, _maxPlayers);
+		logger.Information("Max players: {MaxPlayers}", _maxPlayers);
+
+		_maxNpcSpeedMps      = configuration.GetValue("NpcClaimValidation:MaxSpeedMps", 40.0);
+		_npcSpeedSlackMeters = configuration.GetValue("NpcClaimValidation:SlackMeters", 2.0);
+
+		_claimLifecycleLoggingEnabled = configuration.GetValue("NpcClaimValidation:ClaimLifecycleLogging", true);
+		_contestedGapSeconds          = configuration.GetValue("NpcClaimValidation:ContestedGapSeconds", 10.0);
+	}
+
+	/// <summary>The effective (clamped) player cap, echoed in the ServerFull (0x36) packet.</summary>
+	public int MaxPlayers => _maxPlayers;
+
+	// ---- WO-110 R9: per-type drop counters ----
+	//
+	// Every exact-length check in ClientSession and the unknown-type skip used
+	// to drop silently: no log, no counter. 0.23.1 shipped a Position shape the
+	// relay dropped on a length check for a whole release with nothing to see
+	// (docs/WO-101-findings.md). Counted here by "0x<type>:<reason>", drained
+	// into one MP-RELAY-DROPS line every 60 s by TcpSocketService, only when
+	// anything was dropped. WO-66's plausibility rejects keep their own
+	// counters and lines; these are the FRAMING drops.
+	private readonly Dictionary<string, long> _drops = new();
+	private long _dropsTotal;
+	// WO-203 II.5: the same keys since the relay started, never cleared by DrainDropsLine -- the tests (and anything else that
+	// wants "has this type ever been dropped") read it through DropCount.
+	private readonly Dictionary<string, long> _dropsSinceStart = new();
+
+	public void CountDrop(byte type, string reason) => CountDrop(type, reason, -1);
+
+	/// <summary>
+	/// WO-203 II.5: with <paramref name="kind"/> >= 0 the key names the body's kind as well, "0x74/k21:&lt;reason&gt;" -- the
+	/// side channels many features share (Protocol.DropKeyHasKind), where the type alone does not say whose message it was.
+	/// </summary>
+	public void CountDrop(byte type, string reason, int kind)
+	{
+		lock (_drops)
+		{
+			string key = kind >= 0 ? $"0x{type:X2}/k{kind}:{reason}" : $"0x{type:X2}:{reason}";
+			Bump(_drops, key, type);
+			Bump(_dropsSinceStart, key, type);
+			_dropsTotal++;
+		}
+	}
+
+	// A reason can carry a length ("wrong-length:<len>"), so a peer sending garbage could make the keys many: past
+	// DropKeysMax distinct keys a new one is folded into "0x<type>:other" (still counted, still by type).
+	private const int DropKeysMax = 1024;
+
+	private static void Bump(Dictionary<string, long> d, string key, byte type)
+	{
+		if (!d.ContainsKey(key) && d.Count >= DropKeysMax) key = $"0x{type:X2}:other";
+		d[key] = d.TryGetValue(key, out var n) ? n + 1 : 1;
+	}
+
+	/// <summary>
+	/// WO-203 II.5: how many drops since the relay started have a key starting with <paramref name="keyPrefix"/> ("0x74" = every
+	/// W164 drop, "0x74/k21:" = the speech lines, "0x01:wrong-length" = ...). Not cleared by DrainDropsLine.
+	/// </summary>
+	public long DropCount(string keyPrefix)
+	{
+		lock (_drops)
+		{
+			long n = 0;
+			foreach (var kv in _dropsSinceStart)
+				if (kv.Key.StartsWith(keyPrefix, StringComparison.Ordinal)) n += kv.Value;
+			return n;
+		}
+	}
+
+	/// <summary>The MP-RELAY-DROPS line for the interval, or null when nothing was dropped; resets the interval counters.</summary>
+	public string? DrainDropsLine()
+	{
+		lock (_drops)
+		{
+			if (_drops.Count == 0) return null;
+			string by = string.Join(",", _drops.OrderByDescending(kv => kv.Value).Select(kv => $"{kv.Key}={kv.Value}"));
+			long interval = _drops.Values.Sum();
+			_drops.Clear();
+			return $"MP-RELAY-DROPS side=relay interval_s=60 dropped={interval} total={_dropsTotal} by={by}";
+		}
+	}
+
+	/// <summary>
+	/// Add a client.
+	///
+	/// Called when a client connects.
+	/// </summary>
+	/// <param name="client"></param>
+	public void AddClient(ClientSession client)
+	{
+		lock (_lock)
+			_clients.Add(client);
+	}
+
+	/// <summary>
+	/// Reserves one player slot and one wire id after a valid handshake. The
+	/// check and reserve happen under the same lock so simultaneous
+	/// handshakes cannot overbook the relay; a socket that never handshakes
+	/// consumes neither a player slot nor an id (WO-76).
+	/// </summary>
+	public bool TryMarkReady(ClientSession client)
+	{
+		lock (_lock)
+		{
+			if (_readyClients.Count >= _maxPlayers || _freeIds.Count == 0)
+				return false;
+
+			client.Id = _freeIds.Min;
+			_freeIds.Remove(client.Id);
+			return _readyClients.Add(client);
+		}
+	}
+
+	/// <summary>
+	/// Remove a client.
+	///
+	/// Called when a client disconnects. Only a client that was ever marked
+	/// ready holds a pooled id to release (WO-76) -- one that dropped mid- or
+	/// pre-handshake never reserved one.
+	/// </summary>
+	/// <param name="client"></param>
+	public void RemoveClient(ClientSession client)
+	{
+		lock (_lock)
+		{
+			_clients.Remove(client);
+			if (_readyClients.Remove(client))
+				_freeIds.Add(client.Id);
+		}
+	}
+
+	/// <summary>
+	/// WO-144 1.1: the older connections a newly ready client replaces -- the
+	/// same player (the same machine: TCP address or Steam peer, and the same
+	/// name) connecting again while his old connection is still here (his game
+	/// or agent restarted; a Steam connection lingers until its ~10-20 s
+	/// timeout, and for all that time the host counted a phantom partner). The
+	/// caller closes them at once; their Disconnect goes out as for any leave.
+	/// </summary>
+	public List<ClientSession> SupersededBy(ClientSession newer)
+	{
+		var list = new List<ClientSession>();
+		string key = newer.IdentityKey;
+		if (string.IsNullOrEmpty(key) || key.EndsWith(':') || key.EndsWith('?') || newer.Name is null) return list;
+		lock (_lock)
+			foreach (var c in _readyClients)
+				if (!ReferenceEquals(c, newer) && c.IsReady && c.IdentityKey == key
+				    && string.Equals(c.Name, newer.Name, StringComparison.Ordinal))
+					list.Add(c);
+		return list;
+	}
+
+	/// <summary>
+	/// Gets a copy of the client list to prevent outside manipulation.
+	/// </summary>
+	/// <returns></returns>
+	public ClientSession[] GetClients()
+	{
+		lock (_lock)
+			return _clients.ToArray();
+	}
+
+	/// <summary>
+	/// The client currently holding Rule 2's NPC→player damage authority
+	/// (WO-28), or null when nobody is connected yet.
+	///
+	/// Only one client's NPC simulation may generate hits against players, or
+	/// N peers produce N independent damage streams for one conceptual fight
+	/// and the damage multiplies by N -- see Protocol's 0x21 documentation.
+	///
+	/// Defined as the lowest-id ready client. That is the session host in
+	/// practice (the host's own agent connects to its local relay first), but
+	/// it is deliberately defined on the connection set rather than on who
+	/// started the relay process, because the relay cannot observe the latter
+	/// and because it must keep having an answer after the host leaves.
+	/// Derived on read from state the handler already keeps -- no world state
+	/// is introduced here.
+	/// </summary>
+	public ClientSession? DamageAuthority
+	{
+		get
+		{
+			lock (_lock) return PickAuthority(out _);
+		}
+	}
+
+	/// <summary>
+	/// WO-110 R4: the authority decision, with its reason. Two rules, in
+	/// order: (1) if exactly one ready client is connected over a loopback
+	/// socket, it is the relay host's own agent (the launcher starts relay and
+	/// agent on the same machine) and it is the authority whatever its id --
+	/// sticky across its own reconnects by construction; (2) otherwise the
+	/// lowest ready id, which the sorted id pool keeps stable across
+	/// reconnects. Rule 1 is inert for a dedicated relay box (no loopback
+	/// client) and for a two-peers-on-one-machine test (two loopback clients),
+	/// both of which fall through to rule 2 exactly as before.
+	///
+	/// WO-127 puts one rule in front: (0) a client that CLAIMS the host
+	/// (Position flag 0x40: the launcher started the relay for it, or it runs a
+	/// shared world from inside a world -- GameBridge.Wo127) is the authority,
+	/// whatever order people connected in. That closes WO-124's carry-forward
+	/// (with a remote relay the first to connect used to win). Several
+	/// claimants (two players each in their own world with the toggle on)
+	/// resolve among themselves by rules 1 and 2. A Steam session is never
+	/// loopback (RelayConnection), so a Steam joiner can never take rule 1
+	/// from the host's own agent.
+	/// </summary>
+	private ClientSession? PickAuthority(out string reason)
+	{
+		var claimants = new List<ClientSession>();
+		foreach (var c in _clients)
+			if (c.IsReady && c.ClaimsHost) claimants.Add(c);
+		if (claimants.Count == 1) { reason = "declared-host"; return claimants[0]; }
+		var pool = claimants.Count > 1 ? claimants : _clients.Where(c => c.IsReady);
+		string prefix = claimants.Count > 1 ? "declared-host+" : "";
+
+		ClientSession? loop = null; int loopN = 0;
+		ClientSession? lowest = null;
+		foreach (var c in pool)
+		{
+			if (c.IsLoopback) { loopN++; loop ??= c; }
+			if (lowest is null || c.Id < lowest.Id) lowest = c;
+		}
+		if (loopN == 1) { reason = prefix + "relay-local"; return loop; }
+		reason = lowest is null ? "none" : prefix + "lowest-id";
+		return lowest;
+	}
+
+	/// <summary>
+	/// WO-127: the connection test's "is the host's game here": a ready client
+	/// that claims the host, or the relay-local one (a pre-WO-127 host agent
+	/// never claims).
+	/// </summary>
+	public bool HasHostConnected()
+	{
+		lock (_lock)
+			return _clients.Any(c => c.IsReady && (c.ClaimsHost || c.IsLoopback));
+	}
+
+	// WO-127: the last release a joiner was refused for, for the host's launcher
+	// (GET api/local/status): the mixed-build check in plain words on both sides.
+	private string? _lastRefusedRelease;
+	private DateTime _lastRefusedUtc;
+
+	public void NoteRefusedRelease(string release)
+	{
+		lock (_lock) { _lastRefusedRelease = release; _lastRefusedUtc = DateTime.UtcNow; }
+	}
+
+	public (string? Release, DateTime Utc) LastRefusedRelease
+	{
+		get { lock (_lock) return (_lastRefusedRelease, _lastRefusedUtc); }
+	}
+
+	/// <summary>
+	/// WO-110 R4: one MP-AUTHORITY-OWNER line per authority decision (every
+	/// CombatRole broadcast: a client became ready or left). The line is
+	/// greppable in relay.log next to the agents' own MP-AUTHORITY-OWNER lines.
+	/// </summary>
+	public void LogAuthorityDecision(string trigger)
+	{
+		lock (_lock)
+		{
+			var a = PickAuthority(out var reason);
+			int ready = _readyClients.Count;
+			bool changed = a?.Id != _lastAuthorityId;
+			_lastAuthorityId = a?.Id;
+			_logger.Information("MP-AUTHORITY-OWNER id={Id} name={Name} reason={Reason} trigger={Trigger} ready={Ready} changed={Changed}",
+				a is null ? "-" : a.Id.ToString(), a?.Name ?? "-", reason, trigger, ready, changed ? 1 : 0);
+		}
+	}
+
+	/// <summary>True if <paramref name="client"/> currently holds damage authority.</summary>
+	public bool IsDamageAuthority(ClientSession client) =>
+		ReferenceEquals(DamageAuthority, client);
+
+	// ---- Time-skip sync (WO-38 Phase 1) ----
+	//
+	// The session's one active skip: whichever client's TimeSkipUp(start)
+	// arrived first owns it; everyone who starts a skip while it is active is
+	// recorded as joined instead of getting a competing claim. Deterministic
+	// by arrival order at this relay -- never by comparing finished results.
+	// Deliberately NOT tied to Rule 2's damage authority: any player's sleep
+	// counts (WO-38 spec), so this layer has its own first-come arbitration.
+
+	private byte? _skipOwnerId;
+	private DateTime _skipStartedUtc;
+	private readonly HashSet<byte> _skipJoined = [];
+
+	// Grace record of the most recently cleared skip, so a joined client
+	// whose own vanilla skip resolves shortly *after* the owner's still gets
+	// its result forwarded quietly rather than announced as a second skip.
+	private HashSet<byte>? _lastSkipJoined;
+	private DateTime _lastSkipClearedUtc;
+
+	/// <summary>What the relay should do with an inbound TimeSkipUp.</summary>
+	public enum TimeSkipRouting
+	{
+		/// <summary>Drop it (a duplicate start, or a joined player's start).</summary>
+		None,
+		/// <summary>Broadcast it as phase=start.</summary>
+		BroadcastStart,
+		/// <summary>Broadcast it as phase=done (announced).</summary>
+		BroadcastDone,
+		/// <summary>Broadcast it as phase=done-quiet (applied, not announced).</summary>
+		BroadcastDoneQuiet,
+	}
+
+	/// <summary>
+	/// A client reported a skip starting. First claim wins and is broadcast;
+	/// anyone else is joined to the active skip and their start is dropped.
+	/// </summary>
+	public TimeSkipRouting BeginTimeSkip(ClientSession client)
+	{
+		lock (_lock)
+		{
+			ExpireTimeSkipLocked();
+			if (_skipOwnerId is null)
+			{
+				_skipOwnerId = client.Id;
+				_skipStartedUtc = DateTime.UtcNow;
+				_skipJoined.Clear();
+				return TimeSkipRouting.BroadcastStart;
+			}
+			if (_skipOwnerId == client.Id)
+				return TimeSkipRouting.None;   // duplicate start marker for the same skip
+			_skipJoined.Add(client.Id);
+			return TimeSkipRouting.None;       // joined -- absorbed into the active skip
+		}
+	}
+
+	/// <summary>
+	/// A client reported a skip finishing (or a detected clock jump, which
+	/// arrives as a bare done). See <see cref="Protocol"/>'s 0x28 notes for the
+	/// three outcomes.
+	/// </summary>
+	public TimeSkipRouting CompleteTimeSkip(ClientSession client)
+	{
+		lock (_lock)
+		{
+			ExpireTimeSkipLocked();
+			if (_skipOwnerId is not null)
+			{
+				if (_skipOwnerId == client.Id)
+				{
+					ClearTimeSkipToGraceLocked();
+					return TimeSkipRouting.BroadcastDone;
+				}
+				// A joined player's own skip resolved before the owner's.
+				// Forward quietly: convergence without a second notification.
+				return TimeSkipRouting.BroadcastDoneQuiet;
+			}
+			if (_lastSkipJoined is not null
+			    && (DateTime.UtcNow - _lastSkipClearedUtc).TotalSeconds <= Protocol.TimeSkipJoinGraceSeconds
+			    && _lastSkipJoined.Contains(client.Id))
+				return TimeSkipRouting.BroadcastDoneQuiet;
+			// No active skip, not a late joiner: an instant skip (the
+			// fast-travel clock-jump shape). Announce it.
+			return TimeSkipRouting.BroadcastDone;
+		}
+	}
+
+	/// <summary>Clears the active skip if <paramref name="client"/> owned it -- called on disconnect.</summary>
+	public void ClearTimeSkipFor(ClientSession client)
+	{
+		lock (_lock)
+			if (_skipOwnerId == client.Id)
+				ClearTimeSkipToGraceLocked();
+	}
+
+	private void ExpireTimeSkipLocked()
+	{
+		if (_skipOwnerId is not null
+		    && (DateTime.UtcNow - _skipStartedUtc).TotalSeconds > Protocol.TimeSkipTimeoutSeconds)
+			ClearTimeSkipToGraceLocked();
+	}
+
+	private void ClearTimeSkipToGraceLocked()
+	{
+		_lastSkipJoined = [.. _skipJoined];
+		_lastSkipClearedUtc = DateTime.UtcNow;
+		_skipOwnerId = null;
+		_skipJoined.Clear();
+	}
+
+	// ---- WO-81 diagnostic position cache ----
+	//
+	// The relay already parses every Position (0x01) packet in ClientSession
+	// to build the outgoing Ghost packet, but never retained it -- Phase 0 of
+	// this WO confirmed there was no existing cache to reuse. This one exists
+	// SOLELY to answer "how far apart were the two players" on a contested
+	// claim log line; it is never read by RouteNpcState or any other decision
+	// path. Read-only observation, same discipline as every other diagnostic
+	// surface in this project -- see docs/WO-81-findings.md.
+	private readonly Dictionary<byte, (float X, float Y, float Z)> _playerPositions = [];
+
+	/// <summary>WO-81: records the sender's latest reported position, diagnostic-only.</summary>
+	public void RecordPlayerPosition(ClientSession sender, float x, float y, float z)
+	{
+		lock (_lock)
+			_playerPositions[sender.Id] = (x, y, z);
+	}
+
+	/// <summary>
+	/// WO-213 D.2: the 2D distance from (x, y) to the nearest player who reported a position (float.MaxValue when none did). Read for
+	/// the ORDER the scheduler sends bodies' states in, never for whether anything is forwarded.
+	/// </summary>
+	public float NearestPlayerM(float x, float y)
+	{
+		float best = float.MaxValue;
+		lock (_lock)
+			foreach (var p in _playerPositions.Values)
+			{
+				float dx = p.X - x, dy = p.Y - y, d = MathF.Sqrt(dx * dx + dy * dy);
+				if (d < best) best = d;
+			}
+		return best;
+	}
+
+	/// <summary>WO-81: drops a disconnected client's cached position.</summary>
+	public void ClearPlayerPositionFor(ClientSession client)
+	{
+		lock (_lock)
+			_playerPositions.Remove(client.Id);
+	}
+
+	/// <summary>
+	/// WO-81: Euclidean distance between two sessions' last-known positions,
+	/// or "unknown" if either has not reported one. Caller must already hold
+	/// <see cref="_lock"/> -- this reads <see cref="_playerPositions"/> directly.
+	/// </summary>
+	private string DistanceBetweenLocked(byte a, byte b)
+	{
+		if (!_playerPositions.TryGetValue(a, out var pa) || !_playerPositions.TryGetValue(b, out var pb))
+			return "unknown";
+		double dx = pa.X - pb.X, dy = pa.Y - pb.Y, dz = pa.Z - pb.Z;
+		return Math.Sqrt(dx * dx + dy * dy + dz * dz).ToString("F1", System.Globalization.CultureInfo.InvariantCulture);
+	}
+
+	// ---- Per-entity NPC authority (WO-39 Phase 2) ----
+	//
+	// The handoff item C of docs/WO-38-gaps-and-next-WOs.md asks for: "the
+	// player acting on a body owns that body's stream while acting on it."
+	// Same first-claim shape as the time-skip arbitration above, applied per
+	// entity name, and enforced HERE -- the relay is the single arbitration
+	// point, so two clients acting on the same body resolve deterministically
+	// by relay arrival order, never by comparing world states.
+	//
+	// There is deliberately NO claim packet. A non-authority client claims an
+	// entity simply by sending NpcStateUp for it (the mod only does that while
+	// its player is physically manipulating the body); the claim is refreshed
+	// by every packet and expires after NpcClaimTimeoutSeconds of silence, at
+	// which point the global authority's ordinary stream for that entity
+	// resumes flowing. The global authority's own packets never create claims
+	// -- its right to emit is the default, not a claim.
+	//
+	// This SUPERSEDES the WO-38 Phase 6 note that a non-authority's corpse
+	// drag crosses no machine. The receive side needs no change at all: the
+	// body-follow one-shot in KCD2MP_NpcPuppetTick applies whoever the sender
+	// is, and the echo loop is closed by this same gate (the authority's
+	// re-sample of a body someone else is driving is dropped here).
+
+	// WO-60 adds EngagedUtc: the last time the OWNER's packet carried the
+	// ENGAGED flag (its player actively fighting this NPC). While that is
+	// recent (NpcClaimEngagedHoldSeconds), the claim is HELD -- it cannot
+	// expire on silence and cannot be taken by anyone, so a menu pause or
+	// packet gap mid-fight cannot snap the entity to another sender's
+	// diverged stream and back (the flap this hold exists to prevent). A
+	// claim never engaged (a corpse drag) keeps the plain 5 s expiry
+	// unchanged. Disconnect still releases immediately either way.
+	//
+	// WO-66 adds X/Y/Z: the position of the last ACCEPTED update, the speed
+	// gate's baseline. It lives inside the claim entry ON PURPOSE: claim
+	// expiry, disconnect clear, and reclaim all destroy it with the entry, so
+	// a new claimant's first packet is never speed-checked against a previous
+	// owner's data -- it seeds a fresh baseline instead.
+	// WO-81 adds GrantedUtc: when this claim entry was first created, kept
+	// alongside LastUtc (last accepted refresh) so a release can log
+	// heldForSec -- how long the claim actually lasted, not just how stale it
+	// was when it finally lapsed.
+	private readonly Dictionary<string, (byte OwnerId, DateTime GrantedUtc, DateTime LastUtc, DateTime EngagedUtc, float X, float Y, float Z)> _npcClaims = [];
+
+	// WO-81: the previous owner and last-touched moment for a name that has
+	// been released, kept AFTER the entry leaves _npcClaims so the next claim
+	// on that name can tell "brand new" (granted) apart from "someone is
+	// reclaiming a body that had an owner before" (reassigned), and compute
+	// the gap between the two.
+	//
+	// LastActiveUtc is the released claim's OWN LastUtc (its last accepted
+	// packet), not the moment of removal. Removal is lazy -- an expired claim
+	// is only actually deleted when some later packet triggers the check in
+	// RouteNpcState, which for the reassignment path is the SAME packet that
+	// then grants the new claim. Stamping "now" at removal would therefore
+	// make every expiry-driven reassignment's gap read as ~0.0 regardless of
+	// how long the body actually sat unclaimed (caught by
+	// Test-NpcClaimLifecycle.ps1's T5 case). LastUtc is the real moment
+	// nobody was touching this claim any more, so "now - LastActiveUtc" is
+	// the genuine silence duration a rival reassignment interrupted.
+	//
+	// Overwritten on every release; never cleaned up otherwise -- the NPC
+	// name space here is bounded (named world NPCs + the capped ghost/horse
+	// pool), so this cannot grow unbounded over a relay's lifetime.
+	private readonly Dictionary<string, (byte PrevOwnerId, DateTime LastActiveUtc)> _recentReleases = [];
+
+	/// <summary>How <see cref="RouteNpcState"/> disposed of one NpcStateUp.</summary>
+	public enum NpcRoute
+	{
+		/// <summary>Accepted: fan it out.</summary>
+		Broadcast,
+		/// <summary>The authority's re-sample of an entity someone else is
+		/// driving -- the WO-39 echo-loop mute. Normal operation, not a
+		/// validation rejection: dropped quietly, not counted.</summary>
+		MutedEcho,
+		/// <summary>WO-66: claimed-NPC update implying implausible movement.</summary>
+		RejectSpeed,
+		/// <summary>WO-66: NPC state for one of the mod's own spawn names.
+		/// WO-90 widened this to every never-synced name family (see
+		/// Protocol.IsNeverSyncedNpcName -- mod spawns plus the engine's
+		/// "DialogTwin_*" conversation stand-ins) and moved the check ahead
+		/// of the damage-authority branch, so it now refuses the authority's
+		/// ambient stream too, not only a non-authority's claim.</summary>
+		RejectReservedName,
+		/// <summary>WO-66: update for a claimed NPC from a sender who is not
+		/// the current claim holder (a rival, or a former owner's late
+		/// packet after release-and-reclaim).</summary>
+		RejectStaleOwner,
+	}
+
+	// ---- WO-66 rejection counters ----
+	//
+	// One per reason tag; Interlocked because the rotation/finite counter is
+	// bumped from ClientSession outside _lock. Read at runtime through the
+	// relay's existing diagnostics surface, GET api/information/npc-validation
+	// (InformationController), alongside the [WO66-REJECT] log lines.
+	private long _rejectSpeed, _rejectRotation, _rejectReservedName, _rejectStaleOwner;
+
+	/// <summary>WO-66: count one rejected packet whose rotation (or position)
+	/// failed the finite check in ClientSession's framing layer.</summary>
+	public void CountNpcRejectRotation() => Interlocked.Increment(ref _rejectRotation);
+
+	/// <summary>WO-66: count one non-finite-position rejection (tagged under
+	/// the speed reason: it is the position-plausibility class).</summary>
+	public void CountNpcRejectSpeed() => Interlocked.Increment(ref _rejectSpeed);
+
+	/// <summary>Snapshot of the WO-66 rejection counters.</summary>
+	public NpcValidationCounters GetNpcValidationCounters() => new(
+		Interlocked.Read(ref _rejectSpeed),
+		Interlocked.Read(ref _rejectRotation),
+		Interlocked.Read(ref _rejectReservedName),
+		Interlocked.Read(ref _rejectStaleOwner));
+
+	// ---- WO-81 claim-lifecycle counters ----
+	//
+	// One per event kind, matching the [CLAIM]/[CLAIM-CONTESTED] log lines,
+	// same shape as WO-66's rejection counters above. Interlocked for the
+	// same reason: read from the HTTP endpoint outside _lock. ContestedByNpc
+	// is the one per-NPC breakdown kept (guarded by _lock, not Interlocked --
+	// it is only ever touched from inside RouteNpcState/ClearNpcClaimsFor,
+	// which already hold it): grants/releases/reassignments happen routinely
+	// for any claim-using feature, but a contested claim is the rare, actually
+	// diagnostic event this WO exists to surface, so only it gets a per-NPC
+	// breakdown -- a per-NPC table for the other three would just be a bigger
+	// version of the same totals for no analytical gain.
+	private long _claimGrants, _claimReleases, _claimReassignments, _claimContested;
+	private readonly Dictionary<string, long> _claimContestedByNpc = [];
+
+	// ---- WO-102 Phase 2 authority instrumentation ----
+	//
+	// The one lifecycle event the relay never logged: the damage authority's
+	// own stream for a claimed name being MUTED. That is the authority's
+	// implicit "request" being denied, and WO-98 S2 could not tell client-side
+	// from relay-side bias without it. Logged ONCE per claim ([CLAIM] muted),
+	// counted per packet; _mutedLogged is cleared with the claim (release,
+	// disconnect, reclaim) so a new claim logs again. _claimPackets counts the
+	// owner's accepted refreshes per claim and rides on the release line.
+	private long _authorityMutedClaims, _authorityMutedPackets;
+	private readonly HashSet<string> _mutedLogged = [];
+	private readonly Dictionary<string, long> _claimPackets = [];
+
+	/// <summary>Snapshot of the WO-81 claim-lifecycle counters.</summary>
+	public NpcClaimCounters GetNpcClaimCounters()
+	{
+		lock (_lock)
+			return new NpcClaimCounters(
+				Interlocked.Read(ref _claimGrants),
+				Interlocked.Read(ref _claimReleases),
+				Interlocked.Read(ref _claimReassignments),
+				Interlocked.Read(ref _claimContested),
+				new Dictionary<string, long>(_claimContestedByNpc),
+				Interlocked.Read(ref _authorityMutedClaims),
+				Interlocked.Read(ref _authorityMutedPackets));
+	}
+
+	/// <summary>
+	/// WO-81: logs and counts a contested claim -- a reassignment or a
+	/// stale-owner rejection whose gap since the current/previous owner's
+	/// last accepted packet is under <see cref="_contestedGapSeconds"/>. Caller
+	/// must already hold <see cref="_lock"/>.
+	/// </summary>
+	private void LogContestedLocked(string npcName, byte prevOwnerId, byte newOwnerId, double gapSec)
+	{
+		Interlocked.Increment(ref _claimContested);
+		_claimContestedByNpc.TryGetValue(npcName, out long count);
+		_claimContestedByNpc[npcName] = count + 1;
+		_logger.Information(
+			"[CLAIM-CONTESTED] npc={Npc} prevOwner={PrevOwner} newOwner={NewOwner} gapSec={GapSec:F1} distanceBetweenPlayers={Distance}",
+			npcName, prevOwnerId, newOwnerId, gapSec, DistanceBetweenLocked(prevOwnerId, newOwnerId));
+	}
+
+	/// <summary>
+	/// Decides whether one NpcStateUp for <paramref name="npcName"/> from
+	/// <paramref name="sender"/> may be broadcast, updating the per-entity
+	/// claim table. <paramref name="engaged"/> is the packet's
+	/// <see cref="Protocol.NpcStateFlagEngaged"/> bit; it only matters on a
+	/// claimant's own packets. <paramref name="x"/>/<paramref name="y"/>/
+	/// <paramref name="z"/> are the packet's position, for the WO-66 speed
+	/// gate. See the field comment for the claim rules.
+	///
+	/// WO-66 invariant: a rejected packet mutates NOTHING -- not the claim,
+	/// not its timestamps (so garbage cannot refresh a claim or re-arm the
+	/// engaged hold), not the baseline. It is bad data, not evidence the
+	/// owner is gone; a claim fed only garbage simply expires on the
+	/// ordinary silence path and the next claim re-seeds the baseline --
+	/// which is also how a genuine legitimate teleport (claimant reload)
+	/// self-heals within one expiry window.
+	/// </summary>
+	public NpcRoute RouteNpcState(ClientSession sender, string npcName, bool engaged, float x, float y, float z)
+	{
+		lock (_lock)
+		{
+			// WO-90: names that are never shareable at all, checked FIRST so
+			// the packet mutates nothing -- no claim, no timestamp, no
+			// baseline (the WO-66 invariant). Deliberately ahead of the
+			// damage-authority branch below: that branch returns Broadcast
+			// without ever reaching the old reserved-name gate, which is why
+			// the authority's ambient stream carried conversation stand-ins
+			// across all session (docs/WO-90-findings.md finding 3).
+			if (Protocol.IsNeverSyncedNpcName(npcName))
+			{
+				Interlocked.Increment(ref _rejectReservedName);
+				return NpcRoute.RejectReservedName;
+			}
+
+			var now = DateTime.UtcNow;
+			bool claimed = _npcClaims.TryGetValue(npcName, out var claim);
+			if (claimed
+			    && (now - claim.LastUtc).TotalSeconds > Protocol.NpcClaimTimeoutSeconds
+			    && (now - claim.EngagedUtc).TotalSeconds > Protocol.NpcClaimEngagedHoldSeconds)
+			{
+				_npcClaims.Remove(npcName);
+				claimed = false;
+				_claimPackets.TryGetValue(npcName, out long expiredPackets);
+				_claimPackets.Remove(npcName);
+				_mutedLogged.Remove(npcName);
+
+				if (_claimLifecycleLoggingEnabled)
+				{
+					_recentReleases[npcName] = (claim.OwnerId, claim.LastUtc);
+					Interlocked.Increment(ref _claimReleases);
+					// WO-102: packets= is the owner's accepted refresh count,
+					// silentSec= how long the owner had been silent when the
+					// expiry was noticed (the claim only expires when a packet
+					// for the name arrives, so this is >= NpcClaimTimeoutSeconds).
+					_logger.Information("[CLAIM] released npc={Npc} owner={Owner} reason=expiry heldForSec={HeldForSec:F1} packets={Packets} silentSec={SilentSec:F1} noticedBy={NoticedBy}",
+						npcName, claim.OwnerId, (now - claim.GrantedUtc).TotalSeconds, expiredPackets,
+						(now - claim.LastUtc).TotalSeconds, sender.Id);
+				}
+			}
+
+			if (IsDamageAuthority(sender))
+			{
+				// The default stream. Yields only to someone else's live claim.
+				if (!claimed || claim.OwnerId == sender.Id) return NpcRoute.Broadcast;
+				// WO-102 Phase 2: the authority's implicit request, denied.
+				Interlocked.Increment(ref _authorityMutedPackets);
+				if (_mutedLogged.Add(npcName))
+				{
+					Interlocked.Increment(ref _authorityMutedClaims);
+					if (_claimLifecycleLoggingEnabled)
+						_logger.Information("[CLAIM] muted npc={Npc} owner={Owner} authority={Authority} claimAgeSec={AgeSec:F1}",
+							npcName, claim.OwnerId, sender.Id, (now - claim.GrantedUtc).TotalSeconds);
+				}
+				return NpcRoute.MutedEcho;
+			}
+
+			if (claimed && claim.OwnerId != sender.Id)
+			{
+				// Someone else holds this body. Sender identity is the TCP
+				// session itself, so this also covers the stale-owner case: a
+				// former owner's late packet after release-and-reclaim arrives
+				// as a non-owner and lands here. Never releases anything.
+				Interlocked.Increment(ref _rejectStaleOwner);
+
+				// WO-81: this is "someone tried to take an actively-live
+				// claim" by definition -- claimed is only still true here
+				// because claim.LastUtc is within NpcClaimTimeoutSeconds (5s),
+				// which is well under the default 10s ContestedGapSeconds, so
+				// under shipped defaults every stale-owner rejection reports
+				// contested. That is not double-counting a coincidence: a
+				// rival being rejected because the claim is LIVE is exactly
+				// the contest this detector exists to surface, just via the
+				// rejection path rather than the reassignment path below.
+				if (_claimLifecycleLoggingEnabled)
+				{
+					double gapSec = (now - claim.LastUtc).TotalSeconds;
+					if (gapSec < _contestedGapSeconds)
+						LogContestedLocked(npcName, claim.OwnerId, sender.Id, gapSec);
+				}
+				return NpcRoute.RejectStaleOwner;
+			}
+
+			if (!claimed)
+			{
+				// (The never-synced name families -- our own spawns and the
+				// engine's conversation stand-ins -- were refused at the top
+				// of this method, on every path rather than only here.)
+				//
+				// First claim wins, by relay arrival order. This packet seeds
+				// the speed-gate baseline; it is deliberately not speed-checked
+				// (there is nothing of THIS owner's to check it against).
+				_npcClaims[npcName] = (sender.Id, now, now, engaged ? now : DateTime.MinValue, x, y, z);
+				_claimPackets[npcName] = 0;
+				_mutedLogged.Remove(npcName);
+
+				if (_claimLifecycleLoggingEnabled)
+				{
+					// WO-81: a name this WO has seen released before is a
+					// reassignment (someone claiming a body that had an owner);
+					// one it has never seen released is a fresh grant. A
+					// same-session reclaim of its own prior release (nobody
+					// else ever took it) is left as a grant too -- nothing was
+					// contested for that case.
+					if (_recentReleases.TryGetValue(npcName, out var released) && released.PrevOwnerId != sender.Id)
+					{
+						double gapSec = (now - released.LastActiveUtc).TotalSeconds;
+						Interlocked.Increment(ref _claimReassignments);
+						_logger.Information("[CLAIM] reassigned npc={Npc} prevOwner={PrevOwner} newOwner={NewOwner} gapSec={GapSec:F1}",
+							npcName, released.PrevOwnerId, sender.Id, gapSec);
+						if (gapSec < _contestedGapSeconds)
+							LogContestedLocked(npcName, released.PrevOwnerId, sender.Id, gapSec);
+					}
+					else
+					{
+						Interlocked.Increment(ref _claimGrants);
+						_logger.Information("[CLAIM] granted npc={Npc} owner={Owner} pos=({X:F1},{Y:F1},{Z:F1})",
+							npcName, sender.Id, x, y, z);
+					}
+				}
+				return NpcRoute.Broadcast;
+			}
+
+			// Owner refresh. Speed gate BEFORE the state write, so a rejected
+			// packet cannot refresh the claim or re-arm the engaged hold.
+			double elapsed = (now - claim.LastUtc).TotalSeconds;
+			double allowed = _maxNpcSpeedMps * elapsed + _npcSpeedSlackMeters;
+			double dx = x - claim.X, dy = y - claim.Y, dz = z - claim.Z;
+			if (dx * dx + dy * dy + dz * dz > allowed * allowed)
+			{
+				Interlocked.Increment(ref _rejectSpeed);
+				return NpcRoute.RejectSpeed;
+			}
+
+			_npcClaims[npcName] = (sender.Id, claim.GrantedUtc, now, engaged ? now : claim.EngagedUtc, x, y, z);
+			_claimPackets[npcName] = _claimPackets.GetValueOrDefault(npcName) + 1;   // WO-102
+			return NpcRoute.Broadcast;   // refresh (and re-arm the hold if still engaged; NOT logged -- see class notes)
+		}
+	}
+
+	/// <summary>
+	/// Drops every claim <paramref name="client"/> holds -- called on
+	/// disconnect, so a dragger who vanishes mid-drag releases their bodies
+	/// immediately instead of wedging them until the timeout.
+	/// </summary>
+	public void ClearNpcClaimsFor(ClientSession client)
+	{
+		lock (_lock)
+		{
+			var now = DateTime.UtcNow;
+			var mine = new List<string>();
+			foreach (var kv in _npcClaims)
+				if (kv.Value.OwnerId == client.Id) mine.Add(kv.Key);
+			foreach (var name in mine)
+			{
+				var claim = _npcClaims[name];
+				_npcClaims.Remove(name);
+				_claimPackets.TryGetValue(name, out long pk);
+				_claimPackets.Remove(name);
+				_mutedLogged.Remove(name);
+
+				if (_claimLifecycleLoggingEnabled)
+				{
+					_recentReleases[name] = (claim.OwnerId, claim.LastUtc);
+					Interlocked.Increment(ref _claimReleases);
+					_logger.Information("[CLAIM] released npc={Npc} owner={Owner} reason=disconnect heldForSec={HeldForSec:F1} packets={Packets}",
+						name, client.Id, (now - claim.GrantedUtc).TotalSeconds, pk);
+				}
+			}
+		}
+	}
+
+	/// <summary>
+	/// Returns the current player count.
+	/// </summary>
+	public int ClientCount
+	{
+		get
+		{
+			lock (_lock)
+				return _clients.Count;
+		}
+	}
+
+	/// <summary>
+	/// Clients that finished the handshake, as opposed to <see cref="ClientCount"/>
+	/// which includes a connection still mid-handshake or one that opened and
+	/// dropped without ever sending one -- exactly what a launcher's reachability
+	/// probe to the game port looks like from here. Used for the master server
+	/// listing (WO-35) so a probe cannot show up as a phantom player.
+	/// </summary>
+	public int ReadyClientCount
+	{
+		get
+		{
+			lock (_lock)
+				return _readyClients.Count;
+		}
+	}
+}

@@ -1,0 +1,63 @@
+mods - Shortcut.lnk
+memory.md
+.claude
+
+# Build output
+bin/
+obj/
+out/
+Debug/
+Release/
+publish/
+
+# Visual Studio / Rider IDE state — never commit
+.vs/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Probe output, regenerated per run
+tools/probe-results.txt
+
+# Compiled installer test harness (tools/Test-InstallerDetect.ps1 rebuilds it)
+installer/tests/*.exe
+
+# Native build tree (CMake + Ninja), and the plugin's own log
+native/build/
+kcdmp-native.log
+
+# The launcher's own log, written next to the repo root when it runs
+kcd_launcher.log
+
+# WO-120 probe reports (curate before committing anything from them)
+wo120-probe-*.txt
+
+# Python bytecode from the save tools (Read-SaveAnatomy.py imported by scripts)
+tools/__pycache__/
+
+# WO-151: the frame-rate soak's raw runs (the committed record carries the tables)
+tools/perf/runs/
+
+# WO-157: the code-signing settings (docs/CODE-SIGNING.md) -- never committed
+tools/signing.local.json
+
+# WO-156: a private reference study -- never committed or pushed
+research/
+
+# WO-159: the bundled start saves are the maintainer's play data: copied into the release build, never committed
+assets/start-save/*/*.whs
+
+# WO-161: the maintainer's tester bundles (zips of the players' logs) -- private, never committed
+/logs/
+
+# WO-174: the save tool's bytecode
+tools/savegame/__pycache__/
+tools/dev-input/keys.log
+
+# WO-211 0.2: the build id written before a build (tools/Write-BuildId.ps1)
+BUILD_ID
+
+# local builds
+/release/

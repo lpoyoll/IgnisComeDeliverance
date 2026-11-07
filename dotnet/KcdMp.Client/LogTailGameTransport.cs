@@ -1,0 +1,1240 @@
+﻿// Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
+// GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
+// content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
+using System.Globalization;
+using System.Text;
+
+namespace KcdMp.Client;
+
+/// <summary>
+/// The WO-1 replacement channel: the game pushes state into kcd.log and the
+/// agent tails it.
+///
+/// Deliberately hybrid, because the log only runs one way. Outbound
+/// (agent to game) still needs the debug API, so an <see cref="HttpGameTransport"/>
+/// is composed for that; this class replaces only the *inbound* direction,
+/// which is where the cost was:
+///
+///   before: 3 HTTP round trips per sample, ~128 ms, 7.8 samples/s
+///   after:  0 round trips -- reads whatever the emitter last pushed
+///
+/// The mod's KCD2MP_EmitTick writes one line per tick, which this parses into
+/// a cached <see cref="PlayerState"/>. Reads are then free and the sample rate
+/// is set by the Lua timer rather than by HTTP.
+///
+/// Three things the tail has to survive, all of them observed rather than
+/// hypothetical: the log is huge (3.5 MB during testing) and flooded with
+/// unrelated engine chatter, so it is opened at the end and never re-read; the
+/// game truncates or replaces it on restart, so shrinkage is detected and the
+/// handle reopened; and lines are written while we read, so a trailing partial
+/// line is held back until its newline arrives.
+/// </summary>
+public sealed class LogTailGameTransport : IGameTransport
+{
+    /// <summary>Emitted by KCD2MP_EmitState. Must match the Lua EMIT_VERSION.</summary>
+    private const string Tag = "[KCD2-MP-DATA]";
+
+    /// <summary>
+    /// The original WO-1 line: <c>v1 &lt;seq&gt; &lt;clock&gt; &lt;x&gt; &lt;y&gt; &lt;z&gt; &lt;rotZ&gt; &lt;flags&gt;</c>.
+    /// </summary>
+    private const string VersionV1 = "v1";
+
+    /// <summary>
+    /// WO-28 Flow A: the same line plus <c>&lt;health&gt; &lt;stamina&gt;</c>, and two
+    /// more flag bits (dead, unconscious).
+    ///
+    /// **Both versions are parsed, deliberately.** An agent and a kdcmp.pak are
+    /// separate installables that update independently -- the pak is rebuilt by
+    /// tools/Build-And-Install-Mod.ps1 and the agent by the installer -- so a
+    /// new agent reading an old pak's v1 lines is a real, ordinary state, not a
+    /// broken one. It degrades to "health unknown": position keeps working and
+    /// PlayerStateUp is simply never sent, rather than the tail rejecting every
+    /// line and the transport looking like a missing mod.
+    /// </summary>
+    private const string VersionV2 = "v2";
+
+    /// <summary>The emitter version of the most recent line parsed, for diagnostics.</summary>
+    public string? EmitterVersion { get; private set; }
+
+    /// <summary>
+    /// Discrete player actions, emitted by KCD2MP_EmitEvent on the same log
+    /// channel: [KCD2-MP-EVT] v1 &lt;seq&gt; &lt;name&gt; &lt;arg&gt;
+    ///
+    /// This is the only way anything travels game → agent. There is no socket
+    /// and no file API in the sandbox, so an accepted invite has to come out
+    /// through the log like everything else.
+    /// </summary>
+    private const string EventTag = "[KCD2-MP-EVT]";
+    private int _eventTagNotAnchored;   // WO-110 R15
+
+    /// <summary>
+    /// Raised for each game event line: (name, argument). The argument is the
+    /// raw remainder of the line, so an event can carry whatever it needs.
+    /// </summary>
+    public event Action<string, string>? GameEvent;
+
+    /// <summary>Events seen since start.</summary>
+    public long EventsReceived { get; private set; }
+
+    private readonly HttpGameTransport _http;
+    private readonly string _logPath;
+    private readonly int _emitIntervalMs;
+    private readonly CancellationTokenSource _cts = new();
+
+    private Task? _tailTask;
+    private volatile bool _emitterStarted;
+
+    // Latest parsed frame. Written by the tail loop, read by callers.
+    private readonly object _stateLock = new();
+    private PlayerState? _latest;
+    private long _latestSeq = -1;
+    private DateTime _latestAtUtc = DateTime.MinValue;
+
+    /// <summary>Frames parsed since start.</summary>
+    public long FramesReceived { get; private set; }
+
+    /// <summary>
+    /// WO-102 Phase 1: the sequence number of the most recent [KCD2-MP-DATA]
+    /// line parsed, or -1. A change here is one fresh sample on the log path
+    /// -- the agent's cadence instrumentation samples on it, so the log path
+    /// is measured on exactly the same footing as the native pipe path.
+    /// </summary>
+    public long LatestSeq { get { lock (_stateLock) return _latestSeq; } }
+
+    /// <summary>
+    /// Frames missing according to the emitter's sequence numbers. Non-zero
+    /// means the log dropped lines or the tailer could not keep up, which is
+    /// the signal that this transport is not delivering what it promises.
+    /// </summary>
+    public long FramesDropped { get; private set; }
+
+    /// <summary>
+    /// A sample older than this is treated as no sample. Generous relative to
+    /// the emit interval so a single late tick does not blank the state.
+    /// </summary>
+    public TimeSpan MaxAge { get; init; } = TimeSpan.FromMilliseconds(500);
+
+    public string Name => "kcd-log-tail";
+
+    /// <summary>Reads come from cached push state, so none.</summary>
+    public int RoundTripsPerStateRead => 0;
+
+    public LogTailGameTransport(HttpGameTransport http, string logPath, int emitIntervalMs = 20)
+    {
+        _http = http;
+        _logPath = logPath;
+        _emitIntervalMs = emitIntervalMs;
+    }
+
+    /// <summary>
+    /// Resolves kcd.log automatically. Throws if it cannot be found, because a
+    /// silently non-functional transport would look like a game that is simply
+    /// never ready.
+    /// </summary>
+    public static LogTailGameTransport Create(HttpGameTransport http, int emitIntervalMs = 20)
+    {
+        string path = KcdLogLocator.Find()
+            ?? throw new FileNotFoundException(
+                "Could not locate kcd.log in any Steam library. Set it explicitly to use the log-tail transport.");
+        return new LogTailGameTransport(http, path, emitIntervalMs);
+    }
+
+    public string LogPath => _logPath;
+
+    /// <summary>
+    /// Starts the tail loop and asks the mod to begin emitting. Safe to call
+    /// repeatedly; the Lua side is idempotent too.
+    /// </summary>
+    public async Task StartAsync(CancellationToken ct = default)
+    {
+        _tailTask ??= Task.Run(() => TailLoopAsync(_cts.Token), CancellationToken.None);
+
+        if (!_emitterStarted)
+        {
+            // Flush explicitly: the HTTP transport batches by default, and a
+            // buffered start command would sit unsent while we wait for frames
+            // that can never arrive -- which reads exactly like a missing mod.
+            await _http.ExecuteAsync($"KCD2MP_StartEmitter({_emitIntervalMs})", ct);
+            await _http.FlushAsync(ct);
+            _emitterStarted = true;
+        }
+    }
+
+    /// <summary>
+    /// Forgets that the emitter-start command was already sent, so a following
+    /// <see cref="StartAsync"/> issues it again (WO-13). The send path swallows
+    /// its own exceptions, so a lost start command is indistinguishable from a
+    /// missing mod without simply asking twice.
+    /// </summary>
+    public void ResetEmitterStart() => _emitterStarted = false;
+
+    /// <summary>The mod's init line (the second of its two; see <see cref="ModInitDetected"/>).</summary>
+    public const string ModInitMarker = "[KCD2-MP] MOD INIT";
+
+    /// <summary>
+    /// The 0.62.7 field fix: did the mod's Lua initialise in this launch? The game writes kcd.log afresh at every launch, so
+    /// its init line anywhere in the file means the mod is loaded. The agent that started while a save was still settling
+    /// saw no emitter frame in its 6 s, took that for a missing mod and ran the whole session over the debug API (the
+    /// game's queue 99 s behind, the join's world save never ran): a loaded mod whose timers have not ticked yet is not a
+    /// missing mod. Read shared (the game holds the file open); false when it cannot be read.
+    /// </summary>
+    public static bool ModInitInLog(string path)
+    {
+        try
+        {
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            using var r = new StreamReader(fs, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+            return ModInitIn(r);
+        }
+        catch (IOException) { return false; }
+        catch (UnauthorizedAccessException) { return false; }
+    }
+
+    /// <summary><see cref="ModInitInLog"/>'s scan: the init line at the start of a line (a quoted copy does not count).</summary>
+    public static bool ModInitIn(TextReader r)
+    {
+        for (string? line = r.ReadLine(); line is not null; line = r.ReadLine())
+            if (line.StartsWith(ModInitMarker, StringComparison.Ordinal)) return true;
+        return false;
+    }
+
+    public Task<bool> IsGameReadyAsync(CancellationToken ct = default) =>
+        _http.IsGameReadyAsync(ct);
+
+    public Task<PlayerState?> ReadPlayerStateAsync(CancellationToken ct = default)
+    {
+        lock (_stateLock)
+        {
+            if (_latest is null || DateTime.UtcNow - _latestAtUtc > MaxAge)
+                return Task.FromResult<PlayerState?>(null);
+            return Task.FromResult(_latest);
+        }
+    }
+
+    public Task ExecuteAsync(string lua, CancellationToken ct = default) =>
+        _http.ExecuteAsync(lua, ct);
+
+    public void RequestFlush() => _http.RequestFlush();   // WO-207 B.3
+
+    public Task FlushAsync(CancellationToken ct = default) =>
+        _http.FlushAsync(ct);
+
+    // Appearance (WO-9) has no push-based equivalent -- it always goes
+    // through the debug REST API regardless of which transport reads
+    // position, so these simply delegate to the composed HttpGameTransport
+    // exactly like ExecuteAsync/FlushAsync above.
+    public Task<Guid[]?> ReadEquippedItemClassesAsync(CancellationToken ct = default) =>
+        _http.ReadEquippedItemClassesAsync(ct);
+
+    public Task<Guid[]?> ReadGhostEquippedItemClassesAsync(string ghostSoulName, CancellationToken ct = default) =>
+        _http.ReadGhostEquippedItemClassesAsync(ghostSoulName, ct);
+
+    public Task EquipItemOnGhostAsync(string ghostSoulName, Guid itemClass, bool createIfMissing, CancellationToken ct = default) =>
+        _http.EquipItemOnGhostAsync(ghostSoulName, itemClass, createIfMissing, ct);
+
+    public Task UnequipItemOnGhostAsync(string ghostSoulName, Guid itemClass, CancellationToken ct = default) =>
+        _http.UnequipItemOnGhostAsync(ghostSoulName, itemClass, ct);
+
+    public Task<Guid?> ReadGhostSoulGuidAsync(string ghostSoulName, CancellationToken ct = default) =>
+        _http.ReadGhostSoulGuidAsync(ghostSoulName, ct);
+
+    public Task<string?> ReadSoulNameByGuidAsync(Guid soulGuid, CancellationToken ct = default) =>
+        _http.ReadSoulNameByGuidAsync(soulGuid, ct);
+
+    public Task<(Guid? Guid, string? Name)> ReadPlayerSoulIdentityAsync(CancellationToken ct = default) =>
+        _http.ReadPlayerSoulIdentityAsync(ct);
+
+    public Task ExecuteNowAsync(string lua, CancellationToken ct = default) =>
+        _http.ExecuteNowAsync(lua, ct);
+
+    /// <summary>
+    /// Raised when the local player's aggregate pause-like state changes
+    /// (WO-11): true on entering any tracked UI state, false when the last
+    /// one clears. Aggregated from independent enter/exit marker pairs in
+    /// <see cref="ProcessPauseMarkers"/> so two overlapping states (e.g.
+    /// opening inventory while a skip-time animation is still resolving)
+    /// don't produce a spurious "exited" when only one of them closes.
+    ///
+    /// Raised on the tail loop's thread, same discipline as
+    /// <see cref="GameEvent"/> -- subscribers must not block.
+    /// </summary>
+    public event Action<bool>? PauseStateChanged;
+
+    /// <summary>
+    /// Raised on the skip-time marker edges specifically (WO-38 Phase 1):
+    /// true when the AfterSkipTime readiness observer starts waiting, false
+    /// when it reports ready. The aggregate <see cref="PauseStateChanged"/>
+    /// keeps firing exactly as before -- this is an additional, narrower
+    /// signal for the time-skip sync layer, which needs the skip itself and
+    /// not "any pausing UI state". Raised on the tail loop's thread;
+    /// subscribers must not block.
+    /// </summary>
+    public event Action<bool>? SkipTimeStateChanged;
+
+    /// <summary>
+    /// Raised with the engine's quest+objective localisation key whenever the
+    /// local player crosses a checkpoint save (WO-90). The key is the
+    /// <c>questNameOverride</c> the game already writes to kcd.log and is
+    /// byte-identical on two machines at the same objective, which is what
+    /// makes it comparable across clients at all.
+    ///
+    /// Story progress is otherwise entirely untracked by this mod, so this is
+    /// the only signal of its kind. It is coarse -- a handful of markers an
+    /// hour -- and is used to REPORT divergence, never to gate anything.
+    ///
+    /// Raised on the tail loop's thread like the other events here;
+    /// subscribers must not block.
+    /// </summary>
+    public event Action<string>? StoryBeatDetected;
+
+    /// <summary>WO-174: the game's own save request line ("InitiateSaveGame() ...", a loadable kind): the mod clears partner-figure fight records now.</summary>
+    public event Action<string>? SaveInitiated;
+
+    /// <summary>
+    /// WO-94: the engine's own level-load banner,
+    /// "============================ Loading level trosecko ============================"
+    /// (observed twice across the 2026-08-25 field bundles, same text). The
+    /// level name is lowercased. Raised on every occurrence, so a level
+    /// switch mid-session is seen too. The mod uses it to skip fixed-point
+    /// beats of the other map, whose coordinate ranges overlap this one's.
+    /// </summary>
+    public event Action<string>? LevelDetected;
+
+    /// <summary>
+    /// WO-94: the Rendered-cutscene edge on its own (true = PlayCutscene, false
+    /// = OnCutsceneEnd), separate from the aggregate <see cref="PauseStateChanged"/>
+    /// so the catch-up hazard logger can name a cutscene specifically
+    /// (WO-92 s6.4 hazard 6) rather than "some pause-like state".
+    /// </summary>
+    public event Action<bool>? CutsceneStateChanged;
+
+    /// <summary>
+    /// WO-98 Phase 5: EVERY Rendered or Ingame cutscene edge -- (active, type,
+    /// name), straight from CutscenePlayer::PlayCutscene / OnCutsceneEnd.
+    /// Separate from <see cref="CutsceneStateChanged"/>, which stays
+    /// Rendered-only because it feeds the pause aggregate (WO-80's reasoning
+    /// about which types freeze Script.SetTimer is untouched). The
+    /// 2026-09-15 session's seven quest cutscenes were all "Ingame"
+    /// (socky_2_gate .. socky_7_bergov) and nothing in the stack saw them.
+    /// </summary>
+    public event Action<bool, string, string>? CutsceneEdge;
+
+    /// <summary>
+    /// WO-151 3.4: every scene-player stage of every type -- (stage, type, name), from
+    /// <c>CutscenePlayer::&lt;stage&gt; called for &lt;Type&gt; cutscene '&lt;name&gt;'</c>
+    /// (OnCutsceneInitialized, PlayCutscene, OnCutsceneEnd, OnRequestFastForwardedBehavior,
+    /// OnPositioningFinished, FinishCutscene, FinalizeCutscene, ReleaseScene, Interrupt), plus
+    /// ("PositioningLate", "", seconds) for the engine's "NPC positioning took longer than expected"
+    /// and ("FFCancelled", "", "") for its "Cancelling FF for all NPCs". The scene guard's clock: the
+    /// content end starts the end positioning, ReleaseScene is the engine's real release.
+    /// </summary>
+    public event Action<string, string, string>? SceneStage;
+
+    public static readonly string[] SceneStages =
+    [
+        "OnCutsceneInitialized", "PlayCutscene", "OnCutsceneEnd", "OnRequestFastForwardedBehavior",
+        "OnPositioningFinished", "FinishCutscene", "FinalizeCutscene", "ReleaseScene", "Interrupt",
+    ];
+
+    /// <summary>WO-151 3.4: one <c>CutscenePlayer::</c> stage line, or false (a stage, type and name the guard knows only).</summary>
+    public static bool TryParseSceneStage(ReadOnlySpan<char> line, out string stage, out string type, out string name)
+    {
+        stage = type = name = "";
+        int a = line.IndexOf("CutscenePlayer::".AsSpan(), StringComparison.Ordinal);
+        if (a < 0) return false;
+        var rest = line[(a + "CutscenePlayer::".Length)..];
+        int b = rest.IndexOf(" called for ".AsSpan(), StringComparison.Ordinal);
+        if (b <= 0) return false;
+        string st = rest[..b].ToString();
+        if (Array.IndexOf(SceneStages, st) < 0) return false;
+        rest = rest[(b + " called for ".Length)..];
+        int c = rest.IndexOf(" cutscene '".AsSpan(), StringComparison.Ordinal);
+        if (c <= 0) return false;
+        string ty = rest[..c].ToString();
+        foreach (char ch in ty) if (!char.IsAsciiLetter(ch)) return false;
+        rest = rest[(c + " cutscene '".Length)..];
+        int d = rest.IndexOf('\'');
+        if (d <= 0) return false;
+        string nm = rest[..d].ToString();
+        foreach (char ch in nm) if (!(char.IsAsciiLetterOrDigit(ch) || ch == '_')) return false;
+        stage = st; type = ty; name = nm;
+        return true;
+    }
+
+    /// <summary>
+    /// WO-98 Phase 7: the mod's Lua state was (re)initialised -- the tail saw
+    /// "[KCD2-MP] MOD INIT". The one moment a restarted game's fresh Lua
+    /// actually needs the agent's standing quest state pushed again.
+    /// </summary>
+    public event Action? ModInitDetected;
+
+    /// <summary>
+    /// WO-122: the engine printed "Gameplay started" -- a save load (or a new
+    /// game) just finished. Every load wipes every script save lock (WO-112
+    /// s3.6), so the joiner's host-only lock is re-asserted from here.
+    /// </summary>
+    public event Action? GameplayStarted;
+
+    /// <summary>
+    /// WO-123: the engine printed "[CryAction] LoadGame: '...'" -- a save load
+    /// STARTED. Between this and "Gameplay started" the mod's Lua runs and the
+    /// player exists, but the engine cannot save (observed): a join defers.
+    /// </summary>
+    public event Action? LoadStarted;
+
+    /// <summary>WO-124: "CSystem::Quit invoked ..." -- the game is ending its process (the menu's Quit, System.Quit()).</summary>
+    public event Action? GameQuit;
+
+    /// <summary>
+    /// WO-137: the engine lines shared quests need, raw (Wo137Rules.TryParseQuestLine reads them):
+    /// the local player's dialogue request, a dialogue's start attempt and its end (the talk flow),
+    /// and "Switching to player N" (a Godwin stretch holds the quest mirror).
+    /// </summary>
+    public event Action<string>? QuestLine;
+
+    /// <summary>
+    /// WO-144: the engine's own words the field fixes need, raw (GameBridge.Wo144OnEngineLine):
+    /// why an avatar refused a piece, a talk request the engine dropped, a scene queued again,
+    /// the fader held black, a conversation interrupted, an invalid minigame object.
+    /// </summary>
+    public event Action<string>? Wo144Line;
+
+    public static readonly string[] Wo144Prefixes =
+    [
+        "[Warning] Can't equip armor '",
+        "Canceling dialog request id ",
+        // WO-192 4c: the game's own script save locks (a station's 'waterTub' that never ends)
+        "Adding script save lock '",
+        "Removing script save lock '",
+        "[Warning] [MinigameActivityComponent]:",
+        "Faders are faded out",
+        // WO-164: the talk line's dialogue name, kind and preemption; the random events (the mark snapshot)
+        "Running dialogue '",
+        "New dialogue '",
+        // WO-204 III.3: the starter's choice in his own dialogue (the listeners' options close with it)
+        "Topic index '",
+        "<RandomEvent>",
+        // WO-166 L1: the loot screen closing (the joiner applies a host update it held back while the screen was open)
+        "PlayAudio: ui_inv_screen_out",
+        // WO-201 B5: the loot screen opening, and the body it opens on (no mod path changes an inventory a screen shows)
+        "PlayAudio: ui_inv_screen_in",
+        "OnLoot: Dude->",
+        // WO-201 B3: the engine's own mount and dismount of an actor (the host sends its NPC's mount the moment it starts)
+        "Actor '",
+        // WO-201 B15: the host's own save, begun and done (its pings stall meanwhile: the joiner is told, not the connection blamed)
+        "[SAVE GAME] Quick-saving to",
+        "[SAVE GAME] Saving",
+        "SaveGame: '",
+        // WO-167 FT3: the engine stopped a fast travel midway: its interrupt call, or a road event's answer ("... stopping FastTravel: 'Y'")
+        "Interrupting FastTravel",
+        "FastTravel: random event variant ",
+        // WO-167 C4: the engine has no sync data for a paired attack's slave (counted against the rows the mod sent)
+        "Cannot change sync guard on ",
+        // WO-166 W1: the game's own weather layer profiles (rain, flies...) -- counted; on the host a new one re-reads the rain at once
+        "[Info] C_GameProfileManager: Activating profile 'weather_",
+        "[Info] C_GameProfileManager: Deactivating profile 'weather_",
+        // WO-172 H1: the inventory/trade screen's own UI sounds (ApseOpen / ApseClose): a joiner's trade holds its trader until the close
+        "PlayAudio: Apse",
+        // WO-183 2: a dialogue's own state while the engine ends it (WO-179's guard counts a state other than WAITING_FOR_TWINS as running)
+        "Interrupting dialog '",
+        // WO-183 3: a save waiting for the engine's readiness (pending until "... is ready"): the joiner's one save owner never asks a second
+        "Readiness observer 'BeforeGameSave'",
+        // WO-184 B2: the player's own talk press (the conversation clock starts only on a talk he asked for, or a forced dialogue with him)
+        "OnChatWithFocus: Dude->",
+        // WO-184 B4: the game's exit dialog (a quit follows when the player confirms): the joiner's final snapshot is taken here
+        "C_UISaveLoad::HandleExit()",
+        // WO-203B: the engine's dialogue camera took this player's view (the starter's sampler starts with it)
+        "Dialog camera activated.",
+        // WO-189 B: every game profile switched (the host mirrors the quest ones to the joiner) and the load batch around the save's own set
+        "[Info] C_GameProfileManager: Activating profile '",
+        "[Info] C_GameProfileManager: Deactivating profile '",
+        "GameProfileManager: Starting batch update.",
+        "GameProfileManager: Finished batch update.",
+    ];
+
+    public static readonly string[] Wo144Contains =
+    [
+        // WO-151 3.4: the engine spells it "addded" (three d's): " into waiting players" matches both
+        " into waiting players",
+        "Dialog interrupted.",
+        "Dialog ends but no response was played",
+        // WO-183 2 (the class test): Wo166Rules.TryParseDialogState reads every '[ID: n] Dialog <word>' line; this member of the family never passed
+        "] Dialog ending",
+        // WO-160: the game's planner failing a placement this mod asked for (counted per NPC, GameBridge.Wo160)
+        "[NPCContext]:Couldn't find actions to get NPC into game loaded state",
+        // WO-211 C.3: a body's over-full action queue (the field's seated copy: 3,712 of these), the owner's clean reseat (GameBridge.Wo211)
+        Wo211Rules.OverflowMarker,
+        // WO-204 IV.5: a copy stuck in a state the engine cannot leave (2,577 of these for one joiner copy in session D)
+        "[NPCContext]:NPC state search has failed!",
+        "counldn't reach the loaded state in",
+        // WO-164: a dialogue's commands (the talk line's count: a haggle that played nothing) and the minigame entities (dice)
+        "] DialogCommand-",
+        "of minigame entity",
+        // WO-166 T3: a conversation's NPC never stopped its behaviour for it (the haggle's death)
+        "PlayerDialogController::NPCPauseRequests timed out",
+        // WO-194: an in-game cutscene's start readiness (its black): the live check of the sequence clock under it
+        "' with category bitmask '15255'",
+        // WO-167 T3: an NPC's behaviour-tree path in the engine's own lines (the timeout line names the last one); T4: a fader's end
+        "/(BT)",
+        "Last fader took ",
+        // WO-183 2: a conversation's dialogue twins (MasterSlaveManager lines naming 'DialogTwin_<soul>'): WO-179's A3 guard waited for
+        // them and the forward lists never passed one -- every joiner conversation was ended 3.6-3.9 s in (the field: 6 of 6 haggles)
+        "DialogTwin_",
+        // WO-183 3: the engine's refusal of a save while another is pending
+        "because there is another savegame pending",
+        // WO-189 C: a cutscene's initialization with its holder (the stage feed drops the holder; a barrier's holder names the wait)
+        "CutscenePlayer::OnCutsceneInitialized called for ",
+        // WO-191 3b: an NPC or animal turning on a partner's figure (the host pins it into the NPC stream: its copy exists before its first blow)
+        "] Set target: kcd2mp_",
+    ];
+
+    /// <summary>WO-184: would <see cref="QuestLine"/> receive this raw engine line? (The class test pins the clock's literals against both lists.)</summary>
+    public static bool QuestLinePasses(ReadOnlySpan<char> line) =>
+        line.StartsWith("Soul 'Dude' requested dialog. ", StringComparison.Ordinal)
+        || line.StartsWith("Attempting to start new dialogue (runtime id '", StringComparison.Ordinal)
+        || (line.StartsWith("[ID: ", StringComparison.Ordinal) && line.IndexOf("] Dialog end", StringComparison.Ordinal) > 0)
+        || line.StartsWith("Switching to player ", StringComparison.Ordinal);
+
+    /// <summary>WO-183 2: would <see cref="Wo144Line"/> receive this raw engine line? (The class test pins every handler's literals against it.)</summary>
+    public static bool Wo144Passes(ReadOnlySpan<char> line)
+    {
+        foreach (var pre in Wo144Prefixes) if (line.StartsWith(pre, StringComparison.Ordinal)) return true;
+        foreach (var mid in Wo144Contains) if (line.IndexOf(mid, StringComparison.Ordinal) >= 0) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// WO-124: "Loading saved game '%USER%/saves/playlineN/x.whs' ..." -- a save
+    /// load was accepted (printed at once; from the main menu the level loads
+    /// next and "[CryAction] LoadGame" follows ~40 s later). Argument: playlineN/x.whs.
+    /// </summary>
+    public event Action<string>? SaveLoadAccepted;
+
+    /// <summary>WO-124: "Exiting to main menu because save game loading failed." -- the engine's own way back to the menu.</summary>
+    public event Action? LoadFailedToMenu;
+
+    /// <summary>WO-124: "PlayVideoOnly 'main_menu..." -- the main menu is up (at startup, and after a failed load).</summary>
+    public event Action? MainMenuShown;
+
+    /// <summary>
+    /// WO-124: is the game at the main menu, read from the log's own history:
+    /// the later of the last "PlayVideoOnly 'main_menu" (the menu came up: at
+    /// startup, or after a failed load) and the last "Gameplay started". True =
+    /// menu, false = a world, null = neither seen. The Calendar cannot tell: a
+    /// failed load leaves the menu with the clock and even the player entity
+    /// still there (observed).
+    /// </summary>
+    public static bool? ScanAtMainMenu(string logPath, int tailBytes = 16 * 1024 * 1024)
+    {
+        try
+        {
+            using var fs = new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            long start = Math.Max(0, fs.Length - tailBytes);
+            fs.Seek(start, SeekOrigin.Begin);
+            var buf = new byte[fs.Length - start];
+            int got = 0;
+            while (got < buf.Length) { int n = fs.Read(buf, got, buf.Length - got); if (n <= 0) break; got += n; }
+            string text = Encoding.UTF8.GetString(buf, 0, got);
+            int menu = text.LastIndexOf("PlayVideoOnly 'main_menu", StringComparison.Ordinal);
+            int world = text.LastIndexOf("\nGameplay started", StringComparison.Ordinal);
+            if (menu < 0 && world < 0) return null;
+            return menu > world;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return null; }
+    }
+
+    /// <summary>
+    /// WO-122: "AutoSave is disabled under a script lock 'Script:&lt;name&gt;'" --
+    /// the engine refused an autosave (sleep, a quest save, the mod's own
+    /// request) because of a named script lock. The argument is the lock name.
+    /// </summary>
+    public event Action<string>? AutoSaveRefused;
+
+    /// <summary>WO-122: the engine's own "generation time: N ms" for the save it just wrote (0 = none seen yet).</summary>
+    public int LastSaveGenerationMs { get; private set; }
+
+    // WO-99 Phase 4: Fader/Text/SkipTime edges are now reported too, so a
+    // loading fade or a sleep shows up beside the emitter gap it causes
+    // (2026-09-16: all 18 cutscene lines were Fader, and the un-paused ghost
+    // gaps were exactly those). The consumer ACTS only on Rendered/Ingame.
+    private static readonly string[] CutsceneEdgeTypes = ["Rendered", "Ingame", "Fader", "Text", "SkipTime"];
+
+    private const string LevelBanner = " Loading level ";
+
+    /// <summary>
+    /// WO-94: the engine's own player-teleport line,
+    /// "TeleportPlayer Player 'Dude' (alive, health=  100.00/  100.00) BEFORE pos=&lt;2346.77 2087.35 111.57&gt; ..."
+    /// (observed live 2026-09-13 on the first real catch-up fire). Raised with
+    /// the raw line so the hazard logger can quote it; a `goto` of any size
+    /// produces exactly one of these, which the position-delta rules cannot
+    /// promise.
+    /// </summary>
+    public event Action<string>? PlayerTeleported;
+
+    /// <summary>
+    /// WO-114: the engine's own fast-travel edges, "FastTravel: started..." and
+    /// "FastTravel: ended..." (PlayerModule; observed live on a console
+    /// wh_pl_FastTravelTo). KCD2's fast travel is a sped-up simulated walk (the
+    /// position advances along the road), not a jump, so a position rule cannot
+    /// see it; these lines can. true = started, false = ended (arrived).
+    /// </summary>
+    public event Action<bool>? FastTravelStateChanged;
+
+    /// <summary>
+    /// WO-114: the engine refused a fast travel -- "[Warning] FastTravel: unable to
+    /// start fast travel from/to outside navmesh!" (observed live: the refusal
+    /// wh_pl_FastTravelEnabled 0 produces, whatever the navmesh; the same trip ran
+    /// with the switch at 1).
+    /// </summary>
+    public event Action? FastTravelRefused;
+
+    private void ProcessFastTravelMarker(ReadOnlySpan<char> line)
+    {
+        if (FastTravelRefused is not null && line.IndexOf("FastTravel: unable to start fast travel", StringComparison.Ordinal) >= 0)
+        {
+            try { FastTravelRefused?.Invoke(); }
+            catch (Exception ex) { Console.WriteLine($"[leash] fast-travel refusal handler threw: {ex.Message}"); }
+            return;
+        }
+        if (FastTravelStateChanged is null || !line.StartsWith("FastTravel: ", StringComparison.Ordinal)) return;
+        bool? on = line.StartsWith("FastTravel: started", StringComparison.Ordinal) ? true
+                 : line.StartsWith("FastTravel: ended", StringComparison.Ordinal) ? false : null;
+        if (on is not bool b) return;
+        try { FastTravelStateChanged?.Invoke(b); }
+        catch (Exception ex) { Console.WriteLine($"[leash] fast-travel handler threw: {ex.Message}"); }
+    }
+
+    private void ProcessTeleportMarker(ReadOnlySpan<char> line)
+    {
+        int at = line.IndexOf("TeleportPlayer Player 'Dude'", StringComparison.Ordinal);
+        if (at < 0) return;
+        try { PlayerTeleported?.Invoke(line[at..].ToString()); }
+        catch (Exception ex) { Console.WriteLine($"[quest] teleport handler threw: {ex.Message}"); }
+    }
+
+    private void ProcessLevelMarker(ReadOnlySpan<char> line)
+    {
+        int at = line.IndexOf(LevelBanner, StringComparison.Ordinal);
+        if (at < 0 || line.IndexOf("====", StringComparison.Ordinal) < 0) return;
+        var rest = line[(at + LevelBanner.Length)..];
+        int end = 0;
+        while (end < rest.Length && (char.IsLetterOrDigit(rest[end]) || rest[end] == '_')) end++;
+        if (end == 0 || end > 64) return;
+        string level = rest[..end].ToString().ToLowerInvariant();
+        try { LevelDetected?.Invoke(level); }
+        catch (Exception ex) { Console.WriteLine($"[quest] level handler threw: {ex.Message}"); }
+    }
+
+    /// <summary>
+    /// Which trigger action the current/most recent skip came from
+    /// (Protocol.TimeSkipKind*). WO-11's live kcd.log diff bracketed bed
+    /// sleep, wait and fast travel with the same AfterSkipTime observer and
+    /// never isolated a marker that distinguishes them, so until a live
+    /// marker diff fills this in, every skip reports
+    /// <see cref="Protocol.TimeSkipKindUnknown"/> and receivers use the
+    /// generic "passed time to" wording. The extension point is
+    /// <see cref="ProcessPauseMarkers"/>: latch a kind from a
+    /// bed/fast-travel-specific line seen shortly before the skip start
+    /// marker, exactly as the three existing marker pairs were found.
+    /// </summary>
+    public byte LastSkipKind { get; private set; } = Protocol.TimeSkipKindUnknown;
+
+    // Independent because they were confirmed as genuinely distinct engine
+    // signals (docs/WO-11-findings.md addendum, isolated live tests): the
+    // ESC pause menu's RTPC tag does not fire for inventory, and neither
+    // fires for a time skip.
+    private bool _menuOpen;
+    private bool _inventoryOpen;
+    private bool _skipTimeActive;
+    private DateTime _skipTimeSinceUtc;
+
+    /// <summary>
+    /// WO-147: the longest a skip-time marker may stay open without its end. A real skip resolves in seconds; the
+    /// field's quest sleep that the engine cancelled (it cut to a cutscene) left the flag set for 45 minutes -- the
+    /// host read "paused" all that time, the joiner was told so, and the leash held its pull.
+    /// </summary>
+    public const int SkipTimeMaxOpenSeconds = 180;
+
+    // Rendered cutscene (WO-80). Independent for the same reason as the three
+    // above -- a real field session shows a cutscene starting while a
+    // skip-time animation was still resolving (docs/WO-80-findings.md).
+    private bool _cutsceneActive;
+
+    private bool AggregatePaused => _menuOpen || _inventoryOpen || _skipTimeActive || _cutsceneActive;
+
+    // WO-138: the four states one by one -- the host announces its pause with its reasons.
+    public bool MenuOpen => _menuOpen;
+    public bool InventoryOpen => _inventoryOpen;
+    public bool SkipTimeActive => _skipTimeActive;
+    public bool CutsceneActive => _cutsceneActive;
+
+    /// <summary>
+    /// Scans one raw (untagged) engine log line for the marker pairs found
+    /// live in WO-11 (menu/inventory/skip-time) and WO-80 (Rendered
+    /// cutscenes). These are not this mod's own lines -- no
+    /// [KCD2-MP-...] tag -- so they are matched by substring against
+    /// whatever CryEngine/Warhorse actually wrote, confirmed against real
+    /// isolated single-action tests rather than the mixed first pass that
+    /// initially looked ambiguous.
+    /// </summary>
+    private void ProcessPauseMarkers(ReadOnlySpan<char> line)
+    {
+        bool before = AggregatePaused;
+
+        // ESC/system pause menu: confirmed live, isolated
+        // (docs/WO-11-findings.md addendum) -- MenuOpen pairs with the RTPC
+        // tag going to 1, ui_menu_close with it going to 0. The RTPC line is
+        // used as the authoritative edge since it is an explicit boolean,
+        // not just an audio cue that could in principle fire elsewhere.
+        if (line.IndexOf("'sqc_ptag_menu' will be 1") >= 0) _menuOpen = true;
+        else if (line.IndexOf("'sqc_ptag_menu' will be 0") >= 0) _menuOpen = false;
+
+        // Inventory: confirmed live, isolated -- its own PlayAudio pair,
+        // distinct from the pause menu's (WO-11 addendum: the first mixed
+        // test wrongly suggested inventory shared the menu RTPC tag; an
+        // isolated re-test showed that was leftover state from a menu still
+        // open at the start of that window, not inventory at all).
+        if (line.IndexOf("PlayAudio: ApseOpen") >= 0) _inventoryOpen = true;
+        else if (line.IndexOf("PlayAudio: ApseClose") >= 0) _inventoryOpen = false;
+        // WO-114: a fast travel plays ApseOpen right before "FastTravel: started..."
+        // and no ApseClose after it (observed live, two console fast travels):
+        // the APSE screen is not open once the travel has ended, so the end
+        // clears the flag -- else this player reads "paused" for good after
+        // every fast travel (and the leash holds its pull forever).
+        if (_inventoryOpen && line.StartsWith("FastTravel: ended", StringComparison.Ordinal)) _inventoryOpen = false;
+
+        // Skip-time (sleep/wait/bed): brackets the entire skip, start to
+        // finish, via CryEngine's own readiness-observer logging.
+        //
+        // WO-38: no marker distinguishing bed sleep from wait from fast
+        // travel has been confirmed live yet -- when one is, latch it into
+        // LastSkipKind here, *before* the start edge fires, so the kind
+        // rides the very first packet of the skip.
+        bool skipWas = _skipTimeActive;
+        if (line.IndexOf("Readiness observer 'AfterSkipTime'") >= 0)
+        {
+            if (line.IndexOf("started async waiting") >= 0) { _skipTimeActive = true; _skipTimeSinceUtc = DateTime.UtcNow; }
+            else if (line.IndexOf("is ready") >= 0) _skipTimeActive = false;
+            // WO-147: the engine can cancel the skip (a quest sleep that cuts to a cutscene) -- that ends it too.
+            else if (line.IndexOf("has canceled async waiting") >= 0)
+            {
+                _skipTimeActive = false;
+                if (skipWas) Console.WriteLine("[timeskip] the engine cancelled the skip (no 'is ready' follows) -- skip-time ended");
+            }
+        }
+        else if (_skipTimeActive && (DateTime.UtcNow - _skipTimeSinceUtc).TotalSeconds > SkipTimeMaxOpenSeconds)
+        {
+            _skipTimeActive = false;   // WO-147: an end the log never showed -- never a pause for good
+            Console.WriteLine($"[timeskip] skip-time open for over {SkipTimeMaxOpenSeconds} s without its end marker -- cleared");
+        }
+        if (_skipTimeActive != skipWas)
+        {
+            try { SkipTimeStateChanged?.Invoke(_skipTimeActive); }
+            catch (Exception ex) { Console.WriteLine($"[timeskip] handler threw: {ex.Message}"); }
+        }
+
+        // Rendered cutscene (WO-80): CutscenePlayer::PlayCutscene / OnCutsceneEnd
+        // are generic CryEngine events (holder/module vary, the event name and
+        // cutscene type do not) -- confirmed against six real Play/End pairs in
+        // a field session's kcd.log, cleanly ordered with no orphans
+        // (docs/WO-80-findings.md). The candidate "OnCutsceneStart" named in
+        // the WO does not appear anywhere in either field log -- it has
+        // drifted or never existed on this build -- so PlayCutscene is used
+        // as the entry edge instead; OnCutsceneEnd matches verbatim.
+        //
+        // Scoped to the "Rendered" type specifically, not every cutscene:
+        // the same session logs a 62 s "Text" cutscene and three "Fader"
+        // cutscenes with the emitter's DATA line flowing the entire time --
+        // those do not freeze Script.SetTimer, so tracking them would only
+        // pump needlessly. A "SkipTime"-type cutscene also appears, but its
+        // own PlayCutscene fires ~19 s before anything actually freezes; the
+        // freeze there is the existing AfterSkipTime marker above, which this
+        // deliberately does not duplicate. Only "Rendered" (the one real
+        // instance observed) sat inside the field session's 60.69 s DATA gap.
+        // WO-98 Phase 5: report every Rendered/Ingame edge with type and name.
+        // Fader/Text/SkipTime stay excluded here too -- they are not what a
+        // player experiences as "a cutscene" (WO-80 notes above).
+        if (SceneStage is not null)
+        {
+            if (line.IndexOf("CutscenePlayer::", StringComparison.Ordinal) >= 0)
+            {
+                if (TryParseSceneStage(line, out var sst, out var sty, out var snm))
+                {
+                    try { SceneStage.Invoke(sst, sty, snm); }
+                    catch (Exception ex) { Console.WriteLine($"[scene] stage handler threw: {ex.Message}"); }
+                }
+            }
+            else if (line.IndexOf("[ScenePositioningManager]:NPC positioning took longer than expected", StringComparison.Ordinal) >= 0)
+            {
+                const string fin = "Finished in ";
+                int f = line.IndexOf(fin, StringComparison.Ordinal);
+                string secs = f >= 0 ? line[(f + fin.Length)..].ToString().Split(' ')[0] : "?";
+                try { SceneStage.Invoke("PositioningLate", "", secs); }
+                catch (Exception ex) { Console.WriteLine($"[scene] stage handler threw: {ex.Message}"); }
+            }
+            else if (line.IndexOf("Cancelling FF for all NPCs", StringComparison.Ordinal) >= 0)
+            {
+                try { SceneStage.Invoke("FFCancelled", "", ""); }
+                catch (Exception ex) { Console.WriteLine($"[scene] stage handler threw: {ex.Message}"); }
+            }
+            else if (Wo167Rules.IsmStage(line) is { } ism)   // WO-167 T4: a conversation's interactive scene queued / ended
+            {
+                try { SceneStage.Invoke(ism, "", ""); }
+                catch (Exception ex) { Console.WriteLine($"[scene] stage handler threw: {ex.Message}"); }
+            }
+        }
+
+        if (CutsceneEdge is not null && line.IndexOf("CutscenePlayer::") >= 0)
+        {
+            bool csPlay = line.IndexOf("::PlayCutscene called for ") >= 0;
+            bool csEnd  = !csPlay && line.IndexOf("::OnCutsceneEnd called for ") >= 0;
+            if (csPlay || csEnd)
+            {
+                foreach (string csType in CutsceneEdgeTypes)
+                {
+                    string marker = " called for " + csType + " cutscene '";
+                    int m = line.IndexOf(marker.AsSpan(), StringComparison.Ordinal);
+                    if (m < 0) continue;
+                    var afterMarker = line[(m + marker.Length)..];
+                    int q = afterMarker.IndexOf('\'');
+                    if (q > 0)
+                    {
+                        try { CutsceneEdge.Invoke(csPlay, csType, afterMarker[..q].ToString()); }
+                        catch (Exception ex) { Console.WriteLine($"[cutscene] edge handler threw: {ex.Message}"); }
+                    }
+                    break;
+                }
+            }
+        }
+
+        const string refusedMarker = "AutoSave is disabled under a script lock '";
+        int rm = line.IndexOf(refusedMarker, StringComparison.Ordinal);
+        if (rm >= 0)
+        {
+            var lockTail = line[(rm + refusedMarker.Length)..];
+            int end = lockTail.IndexOf('\'');
+            string lockName = end > 0 ? lockTail[..end].ToString() : "?";
+            if (lockName.StartsWith("Script:", StringComparison.Ordinal)) lockName = lockName[7..];
+            try { AutoSaveRefused?.Invoke(lockName); }
+            catch (Exception ex) { Console.WriteLine($"[worldsave] autosave-refused handler threw: {ex.Message}"); }
+        }
+        else if (line.IndexOf("[SAVE GAME] Binary saveload: After writing", StringComparison.Ordinal) >= 0)
+        {
+            int g = line.IndexOf("generation time: ", StringComparison.Ordinal);
+            if (g >= 0)
+            {
+                var rest = line[(g + 17)..];
+                int n = 0, i = 0;
+                while (i < rest.Length && char.IsAsciiDigit(rest[i])) { n = n * 10 + (rest[i] - '0'); i++; }
+                if (i > 0) LastSaveGenerationMs = n;
+            }
+        }
+
+        if (LoadStarted is not null && line.StartsWith("[CryAction] LoadGame: '", StringComparison.Ordinal))
+        {
+            try { LoadStarted.Invoke(); }
+            catch (Exception ex) { Console.WriteLine($"[join] load-started handler threw: {ex.Message}"); }
+        }
+
+        if (SaveLoadAccepted is not null && line.StartsWith("Loading saved game '", StringComparison.Ordinal))
+        {
+            var rest = line[20..];
+            int q = rest.IndexOf('\'');
+            if (q > 0)
+            {
+                var path = rest[..q].ToString().Replace('\\', '/');
+                int pl = path.LastIndexOf("/playline", StringComparison.Ordinal);
+                try { SaveLoadAccepted.Invoke(pl >= 0 ? path[(pl + 1)..] : path); }
+                catch (Exception ex) { Console.WriteLine($"[join] save-load handler threw: {ex.Message}"); }
+            }
+        }
+        if (MainMenuShown is not null && line.StartsWith("PlayVideoOnly 'main_menu", StringComparison.Ordinal))
+        {
+            try { MainMenuShown.Invoke(); }
+            catch (Exception ex) { Console.WriteLine($"[join] main-menu handler threw: {ex.Message}"); }
+        }
+        if (LoadFailedToMenu is not null && line.StartsWith("Exiting to main menu because save game loading failed", StringComparison.Ordinal))
+        {
+            try { LoadFailedToMenu.Invoke(); }
+            catch (Exception ex) { Console.WriteLine($"[join] load-failed handler threw: {ex.Message}"); }
+        }
+
+        if (QuestLine is not null && QuestLinePasses(line))
+        {
+            try { QuestLine.Invoke(line.ToString()); }
+            catch (Exception ex) { Console.WriteLine($"[wo137] quest-line handler threw: {ex.Message}"); }
+        }
+
+        if (Wo144Line is not null)
+        {
+            if (Wo144Passes(line))
+            {
+                try { Wo144Line.Invoke(line.ToString()); }
+                catch (Exception ex) { Console.WriteLine($"[wo144] engine-line handler threw: {ex.Message}"); }
+            }
+        }
+
+        if (GameQuit is not null && line.StartsWith("CSystem::Quit invoked", StringComparison.Ordinal))
+        {
+            try { GameQuit.Invoke(); }
+            catch (Exception ex) { Console.WriteLine($"[join] quit handler threw: {ex.Message}"); }
+        }
+
+        if (GameplayStarted is not null && line.Length < 40 && line.StartsWith("Gameplay started", StringComparison.Ordinal))
+        {
+            try { GameplayStarted.Invoke(); }
+            catch (Exception ex) { Console.WriteLine($"[worldsave] gameplay-started handler threw: {ex.Message}"); }
+        }
+
+        // WO-98 Phase 7: "[KCD2-MP] MOD INIT" (the second of the mod's two
+        // init lines; the first is "=== MOD INIT ===" and does not match).
+        if (ModInitDetected is not null && line.IndexOf("[KCD2-MP] MOD INIT") >= 0)
+        {
+            try { ModInitDetected.Invoke(); }
+            catch (Exception ex) { Console.WriteLine($"[quest] mod-init handler threw: {ex.Message}"); }
+        }
+
+        bool cutBefore = _cutsceneActive;
+        if (line.IndexOf("CutscenePlayer::PlayCutscene called for Rendered cutscene") >= 0) _cutsceneActive = true;
+        else if (line.IndexOf("CutscenePlayer::OnCutsceneEnd called for Rendered cutscene") >= 0) _cutsceneActive = false;
+        if (_cutsceneActive != cutBefore)
+        {
+            try { CutsceneStateChanged?.Invoke(_cutsceneActive); }   // WO-94
+            catch (Exception ex) { Console.WriteLine($"[quest] cutscene handler threw: {ex.Message}"); }
+        }
+
+        bool after = AggregatePaused;
+        if (after != before)
+        {
+            try { PauseStateChanged?.Invoke(after); }
+            catch (Exception ex) { Console.WriteLine($"[pause] handler threw: {ex.Message}"); }
+        }
+    }
+
+    /// <summary>
+    /// WO-90: scans one raw engine log line for a quest-objective checkpoint
+    /// and raises <see cref="StoryBeatDetected"/> when the key CHANGES.
+    ///
+    /// Change-gated here rather than at the sender because the same objective
+    /// is saved repeatedly through a session (an autosave, then a manual
+    /// save, then a death reload's autosave all carry it), and a peer does
+    /// not need to hear the same string again. The parse itself is in
+    /// <see cref="StoryBeat.TryParseObjectiveMarker"/>, which is pinned by
+    /// tests to the real field lines.
+    /// </summary>
+    private void ProcessStoryMarkers(ReadOnlySpan<char> line)
+    {
+        if (!StoryBeat.TryParseObjectiveMarker(line, out string marker)) return;
+        if (string.Equals(marker, _lastStoryMarker, StringComparison.Ordinal)) return;
+
+        _lastStoryMarker = marker;
+        try { StoryBeatDetected?.Invoke(marker); }
+        catch (Exception ex) { Console.WriteLine($"[story] handler threw: {ex.Message}"); }
+    }
+
+    private string? _lastStoryMarker;
+
+    private void ProcessSaveMarker(ReadOnlySpan<char> line)
+    {
+        if (!Wo174Rules.IsLoadableSaveKind(line)) return;
+        try { SaveInitiated?.Invoke(line.Length > 120 ? line[..120].ToString() : line.ToString()); }
+        catch (Exception ex) { Console.WriteLine($"[save] handler threw: {ex.Message}"); }
+    }
+
+    /// <summary>
+    /// The most recent quest objective this client crossed, or null before
+    /// the first checkpoint of the session. Read by the agent when a new peer
+    /// arrives, so a late joiner is told where we are rather than waiting for
+    /// our next checkpoint -- which, at a handful an hour, could be a long
+    /// wait.
+    /// </summary>
+    public string? LastStoryMarker => _lastStoryMarker;
+
+    // -------------------------------------------------------------------------
+
+    /// <summary>WO-124: the line [start, start+len) is the event line already delivered before its terminator arrived.</summary>
+    private static bool IsEarlyDelivered(string text, int start, int len, string? early) =>
+        early is not null && text.AsSpan(start, len).TrimEnd('\r').SequenceEqual(early.AsSpan());
+
+    private async Task TailLoopAsync(CancellationToken ct)
+    {
+        var decoder = Encoding.UTF8.GetDecoder();
+        var buffer = new byte[64 * 1024];
+        var chars = new char[64 * 1024];
+        var partial = new StringBuilder();
+        // WO-124: CryEngine writes a log line's terminator only when the NEXT
+        // line is written (observed: the last line of a quiet kcd.log has no
+        // CR LF). In a world the log never goes quiet; at the main menu it
+        // does, and a mod event could sit unread until something else logs.
+        // An EVENT line left unchanged for 300 ms is taken as complete (the mod
+        // writes each one with a single System.LogAlways), and its terminator,
+        // when it comes, does not deliver it twice.
+        string? earlyDone = null;
+        DateTime partialSince = DateTime.MinValue;
+
+        FileStream? fs = null;
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                if (fs is null)
+                {
+                    try
+                    {
+                        // FileShare.ReadWrite|Delete: the game holds this open and
+                        // may replace it; refusing to share would fail the open or
+                        // block the game's own writes.
+                        fs = new FileStream(_logPath, FileMode.Open, FileAccess.Read,
+                            FileShare.ReadWrite | FileShare.Delete);
+                        fs.Seek(0, SeekOrigin.End); // only new lines matter
+                        partial.Clear();
+                        decoder.Reset();
+                    }
+                    catch
+                    {
+                        await Task.Delay(500, ct);
+                        continue;
+                    }
+                }
+
+                // Rotation or truncation on game restart: the file got shorter
+                // than where we are, so our offset is meaningless. Start over.
+                try
+                {
+                    if (fs.Length < fs.Position)
+                    {
+                        fs.Dispose();
+                        fs = null;
+                        continue;
+                    }
+                }
+                catch
+                {
+                    fs.Dispose();
+                    fs = null;
+                    continue;
+                }
+
+                int read;
+                try { read = await fs.ReadAsync(buffer.AsMemory(0, buffer.Length), ct); }
+                catch (OperationCanceledException) { break; }
+                catch { fs.Dispose(); fs = null; continue; }
+
+                if (read == 0)
+                {
+                    if (partial.Length > 0 && earlyDone is null && (DateTime.UtcNow - partialSince).TotalMilliseconds >= 300)
+                    {
+                        string pending = partial.ToString();
+                        if (pending.StartsWith(EventTag, StringComparison.Ordinal))
+                        {
+                            earlyDone = pending;
+                            ProcessLine(pending.AsSpan());
+                        }
+                    }
+                    // Caught up. Poll well inside the emit interval so a fresh
+                    // line is picked up promptly without spinning a core.
+                    await Task.Delay(Math.Max(2, _emitIntervalMs / 4), ct);
+                    continue;
+                }
+
+                int charCount = decoder.GetChars(buffer, 0, read, chars, 0);
+                partial.Append(chars, 0, charCount);
+
+                // Consume whole lines only; anything after the last newline is
+                // an incomplete write and stays buffered.
+                int start = 0;
+                string text = partial.ToString();
+                for (int i = 0; i < text.Length; i++)
+                {
+                    if (text[i] != '\n') continue;
+                    if (!IsEarlyDelivered(text, start, i - start, earlyDone)) ProcessLine(text.AsSpan(start, i - start));   // WO-124
+                    earlyDone = null;
+                    start = i + 1;
+                }
+
+                partial.Clear();
+                if (start < text.Length)
+                    partial.Append(text, start, text.Length - start);
+                partialSince = DateTime.UtcNow;
+            }
+        }
+        catch (OperationCanceledException) { }
+        finally { fs?.Dispose(); }
+    }
+
+    /// <summary>
+    /// Parses one log line if it is ours. The DATA/state tag is searched for
+    /// rather than anchored at position 0, so an engine-added prefix does not
+    /// break it. The EVENT tag is anchored to the line start (WO-110 R15): the
+    /// mod writes its event lines with System.LogAlways at column 0 (observed
+    /// in every kcd.log this project has), and an event tag appearing later in
+    /// a line is text inside some other line -- a peer name or an NPC name
+    /// that CONTAINS "[KCD2-MP-EVT] v1 1 npc_death ..." must not be able to
+    /// forge an event (docs/WO-109-audit.md R15).
+    /// </summary>
+    private void ProcessLine(ReadOnlySpan<char> line)
+    {
+        if (line.StartsWith(EventTag))
+        {
+            ProcessEventLine(line[EventTag.Length..].Trim());
+            return;
+        }
+        if (line.IndexOf(EventTag) > 0)
+        {
+            // An event tag NOT at column 0: something quoted it. Counted so a
+            // forgery attempt, or an engine prefix this build never had, is
+            // visible rather than silently ignored.
+            if (Interlocked.Increment(ref _eventTagNotAnchored) <= 3)
+                Console.WriteLine($"[logtail] event tag not at line start, ignored (#{_eventTagNotAnchored}): {line[..Math.Min(line.Length, 120)].ToString()}");
+            return;
+        }
+
+        int tagIdx = line.IndexOf(Tag);
+        if (tagIdx < 0)
+        {
+            // Not one of this mod's own tagged lines -- still worth scanning
+            // for the raw engine markers WO-11 found (menu/inventory/skip-
+            // time) and WO-80 added (Rendered cutscenes). Those never appear
+            // on a [KCD2-MP-...] line, so checking only here costs nothing on
+            // the hot (DATA-tagged) path.
+            ProcessPauseMarkers(line);
+            ProcessStoryMarkers(line);
+            ProcessSaveMarker(line);    // WO-174
+            ProcessLevelMarker(line);   // WO-94
+            ProcessTeleportMarker(line); // WO-94
+            ProcessFastTravelMarker(line); // WO-114
+            return;
+        }
+
+        var rest = line[(tagIdx + Tag.Length)..].Trim();
+
+        // v1 <seq> <clock> <x> <y> <z> <rotZ> <flags>
+        // v2 <seq> <clock> <x> <y> <z> <rotZ> <flags> <health> <stamina>
+        Span<Range> fields = stackalloc Range[11];
+        int n = SplitOnSpaces(rest, fields);
+        if (n < 8) return;
+
+        bool isV2 = rest[fields[0]].SequenceEqual(VersionV2);
+        if (!isV2 && !rest[fields[0]].SequenceEqual(VersionV1)) return; // unknown emitter version
+
+        if (!long.TryParse(rest[fields[1]], NumberStyles.Integer, CultureInfo.InvariantCulture, out long seq)) return;
+        if (!float.TryParse(rest[fields[3]], NumberStyles.Float, CultureInfo.InvariantCulture, out float x)) return;
+        if (!float.TryParse(rest[fields[4]], NumberStyles.Float, CultureInfo.InvariantCulture, out float y)) return;
+        if (!float.TryParse(rest[fields[5]], NumberStyles.Float, CultureInfo.InvariantCulture, out float z)) return;
+        if (!float.TryParse(rest[fields[6]], NumberStyles.Float, CultureInfo.InvariantCulture, out float rotZ)) return;
+        if (!int.TryParse(rest[fields[7]], NumberStyles.Integer, CultureInfo.InvariantCulture, out int flags)) return;
+
+        // Health/stamina stay null on a v1 line, and on a v2 line whose trailing
+        // fields are missing or malformed. Null means "unknown, leave it alone"
+        // all the way up -- it is never coerced to a zero that would read as a
+        // dead player. The mod sends Protocol.UnknownStat (-1) for a reading it
+        // could not obtain at all (no stamina binding on this build), which is
+        // passed through as-is for the same reason.
+        float? health = null, stamina = null;
+        bool? isDead = null, isUnconscious = null;
+        if (isV2)
+        {
+            if (n >= 10
+                && float.TryParse(rest[fields[8]], NumberStyles.Float, CultureInfo.InvariantCulture, out float h)
+                && float.TryParse(rest[fields[9]], NumberStyles.Float, CultureInfo.InvariantCulture, out float st))
+            {
+                health = h;
+                stamina = st;
+            }
+            // Flag bits 2 and 3 exist only in v2, so they are only trusted
+            // there -- a v1 emitter leaves them clear, which would otherwise
+            // read as a positive "not dead" it never actually asserted.
+            isDead = (flags & 0x04) != 0;
+            isUnconscious = (flags & 0x08) != 0;
+        }
+
+        lock (_stateLock)
+        {
+            // Emitter restarts reset the sequence, so only count a gap when it
+            // moves forward -- otherwise a restart would report a huge fake drop.
+            if (_latestSeq >= 0 && seq > _latestSeq + 1)
+                FramesDropped += seq - _latestSeq - 1;
+
+            _latestSeq = seq;
+            _latest = new PlayerState(x, y, z, rotZ, (flags & 0x01) != 0,
+                                      health, stamina, isDead, isUnconscious);
+            _latestAtUtc = DateTime.UtcNow;
+            EmitterVersion = isV2 ? VersionV2 : VersionV1;
+            FramesReceived++;
+        }
+    }
+
+    /// <summary>
+    /// Parses "v1 &lt;seq&gt; &lt;name&gt; &lt;arg...&gt;" and raises <see cref="GameEvent"/>.
+    ///
+    /// The handler runs on the tail loop's thread, so subscribers must not block.
+    /// A throwing subscriber is swallowed: losing one event is bad, but killing
+    /// the tail loop would silently stop all position updates too.
+    /// </summary>
+    private void ProcessEventLine(ReadOnlySpan<char> rest)
+    {
+        Span<Range> fields = stackalloc Range[4];
+        int n = SplitOnSpaces(rest, fields, limit: 3);
+        if (n < 3) return;
+        // The event channel has its own version, still v1: WO-28 changed the
+        // state line's shape, not this one.
+        if (!rest[fields[0]].SequenceEqual(VersionV1)) return;
+
+        string name = rest[fields[2]].ToString();
+        string arg = n > 3 ? rest[fields[3]].ToString().Trim() : string.Empty;
+
+        EventsReceived++;
+        try { GameEvent?.Invoke(name, arg); }
+        catch (Exception ex) { Console.WriteLine($"[event] handler for '{name}' threw: {ex.Message}"); }
+    }
+
+    /// <summary>Splits on runs of spaces without allocating.</summary>
+    /// <param name="limit">
+    /// When non-negative, everything after this many fields is returned as one
+    /// final field, so a trailing argument may itself contain spaces.
+    /// </param>
+    private static int SplitOnSpaces(ReadOnlySpan<char> s, Span<Range> into, int limit = -1)
+    {
+        int count = 0, i = 0;
+        while (i < s.Length && count < into.Length)
+        {
+            while (i < s.Length && s[i] == ' ') i++;
+            if (i >= s.Length) break;
+            int start = i;
+
+            if (limit >= 0 && count == limit)
+            {
+                into[count++] = new Range(start, s.Length);
+                break;
+            }
+
+            while (i < s.Length && s[i] != ' ') i++;
+            into[count++] = new Range(start, i);
+        }
+        return count;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _cts.Cancel();
+        if (_tailTask is not null)
+        {
+            try { await _tailTask; } catch { }
+        }
+
+        if (_emitterStarted)
+        {
+            // Best effort: leaving the emitter running would keep writing to
+            // kcd.log for the rest of the session. Flushed for the same reason
+            // as the start command.
+            try
+            {
+                await _http.ExecuteAsync("KCD2MP_StopEmitter()");
+                await _http.FlushAsync();
+            }
+            catch { }
+        }
+
+        _cts.Dispose();
+    }
+}

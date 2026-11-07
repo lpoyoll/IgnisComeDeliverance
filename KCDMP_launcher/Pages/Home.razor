@@ -1,0 +1,255 @@
+﻿@* Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
+   GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
+   content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
+   Portions from the original project, marczukmichal/kcd2-multiplayer; its author keeps their copyright (AUTHORS). *@
+@page "/"
+@using KCDMP_launcher.Components
+@using KCDMP_launcher.Components.Modals
+@using KCDMP_launcher.Models
+@using Microsoft.JSInterop
+@using System.Diagnostics
+@using System.Text.Json
+
+<FilterSidebar  IsOpen="@isFilterOpen"
+                @bind-FilterName="filterName"
+                @bind-FilterMap="filterMap"
+                @bind-FilterMinPlayers="filterMinPlayers"
+                @bind-FilterMaxPlayers="filterMaxPlayers"
+                @bind-FilterMinPing="filterMinPing"
+                @bind-FilterMaxPing="filterMaxPing"
+                @bind-FilterShowFavorites="filterShowFavorites"
+                @bind-FilterHideUnreachable="filterHideUnreachable"
+                OnResetFilters="@ResetFilters"
+                AvailableMaps="@availableMaps" 
+/>
+
+<div class="content-wrapper">
+
+    <div class="game-title">
+        IgnisComeDeliverance
+    </div>
+
+    @* IgnisComeDeliverance: the start screen -- host or join, in plain steps (Components/PlayHub.razor) *@
+    <PlayHub SetupReady="@setupReady"
+             RelayRunning="@(hostedRelayProcess != null && !hostedRelayProcess.HasExited)"
+             @bind-ShowDirect="showDirectConnect"
+             OnHost="@OpenHostModal"
+             OnJoin="@OpenJoinSteam"
+             OnCheckSetup="@OpenSetupChecklist"
+             OnRestoreSaves="@(() => showRestoreSaves = true)" />
+
+    <div class="main-window @(isFilterOpen ? "shifted" : "") @(showDirectConnect ? "" : "hub-hidden")">
+
+        <ServerList @ref="serverListComponent"
+                    Servers="@filteredAndSortedServers"
+                    Favorites="@favoriteIps"
+                    IsLoading="@isLoading"
+                    CurrentSortColumn="@currentSortColumn"
+                    IsAscending="@isAscending"
+                    OnSort="@SortTable"
+                    OnLaunch="@LaunchGame"
+                    OnTest="@TestServerConnectionAsync"
+                    OnToggleFavorite="@ToggleFavorite"
+                    OnAddClick="@OpenAddModal"
+                    OnEditClick="@OpenEditModal"
+                    OnRemoveClick="@RemoveCustomServer"
+                    OnError="@DisplayError"
+        />
+
+    </div>
+
+</div>
+
+<StatusBar  IsFilterActive="@filterShowFavorites"
+            OnToggleFilters="@ToggleFiltersJS"
+            OnToggleSettings="@ToggleSettingsJS"
+            OnRefresh="@RefreshApp"
+            OnExit="@ExitApp"
+            OnHostGame="@OpenHostModal"
+            OnJoinSteam="@OpenJoinSteam"
+            OnReportBug="@(() => showReportBug = true)"
+            OnAbout="@(() => showAbout = true)"
+            OnCheckSetup="@OpenSetupChecklist"
+            OnRestoreSaves="@(() => showRestoreSaves = true)"
+/>
+
+@* WO-150: the first-run checklist (and "Check setup"); hidden whenever setup is complete *@
+<SetupChecklistModal IsVisible="@showSetup"
+                     Steps="@setupSteps"
+                     Lines="@setupLines"
+                     Busy="@setupBusy"
+                     OnAction="@HandleSetupActionAsync"
+                     OnCheckAgain="@CheckSetupAgainAsync"
+                     OnClose="@CloseSetupChecklist" />
+
+@if (launchStage != LaunchStage.Idle)
+{
+    <div class="modal-overlay">
+        <div class="modal-box" @onclick:stopPropagation="true" style="max-width: 480px;">
+            <div class="modal-frame-top modal-frame-bg"></div>
+            <div class="modal-content" style="text-align: center;">
+                <div class="modal-title">
+                    @(launchStage switch
+                    {
+                        LaunchStage.WaitingForConnect => "READY TO CONNECT",
+                        LaunchStage.Injecting => "INJECTING...",
+                        LaunchStage.Verifying => "VERIFYING...",
+                        LaunchStage.Connected => "CONNECTED",
+                        LaunchStage.Failed => "CONNECT FAILED",
+                        _ => ""
+                    })
+                </div>
+                <p style="margin: 15px 0;">@launchStatusMessage</p>
+                @if (launchStage == LaunchStage.WaitingForConnect && !ConnectEnabled && !string.IsNullOrEmpty(connectGateReason))
+                {
+                    @* WO-154: why CONNECT waits, in plain words (Models/ConnectGate.cs) *@
+                    <div class="kcd-hint" style="margin-bottom: 12px;">@connectGateReason</div>
+                }
+                @if (wo175StatusBad && !string.IsNullOrEmpty(wo175StatusLine))
+                {
+                    @* WO-175 S2: the saves backup failed (the game started anyway) *@
+                    <div class="kcd-hint" style="margin-bottom: 12px; color: var(--kcd-warn);">@wo175StatusLine</div>
+                }
+
+                <div class="modal-actions">
+                    @if (launchStage == LaunchStage.WaitingForConnect)
+                    {
+                        <button class="kcd-btn primary" disabled="@(!ConnectEnabled)" @onclick="ConnectToGame">CONNECT</button>
+                        <button class="kcd-btn" @onclick="CancelPendingConnect">CANCEL</button>
+                    }
+                    else if (launchStage == LaunchStage.Connected || launchStage == LaunchStage.Failed)
+                    {
+                        <button class="kcd-btn primary" @onclick="ResetLaunchState">CLOSE</button>
+                    }
+                </div>
+            </div>
+            <div class="modal-frame-bottom modal-frame-bg"></div>
+        </div>
+    </div>
+}
+
+<HostInfoModal  IsVisible="@showHostInfo"
+                Port="@settings.HostPort"
+                Addresses="@hostLanAddresses"
+                ErrorMessage="@hostErrorMessage"
+                RelayRunning="@(hostedRelayProcess != null && !hostedRelayProcess.HasExited)"
+                AllowSteam="@settings.HostAllowSteam"
+                SteamToggleLocked="@(launchStage != LaunchStage.Idle && launchStage != LaunchStage.Failed)"
+                OnAllowSteamChanged="@SetHostAllowSteamAsync"
+                SteamState="@hostSteamState"
+                SteamMessage="@hostSteamMessage"
+                SteamCode="@hostSteamCode"
+                SteamAppName="@hostSteamAppName"
+                RefusedNotice="@hostRefusedNotice"
+                OnLaunchAsHost="@LaunchAsHost"
+                OnStopRelay="@(() => { StopHostedRelay(); showHostInfo = false; })"
+                OnClose="@(() => showHostInfo = false)" />
+
+<JoinSteamModal IsVisible="@showJoinSteam"
+                Code="@steamCodeInput"
+                CodeChanged="@(c => steamCodeInput = c)"
+                AppName="@SteamAppNameOf(settings.SteamAppId)"
+                Friends="@steamFriends"
+                FriendsNote="@steamFriendsNote"
+                ResultMessage="@steamResultMessage"
+                ResultOk="@steamResultOk"
+                Busy="@steamBusy"
+                BusyText="@steamBusyText"
+                OnFindFriends="@FindSteamFriendsAsync"
+                OnTest="@TestSteamConnectionAsync"
+                OnJoin="@JoinThroughSteamAsync"
+                OnClose="@(() => showJoinSteam = false)" />
+
+<MessageModal IsVisible="@showMessage"
+              Title="@messageTitle"
+              Message="@messageText"
+              NextStep="@messageNext"
+              ShowAddressFallback="@messageAddressFallback"
+              Address="@fallbackAddress"
+              AddressChanged="@(a => fallbackAddress = a)"
+              OnUseAddress="@ConnectByAddressAfterSteamAsync"
+              ShowReportBug="@messageReportBug"
+              ShowLaunchAnyway="@launchAnywayAvailable"
+              OnLaunchAnyway="@LaunchAnywayAsync"
+              OnReportBug="@(() => { showMessage = false; showReportBug = true; })"
+              OnClose="@(() => showMessage = false)" />
+
+<ExitModal  IsVisible="@showExitConfirm"
+            OnConfirm="@ConfirmExit"
+            OnClose="@(() => showExitConfirm = false)" />
+
+<SettingsModal  IsVisible="@showSettings"
+                Settings="@settings"
+                OnSave="@SaveSettings"
+                OnClose="@CancelSettings" />
+
+<AddServerModal IsVisible="@showAddServer"
+                ServerToEdit="@serverToEdit"
+                OnAdd="@AddCustomServer"
+                OnEdit="@HandleServerUpdate"
+                OnClose="@(() => showAddServer = false)" />
+
+<AboutModal IsVisible="@showAbout" OnClose="@(() => showAbout = false)" />
+
+@* WO-175 S2: put back one of the saves backups made before each session *@
+<RestoreSavesModal IsVisible="@showRestoreSaves"
+                   GamePath="@settings.GamePath"
+                   OnClose="@(() => showRestoreSaves = false)" />
+
+<ReportBugModal IsVisible="@showReportBug"
+                GameRoot="@LogBundleGameRoot"
+                AgentDirectory="@LogBundleAgentDirectory"
+                RelayDirectory="@LogBundleRelayDirectory"
+                OnClose="@(() => showReportBug = false)" />
+
+<VersionMismatchModal   IsVisible="@showVersionMismatch"
+                        Message="@versionMismatchMessage"
+                        OnClose="@(() => showVersionMismatch = false)" />
+
+@if (!string.IsNullOrEmpty(joinStatusMessage))
+{
+    @* WO-123: the joiner's world transfer, from the agent's /join-status *@
+    <div class="join-status-banner" style="position: fixed; left: 50%; bottom: @(string.IsNullOrEmpty(connStatusLine) ? "64px" : "112px"); transform: translateX(-50%); padding: 10px 22px; background: rgba(20, 14, 8, 0.88); border: 1px solid #8a6d3b; color: #e8d9b5; font-size: 16px; z-index: 900;">
+        @joinStatusMessage
+        @if (joinStatusState is "choose" or "choose-bring" or "choose-fresh")
+        {
+            @* WO-125: a first join to this host world -- the player's choice, before anything is asked of the host.
+               WO-135: only the choice that has a save of the host's game version is offered. *@
+            <div style="margin-top: 8px; display: flex; gap: 12px; justify-content: center;">
+                @if (joinStatusState != "choose-fresh")
+                {
+                    <button class="btn btn-primary" @onclick='() => SendJoinChoiceAsync("bring")'>Bring my character</button>
+                }
+                @if (joinStatusState != "choose-bring")
+                {
+                    <button class="btn btn-secondary" @onclick='() => SendJoinChoiceAsync("fresh")'>Start fresh</button>
+                }
+            </div>
+        }
+        else if (joinCanFresh)
+        {
+            @* WO-154: no usable save (the message says why) -- the agent can join with a new character (mp_join_henry fresh) *@
+            <div style="margin-top: 8px; display: flex; gap: 12px; justify-content: center;">
+                <button class="btn btn-primary" @onclick='() => SendJoinChoiceAsync("fresh")'>Join with a new character</button>
+            </div>
+        }
+    </div>
+}
+
+@if (!string.IsNullOrEmpty(connStatusLine))
+{
+    @* WO-127: the agent's connection in plain words (never raw exception text) *@
+    <div class="conn-status-banner" style="position: fixed; left: 50%; bottom: 64px; transform: translateX(-50%); padding: 8px 20px; background: rgba(20, 14, 8, 0.88); border: 1px solid @(connStatusBad ? "#a0522d" : "#8a6d3b"); color: #e8d9b5; font-size: 15px; z-index: 899; max-width: 80%; text-align: center;">
+        @connStatusLine
+    </div>
+}
+
+@if (!string.IsNullOrEmpty(wo175StatusLine))
+{
+    @* WO-175 S2: the saves backup before a session, the same look as the connection line *@
+    <div class="conn-status-banner" style="position: fixed; left: 50%; bottom: @(string.IsNullOrEmpty(connStatusLine) ? "64px" : "112px"); transform: translateX(-50%); padding: 8px 20px; background: rgba(20, 14, 8, 0.88); border: 1px solid @(wo175StatusBad ? "#a0522d" : "#8a6d3b"); color: #e8d9b5; font-size: 15px; z-index: 899; max-width: 80%; text-align: center;">
+        @wo175StatusLine
+    </div>
+}
+
+<ErrorModal />

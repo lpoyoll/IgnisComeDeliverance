@@ -1,0 +1,217 @@
+@* Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
+   GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
+   content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them. *@
+@inherits ModalBase
+@using System.Diagnostics
+@using System.Globalization
+@using KCDMP_launcher.Models
+@using Serilog
+
+@* WO-175 S2: the saves backups made before each session (Models/Wo175Backup.cs), newest first; the player picks
+   one, confirms, and the current saves are backed up before they are replaced. Never while the game runs. *@
+@if (IsVisible)
+{
+    <div class="modal-overlay @(isClosing ? "closing" : "")">
+        <div class="modal-box" @onclick:stopPropagation="true" style="max-width: 560px;">
+
+            <div class="modal-frame-top modal-frame-bg"></div>
+
+            <div class="modal-content" style="text-align: left;">
+                <div class="modal-title" style="text-align: center;">RESTORE MY SAVES</div>
+
+                @if (selected is null)
+                {
+                    <p>
+                        Before each session the launcher keeps a copy of all your saves (the last 10).
+                        Pick the one to go back to.
+                    </p>
+                    @if (backups is null)
+                    {
+                        <div class="kcd-hint">Looking for backups...</div>
+                    }
+                    else if (backups.Count == 0)
+                    {
+                        <div class="kcd-hint">There are no backups yet. One is made each time you start the game from this launcher.</div>
+                    }
+                    else
+                    {
+                        @if (pickPath is not null)
+                        {
+                            <div class="kcd-hint" style="margin: 6px 0; color: var(--kcd-warn);">
+                                Your weapons got stuck in a save from your last session. Pick the marked backup: it is from before that session.
+                            </div>
+                        }
+                        @foreach (var b in backups)
+                        {
+                            <div class="kcd-input" style="margin-top: 6px; cursor: pointer;" @onclick="() => Pick(b)">
+                                @When(b) <span style="opacity: 0.7;">(@b.Files files, @Size(b.Bytes))</span>
+                                @if (IsPick(b))
+                                {
+                                    <span style="color: var(--kcd-warn);"> -- pick this one</span>
+                                }
+                            </div>
+                        }
+                    }
+                }
+                else
+                {
+                    <p>
+                        Your current saves will be backed up first, then replaced by the ones from @When(selected).
+                        The game must be closed.
+                    </p>
+                }
+
+                @if (!string.IsNullOrEmpty(resultText))
+                {
+                    <div class="kcd-hint" style="margin: 10px 0; @(resultOk ? "" : "color: var(--kcd-warn);")">@resultText</div>
+                }
+                @if (busy)
+                {
+                    <div class="kcd-hint">Restoring your saves... this can take a minute.</div>
+                }
+
+                <div class="modal-actions">
+                    @if (selected is not null && !done)
+                    {
+                        <button class="kcd-btn primary" disabled="@busy" @onclick="RestoreAsync">RESTORE</button>
+                        <button class="kcd-btn" disabled="@busy" @onclick="Back">BACK</button>
+                    }
+                    <button class="kcd-btn" disabled="@busy" @onclick="CloseModalAsync">CLOSE</button>
+                </div>
+            </div>
+
+            <div class="modal-frame-bottom modal-frame-bg"></div>
+        </div>
+    </div>
+}
+
+@code {
+    // The game executable from Settings: its process name is checked too (the Modding Tools build may differ).
+    [Parameter] public string GamePath { get; set; } = "";
+
+    private IReadOnlyList<Wo175Backup.BackupInfo>? backups;
+    private string? pickPath;   // WO-178 0.c: the backup the agent marked when a load found the weapons stuck
+    private Wo175Backup.BackupInfo? selected;
+    private bool busy;
+    private bool done;
+    private string resultText = "";
+    private bool resultOk;
+    private bool wasVisible;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        if (IsVisible && !wasVisible)
+        {
+            backups = null;
+            selected = null;
+            done = false;
+            resultText = "";
+            await LoadAsync();
+        }
+        wasVisible = IsVisible;
+    }
+
+    private async Task LoadAsync()
+    {
+        try
+        {
+            backups = await Task.Run(() => Wo175Backup.List(Wo175Backup.DefaultRoot()));
+            pickPath = Wo175Backup.ReadPick(Wo175Backup.DefaultRoot());
+        }
+        catch (Exception ex)
+        {
+            backups = Array.Empty<Wo175Backup.BackupInfo>();
+            resultOk = false;
+            resultText = $"The backups could not be read: {ex.Message}";
+            Log.Warning(ex, "WO175-RESTORE list failed");
+        }
+    }
+
+    private void Pick(Wo175Backup.BackupInfo b)
+    {
+        selected = b;
+        resultText = "";
+    }
+
+    private void Back()
+    {
+        selected = null;
+        resultText = "";
+    }
+
+    private async Task RestoreAsync()
+    {
+        if (selected is null || busy) return;
+        if (GameRunning())
+        {
+            resultOk = false;
+            resultText = "The game is running. Close Kingdom Come: Deliverance II first, then try again.";
+            Log.Information("WO175-RESTORE refused: the game is running");
+            return;
+        }
+        string? saves = Wo175Backup.ResolveSavesDir();
+        if (saves is null)
+        {
+            resultOk = false;
+            resultText = "Your saves folder (Saved Games\\KingdomCome2\\saves) could not be found. Start the game once, close it, then try again.";
+            Log.Information("WO175-RESTORE refused: no saves folder");
+            return;
+        }
+
+        busy = true;
+        resultText = "";
+        StateHasChanged();
+        Wo175Backup.BackupInfo pick = selected;
+        Wo175Backup.RestoreResult r;
+        try
+        {
+            r = await Task.Run(() => Wo175Backup.Restore(pick.Path, saves, Wo175Backup.DefaultRoot(), DateTime.Now));
+        }
+        catch (Exception ex)
+        {
+            r = new Wo175Backup.RestoreResult(pick.Path, null, 0, false, ex.Message);
+        }
+        finally
+        {
+            busy = false;
+        }
+
+        if (r.Verified) Log.Information(r.LogLine); else Log.Warning(r.LogLine);
+        resultOk = r.Verified;
+        if (r.Verified)
+        {
+            if (IsPick(pick)) Wo175Backup.ClearPick(Wo175Backup.DefaultRoot());   // WO-178: the marked backup is back; the mark goes
+            done = true;
+            resultText = $"Done. Your saves are now the ones from {When(pick)} ({r.Files} files)."
+                + (r.SafetyBackup is not null ? " The saves you had before are in a new backup at the top of this list, if you want them back." : "");
+        }
+        else if (r.SafetyBackup is not null)
+            resultText = $"The restore did not finish: {r.Why.TrimEnd('.')}. The saves you had before are in the newest backup; restore that one to go back.";
+        else
+            resultText = $"Nothing was changed: {r.Why.TrimEnd('.')}.";
+        await LoadAsync();
+    }
+
+    private bool GameRunning()
+    {
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "KingdomCome" };
+        try { if (!string.IsNullOrWhiteSpace(GamePath)) names.Add(System.IO.Path.GetFileNameWithoutExtension(GamePath)); } catch { }
+        foreach (var n in names)
+        {
+            var procs = Process.GetProcessesByName(n);
+            bool any = procs.Length > 0;
+            foreach (var p in procs) p.Dispose();
+            if (any) return true;
+        }
+        return false;
+    }
+
+    private bool IsPick(Wo175Backup.BackupInfo b) =>
+        pickPath is not null && string.Equals(System.IO.Path.GetFullPath(b.Path), System.IO.Path.GetFullPath(pickPath), StringComparison.OrdinalIgnoreCase);
+
+    private static string When(Wo175Backup.BackupInfo b) => b.Taken.ToString("d MMMM yyyy, HH:mm:ss", CultureInfo.InvariantCulture);
+
+    private static string Size(long bytes) => bytes >= 1048576
+        ? (bytes / 1048576.0).ToString("F1", CultureInfo.InvariantCulture) + " MB"
+        : (bytes / 1024.0).ToString("F0", CultureInfo.InvariantCulture) + " KB";
+}

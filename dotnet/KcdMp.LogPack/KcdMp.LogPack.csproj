@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    WO-171 L: the tester's log bundle, smaller. Collapses the engine's and the mod's known noise (runs of repeated lines) into
+    one line with a count, keeps every line that matters in full, drops byte-identical duplicate files, and writes a tar
+    compressed with zstd (7-Zip opens .tzst) in parts that each fit a Discord upload. No UI types here: the launcher's
+    Report Bug dialog gathers the files and calls this.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>KcdMp.LogPack</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="ZstdSharp.Port" Version="0.8.5" />
+    <InternalsVisibleTo Include="KcdMp.LogPack.Tests" />
+  </ItemGroup>
+
+</Project>

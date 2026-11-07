@@ -1,0 +1,277 @@
+# Testing `KingdomComeTogether-Setup-<version>.exe`
+
+> WO-134 (0.30.9): the installer is now `KingdomComeTogether-Setup-<version>.exe` and
+> installs as **Kingdom Come: Together** (same AppId, same install folder: it upgrades an
+> older `KCDMP-Setup` install in place, one entry in Windows' apps list). Older examples
+> below keep the old file names.
+
+> **WO-150: there is no Modding-Tools gate any more** (WO-154 rewrote the Tier 2 and 3 boxes
+> below to the current wizard). The page only informs: Setup always installs the launcher, places the mod only when the
+> Modding Tools are installed **and** their workspace linked, and otherwise holds it back
+> for the launcher's checklist (`docs/WO-150-findings.md`). The automated proof of the four
+> cases is `tools\Test-InstallerDetect.ps1` (detection, 26 checks) and
+> `tools\wo150\Test-SetupCases.ps1` (a Setup compiled from the real script, isolated from
+> any real install, 41 checks); both are gates in `tools\Build-Installer.ps1`. Fixtures for
+> `Test-Installer.ps1 -SteamRoot` now need the game and a linked workspace too
+> (`New-SteamFixture` in `Test-InstallerUpgrade.ps1` builds both).
+
+Three tiers, and they are not interchangeable. Tier 1 runs on any dev machine
+and is green. Tier 2 needs a human sitting in front of the wizard. Tier 3
+needs a machine that is *not* a dev machine, and nothing in tier 3 has been
+executed — every box in it is unticked and stays unticked until someone runs
+it and edits this file.
+
+Written 2026-07-30 (WO-8), against Setup 0.8.0 built on Windows 11 Pro
+22631 with Inno Setup 6.7.3.
+
+---
+
+## Tier 1 — automated, executed
+
+Three suites now. Re-run all of them after any change to `installer\*.iss`,
+`tools\Publish-Release.ps1`, `tools\Build-Installer.ps1`,
+`tools\Build-DirectInstall.ps1` or `tools\New-InstallManifest.ps1`.
+
+```bash
+powershell -ExecutionPolicy Bypass -File tools\Test-InstallerUpgrade.ps1
+```
+
+33/33 (WO-74) — **what happens when the directory Setup is upgrading is not
+clean.** Six independent installs into throwaway directories, detection pointed
+at a fixture tree the script builds, so the real game folder is never touched:
+virgin, clean previous release, the same version re-run over itself, a
+deliberately half-applied install, a damaged mod folder, and a negative control
+where a file genuinely cannot be written. The first five must end `PASS`; the
+sixth must end anything but — an installer that can finish silently over a
+half-state is the bug class WO-74 exists to close. Every cell compares the
+whole install directory against a clean install by path, size and sha256.
+
+The damaged cell is the one that matters. See `docs\WO-74-findings.md` for what
+it is reproducing and why the recipe has each ingredient in it.
+
+```bash
+powershell -ExecutionPolicy Bypass -File tools\Test-InstallerDetect.ps1
+```
+
+21/21 — Steam/Modding-Tools detection. Compiles `installer\SteamDetect.iss`
+(the file the installer itself includes, not a copy) into a probe and runs it
+against synthetic fixtures plus this machine's real Steam library:
+
+| Case | Asserted |
+|---|---|
+| multi-library | both library roots enumerated, app found in the second |
+| app-in-root-library | app found in the Steam root library |
+| missing-app | both libraries enumerated, nothing found |
+| malformed vdf | degrades to the Steam root, still finds a root-library app |
+| no vdf at all | still finds a root-library app |
+| manifest-but-no-files | rejected (manifest names an app whose files are gone) |
+| retail-not-modding-tools | rejected by the `Framework.dll` + `CrySystem.dll` discriminator |
+| offline library (`Z:\...`) | skipped, no crash |
+| empty Steam path | finds nothing, no crash |
+| this machine | Steam located from the registry, real Modding Tools found, discriminator passes |
+| parser | quoted key/value tokens, `\\` unescaping, quote-less line yields empty, install root derived from the exe path |
+
+```bash
+powershell -ExecutionPolicy Bypass -File tools\Test-Installer.ps1
+```
+
+39/39 — full lifecycle against the real Setup.exe. Silent install into a temp
+directory, then an upgrade over it, then a silent uninstall. Asserts the
+deployed executables and the self-contained runtime, the mod's arrival at
+`<ModdingTools>\Mods\kdcmp`, `settings.json` seeded with the detected game
+path (parsed as JSON, compared against the registry's record, checked to
+exist on disk), the shortcut's target *and* working directory, the Add/Remove
+Programs entry and its version, that an upgrade preserves a hand-edited
+`settings.json` and unrelated files in the install directory, and that
+uninstall removes the install directory, both shortcuts, `HKCU\Software\KCDMP`
+and the Add/Remove entry while leaving the mod alone.
+
+It refuses to run if a KCDMP install is already registered.
+
+By default it deploys the mod into the real game folder and removes it again
+afterwards. **Pass `-SteamRoot <fixture>` and it touches nothing outside the
+fixture** — build one the way `tools\Test-InstallerUpgrade.ps1` does, or reuse
+that script's. Prefer the fixture: there is no reason for a lifecycle test to
+go near the real game.
+
+WO-74 added one assertion to every install and upgrade in it: the installer's
+own verdict, `install-verify.txt`, must read `PASS`. Exit code 0 was never
+enough — a Setup that aborted part way through used to leave the *previous*
+run's PASS sitting there as the record of what happened.
+
+**What tier 1 cannot see:** `/VERYSILENT` skips every wizard page. The
+Modding-Tools gate page, the Steam deep-link button, Browse..., the WebView2
+download, and the replace-a-foreign-`kdcmp` prompt are all unexercised by it.
+
+## Tier 2 — interactive, one human, this machine
+
+Run `release\KingdomComeTogether-Setup-<version>.exe` by double-clicking it.
+
+- [ ] Welcome page appears; GPLv3 licence page shows the real licence text.
+- [ ] The Modding Tools page shows **Modding Tools found and set up.**, the correct
+      `KingdomCome.exe` path, and the `...\Mods\kdcmp` target the mod goes into.
+- [ ] **Browse...** → pick the *retail* `KingdomCome.exe` (app 1771300,
+      `KingdomComeDeliverance2`) → rejected with the "that is the retail
+      game" message, and the previously detected path is kept.
+- [ ] Install location page defaults to `%LocalAppData%\KCDMP`. No UAC prompt
+      appears at any point.
+- [ ] Desktop-icon task is checked by default.
+- [ ] Install completes; finish page mentions Host and `docs/NETWORKING.md`.
+- [ ] **Launch now** starts the launcher, and it opens with the game already
+      configured — Settings shows the right path and no first-run warning.
+
+**The hand-off, deliberately provoked** (WO-150: the page informs, it never stops you).
+
+> **Do not fake "not installed" by renaming the real
+> `appmanifest_2429020.acf`.** It looks reversible and is not. Steam reads
+> the absence of that file as "the app is not installed", drops the app's
+> entitlement, and the game then refuses to start with **"no license
+> found"** — the only way back is a full redownload. This was done once, on
+> 2026-07-30, and cost 8.8 GB. Setup takes a `/STEAMROOT` override precisely
+> so nobody has to do it again.
+
+Point Setup at a fixture tree instead. `tools\Test-InstallerDetect.ps1`
+builds them at `%TEMP%\kcdmp-detect-fixtures`; run it once first, then:
+
+```bash
+"release\KingdomComeTogether-Setup-<version>.exe" /STEAMROOT="%TEMP%\kcdmp-detect-fixtures\missing\Steam"
+```
+
+- [ ] The page says **The KCD2 Modding Tools are not installed yet.** ("the launcher
+      will install them through Steam"), and that you can continue.
+- [ ] **Next advances** (nothing is refused). The finish page says one more thing is
+      needed: open the launcher, whose checklist installs the Modding Tools through
+      Steam, links the game's files and places the mod.
+- [ ] **Re-check** after copying `%TEMP%\kcdmp-detect-fixtures\rootlib\Steam\steamapps`
+      over the `missing` fixture's `steamapps` → the page flips to found.
+- [ ] Cancel out rather than installing into a fixture (its "game" is a folder of
+      empty files).
+- [ ] A fixture with the Modding Tools but no linked workspace → **Modding Tools found,
+      but not set up yet.** The install completes without placing the mod; the
+      launcher's checklist places it after linking.
+- [ ] `/STEAMROOT="C:\definitely\not\here"` → **Steam was not found on this PC.** ("the
+      launcher will walk you through it"); Next still advances.
+
+The four cases are automated (Tier 1): `tools\Test-InstallerDetect.ps1` (detection) and
+`tools\wo150\Test-SetupCases.ps1` (a Setup compiled from the real script, isolated from any
+real install), both gates in `tools\Build-Installer.ps1`. This list is for the eyes: the
+words on the page, the finish page, the Re-check.
+
+**The player's settings on an upgrade (WO-154)** — automated:
+`tools\wo154\Test-SettingsUpgrade.ps1` installs 0.43.0 and 0.44.0 (the first WO-150 build)
+into throwaway folders, writes a player's `settings.json` (a custom game path, changed relay
+and network choices, a voice choice, unknown keys, CRLF and four-space indents),
+`custom_servers.json`, `favorites.json` and `kcdmp-client.json` by hand, installs the new
+Setup over each and compares every file byte for byte; `-Launcher` also starts the upgraded
+launcher once and compares again.
+
+**The half-apply dialog (WO-74) — still unticked, and the reason tier 2 exists:**
+
+- [ ] Make one file in the install directory unwritable in a way
+      `overwritereadonly` cannot clear — put a *directory* where a payload file
+      has to go — and run Setup interactively. It must present
+      Abort/Retry/Ignore and, whichever is chosen, must never reach a green
+      Finish page over a half-state: `install-verify.txt` must not read `PASS`.
+- [ ] Choose **Ignore** specifically. The post-install verification is
+      *reasoned* to catch that and has never been watched doing it.
+- [ ] Confirm the failure box says "THIS INSTALL IS NOT COMPLETE" and names
+      the affected components.
+
+**Replacing a foreign mod folder:**
+
+- [ ] With no KCDMP install registered (`HKCU\Software\KCDMP` absent), create
+      `<ModdingTools>\Mods\kdcmp\marker.txt` by hand and run Setup.
+- [ ] Setup asks before replacing it, and cancelling leaves the folder intact.
+
+**Uninstall:**
+
+- [ ] Uninstall from Add/Remove Programs asks whether to remove the mod from
+      the game folder; answering No leaves it, answering Yes removes it.
+- [ ] Either way the game itself is untouched.
+- [ ] **With the launcher deliberately left running**, start the uninstaller:
+      it must refuse with "Kingdom Come: Together is still running" and a
+      Retry/Cancel choice, and Cancel must leave the install completely
+      intact — not half-removed. Close the launcher, click Retry, and confirm
+      it then completes cleanly with no leftover files in
+      `%LocalAppData%\KCDMP`.
+
+      *Why this is on the list:* it was observed failing. Uninstalling with
+      the launcher open removed the registry entries and the uninstaller
+      itself but left ~120 of ~680 files behind, because Inno's built-in
+      CloseApplications uses the Restart Manager over `[Files]` entries and
+      does not cover the `[UninstallDelete]` sweep of `{app}`.
+
+## Tier 3 — clean machine
+
+This project has one development machine, with Steam, the Modding Tools, the .NET SDK
+and the WebView2 runtime already present — precisely the machine that cannot test any
+of the following. Only what someone has run on another machine is ticked here.
+
+**Reported by the maintainer: a WO-150 build on a machine with no Kingdom Come installed
+at all.** WO-154 asked for his result to be recorded here as he reports it. It had not
+reached this file when 0.45.0 was built: **awaiting the maintainer's report** (what the
+page said, whether the launcher's checklist installed the Modding Tools through Steam,
+linked the workspace and placed the mod, and anything that needed him).
+
+**A fresh Windows install with no WebView2 runtime** (Windows Server images
+and some LTSC/enterprise Windows 10 builds ship without it; confirm absence
+via `HKLM\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}`):
+
+- [ ] Setup detects it as missing.
+- [ ] The Evergreen bootstrapper downloads, with visible progress, and
+      installs silently and per-user (no UAC prompt).
+- [ ] The launcher's window actually renders afterwards.
+- [ ] With networking disabled, the download fails with the explanatory
+      message rather than hanging, and Setup does not proceed.
+
+**A machine with no Steam at all:**
+
+- [ ] The page says **Steam was not found on this PC.** rather than crashing or
+      claiming the Modding Tools are missing; Next advances; the launcher's checklist
+      says what is needed.
+- [ ] Browse... still works if the game was copied there by hand.
+
+**A machine with Steam but no Kingdom Come at all** (the maintainer's run above):
+
+- [ ] The page says the Modding Tools are not installed yet; Setup completes; the
+      launcher's checklist opens Steam's install window for the game / the free
+      Modding Tools, follows the download, links the workspace and places the mod.
+
+**Steam in a non-default location:**
+
+- [ ] Steam installed somewhere other than `C:\Program Files (x86)\Steam` is
+      found via `HKCU\Software\Valve\Steam\SteamPath`.
+- [ ] A library on a second drive, and a library on a drive that is
+      disconnected at install time, both behave (fixtures cover the parsing;
+      real Steam has not been tested in this shape).
+
+**Non-elevated write access:**
+
+- [ ] A Steam library whose ACL does *not* grant `BUILTIN\Users` write access
+      (unusual — Steam's own installer grants it — but possible after a
+      manual move) produces a clear failure rather than a half-deployed mod.
+
+**Other:**
+
+- [ ] A non-ASCII Windows username (`C:\Users\Jörg\...`): the seeded
+      `settings.json` is written UTF-8 without BOM and the launcher reads the
+      path back correctly.
+- [ ] SmartScreen: the installer is unsigned, so a first-time download will
+      show "Windows protected your PC". Note what a friend has to click.
+- [ ] Install, then move the Steam library, then re-run Setup: the new path
+      is detected and `settings.json`'s stale `GamePath` is *not* corrected
+      (a known limit — seeding only fills an empty `GamePath`; the launcher's
+      first-run check catches it and opens Settings instead).
+
+## Known limits, by design
+
+- **Unsigned.** No code-signing certificate, so SmartScreen will warn.
+- **Needs internet only when WebView2 is missing.** The bootstrapper is
+  downloaded rather than embedded, which keeps Setup small and always
+  current, but means a fully offline install on a machine without WebView2
+  cannot succeed.
+- **`/VERYSILENT` implies consent** to replacing an existing `kdcmp` folder
+  and answers "no" to removing the mod at uninstall time. There is no UI to
+  ask in, and those are the safer defaults in each direction.
+- **Steam owns the download.** Setup can deep-link and refuse to continue; it
+  cannot make Steam install anything.

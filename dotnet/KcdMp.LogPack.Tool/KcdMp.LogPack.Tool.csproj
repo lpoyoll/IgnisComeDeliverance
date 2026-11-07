@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- WO-171 L: development only, never shipped. Runs the log packer over the contents of a field bundle and checks what it promised. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\KcdMp.LogPack\KcdMp.LogPack.csproj" />
+  </ItemGroup>
+</Project>

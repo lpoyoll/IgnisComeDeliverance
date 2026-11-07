@@ -1,0 +1,29 @@
+// Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
+// GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
+// content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
+using System.Reflection;
+
+namespace KcdMp.Client;
+
+/// <summary>
+/// This agent's own release version (WO-19), read from the assembly's
+/// InformationalVersion attribute rather than a hardcoded constant. The SDK
+/// sets that attribute from the csproj's $(Version), which
+/// KcdMp.Client.csproj now reads from the repo-root VERSION file at build
+/// time (see the csproj's VersionFileContent property) -- so this is always
+/// whatever VERSION said at the moment this exe was built, with no second
+/// place to forget to update. VERSION itself is never touched here or by
+/// anything this feature adds; see docs/VERSIONING.md.
+/// </summary>
+public static class ReleaseVersionInfo
+{
+    public static readonly string Current =
+        Assembly.GetExecutingAssembly().GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+        ?? "0.0.0";
+
+    /// <summary>WO-211 0.2: this build's id (KcdMp.Wire.BuildId: the short commit and the build time; "dev" without one).</summary>
+    public static readonly string BuildIdValue = KcdMp.Wire.BuildId.Current;
+
+    /// <summary>WO-211 0.2: the release string the handshake carries ("version+build id"; a dev build: the version alone).</summary>
+    public static readonly string Wire = KcdMp.Wire.BuildId.Wire(Current, BuildIdValue);
+}

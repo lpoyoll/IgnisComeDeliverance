@@ -1,0 +1,301 @@
+﻿// Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
+// GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
+// content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
+// KCDMP.dll -- the injected native plugin.
+//
+// Loaded by KCDMP_LauncherInjector.exe via CreateRemoteThread(LoadLibraryA),
+// which is what KCDMP_launcher's LaunchGame already expects.
+
+#include "wo211.h"
+#include "motion.h"
+#include "hits.h"
+#include "wo132.h"
+#include "wo166.h"
+#include "wo173.h"
+#include "wo176.h"
+#include "wo178.h"
+#include "wo179.h"
+#include "wo187.h"
+#include "wo190.h"
+#include "wo194.h"
+#include "wo197.h"
+#include "wo200.h"
+#include "wo201.h"
+#include "wo202.h"
+#include "wo203.h"
+#include "combat_swing.h"
+#include "wo135.h"
+#include "wo137.h"
+#include "weather.h"
+#include "wo138.h"
+#include "wo139.h"
+#include "wo140.h"
+#include "wo141.h"
+#include "wo143.h"
+#include "concept_read.h"
+#include "dice_hook.h"
+#include "log.h"
+#include "main_thread.h"
+#include "mannequin_read.h"
+#include "npc_drive.h"
+#include "combat_write.h"
+#include "pipe_server.h"
+#include "respawn.h"
+#include "script_context.h"
+#include "join_native.h"
+#include "savelist.h"
+#include "crash_capture.h"
+
+#include <windows.h>
+
+namespace kcdmp { bool probe_rttr(); }
+namespace kcdmp::rttr {
+bool validate();
+void walk_to_soul();
+void probe_invoke();
+void probe_take_damage();
+void probe_attribution();
+void probe_faction();
+void probe_method_wrapper();
+void probe_dice_class();
+void probe_play_anim();
+void probe_play_anim_watch();
+void probe_combat_construct();
+void probe_combat_construct_watch();
+}
+
+namespace {
+
+DWORD WINAPI plugin_main(LPVOID) {
+    // DllMain runs under the loader lock, so all real work happens here.
+    kcdmp::logf("KCDMP.dll attached, pid=%lu build=%s", GetCurrentProcessId(), kcdmp::wo211::build_id());   // WO-211 0.2: the build id
+    // WO-202 I.1: before anything else -- a crash from here on leaves its evidence (crash_capture.h).
+    kcdmp::crash::install();
+
+    char exe[MAX_PATH]{};
+    GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    kcdmp::logf("host = %s", exe);
+
+    // If we are injected at process start the engine modules are not loaded
+    // yet. Wait for CrySystem rather than failing on a race.
+    // GUESS, unverified: 60 s is generous for a cold start off an SSD.
+    const DWORD deadline = GetTickCount() + 60'000;
+    while (!GetModuleHandleA("CrySystem.dll") && GetTickCount() < deadline) {
+        Sleep(250);
+    }
+
+    if (!kcdmp::probe_rttr() || !kcdmp::rttr::validate()) return 0;
+
+    if (!kcdmp::main_thread::install()) {
+        kcdmp::logf("MAIN: no tick -- refusing to touch game state from this thread");
+        return 0;
+    }
+
+    // Confirm the hook is on a live path before trusting it. A hook that never
+    // fires is indistinguishable from a queue that never drains, and work
+    // posted to it would sit there forever looking like a hang.
+    //
+    // WO-10: a single 1s sample-and-abort was wrong for automatic injection
+    // and reliably fired there. WHGame.dll is a static import, so it is
+    // present in the process almost instantly -- but the game's actual
+    // per-frame C_ModulesManager::Update tick does not start until well
+    // past the splash/menu screens, into an actually-loaded save. Injecting
+    // the moment the module is merely loadable hooks the import correctly
+    // but checks for ticks far too soon, and a one-shot check with no retry
+    // aborted permanently before the pipe or sampler ever started. Verified
+    // (docs/VERIFICATION-REPORT.md): the identical DLL, injected into the
+    // same still-running process minutes later once a save was actually
+    // loaded, ticked immediately ("25 frames in ~1s") -- this isolates the
+    // defect to timing, not the hook/rttr mechanism. Manual injection into
+    // an already-loaded game was never affected, since the tick is already
+    // live by the time the DLL attaches.
+    //
+    // Fix: poll instead of sampling once. This runs on its own background
+    // thread (see DllMain below), so waiting costs nothing but time -- it
+    // does not block the game or the loader. The ceiling is generous, not
+    // measured: a player may sit at the main menu for a while before
+    // loading a save, and there is no cost to waiting longer for a real
+    // player, only a benefit over giving up on one that just hasn't loaded
+    // yet.
+    constexpr DWORD kFrameCheckIntervalMs = 1000;
+    constexpr DWORD kFrameCheckCeilingMs  = 300'000; // 5 minutes
+    constexpr DWORD kFrameCheckLogEveryMs = 30'000;  // progress line, so a long wait doesn't look hung in the log
+
+    unsigned long long frames = 0;
+    DWORD waited = 0;
+    while (waited < kFrameCheckCeilingMs) {
+        Sleep(kFrameCheckIntervalMs);
+        waited += kFrameCheckIntervalMs;
+        frames = kcdmp::main_thread::frame_count();
+        if (frames > 0) {
+            kcdmp::logf("MAIN: %llu frames after ~%u ms -- tick is live", frames, waited);
+            break;
+        }
+        if (waited % kFrameCheckLogEveryMs == 0) {
+            kcdmp::logf("MAIN: still waiting for the tick to start (%u ms elapsed, 0 frames so far)", waited);
+        }
+    }
+    if (frames == 0) {
+        kcdmp::logf("MAIN: tick never fired after %u ms -- aborting before any game-state access", waited);
+        return 0;
+    }
+
+    // The walk caches SoulList/RPGModule pointers that everything else needs,
+    // so it has to happen before the pipe starts accepting commands.
+    const bool ran = kcdmp::main_thread::run_sync([] {
+        kcdmp::rttr::walk_to_soul();
+        kcdmp::rttr::probe_method_wrapper();
+        kcdmp::rttr::probe_dice_class();
+        // WO-15: re-enabled with the ownership fix (see rttr_abi.cpp). No-ops
+        // unless kcdmp-faction.txt exists beside the DLL -- opt-in, human
+        // writes the ghost/donor GUIDs deliberately before injecting.
+        kcdmp::rttr::probe_faction();
+        // WO-43 Phase 1: no-op unless kcdmp-playanim.txt exists beside the
+        // DLL -- opt-in, same convention as probe_faction above.
+        kcdmp::rttr::probe_play_anim();
+        // WO-44 direction-B precondition probe: no-op unless kcdmp-combat.txt
+        // exists beside the DLL -- opt-in, same convention. Read-only (or one
+        // idempotent GetOrCreateCombatActor call in mode=create); constructs
+        // and queues nothing.
+        kcdmp::rttr::probe_combat_construct();
+        // WO-68 Phase 1: no-op unless kcdmp-contexts.txt exists beside the
+        // DLL -- same opt-in convention. Read-only unless its line 2 says
+        // "write", and even then it undoes its own write.
+        kcdmp::sctx::probe_contexts();
+        // WO-113: death without Game Over. Resolves every anchor (fail
+        // closed per piece), installs the I_GameOver::Start guard, logs
+        // WO113-BUILD. The guard itself only arms in a session.
+        kcdmp::respawn::install();
+        // WO-118: the native per-frame puppet write. Anchors fail closed
+        // (WO118-NATIVE native_write=DISARMED): Lua then writes as before.
+        kcdmp::npcdrive::install();
+        // WO-121: movement and combat on the writer's bodies, the committed-
+        // action capture, and the combat-hit chokepoint. Each piece fails
+        // closed on its own (WO121-MOTION / WO121-HITS lines).
+        kcdmp::motion::install();
+        kcdmp::hits::install();
+    });
+    if (!ran) {
+        kcdmp::logf("MAIN: walk timed out waiting for a frame; not starting the pipe");
+        return 0;
+    }
+
+    // WO-6 R2 research hook: read-only, see dice_hook.cpp for the evidence
+    // behind the patch site. Not gated on pipe/rttr success -- independent
+    // of everything else this DLL does.
+    // WO-135: the avatar is never heard -- the dialogue-start gate (fails
+    // closed: WO135-DIALOG gate NOT armed). Off the main thread: the patch
+    // suspends every other thread while it writes.
+    kcdmp::wo135::install();
+    // WO-137: the quest State detector (two C_StateVariable vftable slots) and the
+    // Set<Value> apply. Fails closed (WO137-BUILD); silent until the agent turns it on.
+    kcdmp::wo137::install();
+    // WO-138: the PauseGame gate (CCryAction::PauseGame; off until the agent turns
+    // the levers on for a session with a partner). Fails closed (WO138-GATE).
+    kcdmp::wo138::install();
+    // WO-151 3.7: the host's live weather (EnvironmentModule BlendToProfile, gated pass-through:
+    // recorded on the host, only the host's profile on a joiner). Fails closed (WO151-WEATHER).
+    kcdmp::weather::install();
+    // WO-139: the trespass detector (the HUD's own trespass listener, gated
+    // pass-through). Fails closed (WO139-BUILD); off until the agent turns it on.
+    kcdmp::wo139::install();
+    // WO-140: the sleep gate (C_SkipTime::ShowDialog) and the clock pull. Fails
+    // closed (WO140-BUILD); off until the agent's Config for a session with a partner.
+    kcdmp::wo140::install();
+    // WO-141: activities -- the NPC-state context read (stance / unstance / hands /
+    // minigame) and its apply. Anchors fail closed (WO141-BUILD).
+    kcdmp::wo141::install();
+    // WO-143: hands, gaits, one-shots and look targets on top of WO-141 (the
+    // RequestStateChange capture gate is patched here, off the main thread).
+    // Fails closed per piece (WO143-BUILD).
+    kcdmp::wo143::install();
+    // WO-178 C1: the hostility answer for the local player's own fight (the combat RPG's test, a detour through the prologue registry).
+    // Fails closed (WO178-HOOK not armed); off the main thread for the same reason as the gates above.
+    kcdmp::wo178::install();
+    // WO-194: the EnqueueCutscene detour (every in-game cutscene a quest enqueues; the joiner's hold). Fails closed (WO194-HOOK not armed).
+    kcdmp::wo194::install();
+    kcdmp::wo200::install();   // WO-200: the out-port tap and the node gate (each off until the agent's Config)
+    kcdmp::wo201::install();   // WO-201: B1's resolver (the save path's own FastForward cancel)
+    kcdmp::wo202::install();   // WO-202: the switch word (op 88), the quest-fail tracer
+    kcdmp::wo203::install();   // WO-203: every area that registered with wo203.h (join the conversation, session C's fixes)
+
+    if (kcdmp::dice::install_pause_hook()) {
+        kcdmp::main_thread::post_repeating("dice::sample_instance_if_changed", &kcdmp::dice::sample_instance_if_changed);
+    }
+
+    // WO-44 follow-up: entity ids are assigned fresh every launch, so testing
+    // the direction-B probe against a ghost (as opposed to the player) needs
+    // the id known only after the game is already running. Re-check
+    // kcdmp-combat.txt on a timer instead of only once at attach, so a human
+    // can spawn a ghost, read its id live, and drop it into the file without
+    // a relaunch. No-ops whenever the file's content is unchanged.
+    kcdmp::main_thread::post_repeating("rttr::probe_combat_construct_watch", &kcdmp::rttr::probe_combat_construct_watch);
+    // Same live-reload treatment for WO-43's original PlayAnim diagnostic --
+    // needed to pin down a live discrepancy found while re-testing WO-44's
+    // ghost class-dispatch finding against a validated ghost.
+    kcdmp::main_thread::post_repeating("rttr::probe_play_anim_watch", &kcdmp::rttr::probe_play_anim_watch);
+    // WO-68: same live-reload treatment, so a soul guid can be dropped into
+    // kcdmp-contexts.txt after a ghost is already standing in the world.
+    kcdmp::main_thread::post_repeating("sctx::probe_contexts_watch", &kcdmp::sctx::probe_contexts_watch);
+    // WO-99.5: the quest-port probe. Same live-reload treatment, and the same
+    // reason -- a node path is chosen after looking at what the running game
+    // actually has. File-watched rather than pipe-driven on purpose: the pipe
+    // has nMaxInstances = 1, so a pipe command would mean disconnecting the
+    // client first (WO-97 s4.4's precondition), and this needs to run while a
+    // session is live.
+    kcdmp::main_thread::post_repeating("conceptread::port_watch", &kcdmp::conceptread::port_watch);
+    // WO-100 Phase 0: the Mannequin tag-state read. Same file-watched,
+    // opt-in convention and the same reason -- it has to run during a live
+    // session while the maintainer walks, jogs, sprints and crouches, and the
+    // pipe (nMaxInstances = 1) is occupied by the agent for the whole session.
+    kcdmp::main_thread::post_repeating("mannequin::tag_watch", &kcdmp::mannequin::tag_watch);
+    // WO-100.5 Phase 1: the first combat WRITE. Same file-watched shape, but
+    // ONE-SHOT rather than periodic -- a write that repeats at the tick rate
+    // is a hook, not a probe. Idle until kcdmp-combatwrite.txt names a command.
+    kcdmp::main_thread::post_repeating("combatwrite::write_watch", &kcdmp::combatwrite::write_watch);
+    // WO-113: the death guard's per-frame tick (rate-limits itself).
+    kcdmp::main_thread::post_repeating("crash::tick", &kcdmp::crash::tick);   // WO-202 I.1: the filter kept first, the module table
+    kcdmp::main_thread::post_repeating("respawn::tick", &kcdmp::respawn::tick);
+    // WO-121: drain the capture / friendly-fire queues, avatar jumps.
+    kcdmp::main_thread::post_repeating("motion::tick", &kcdmp::motion::tick);
+    kcdmp::main_thread::post_repeating("hits::tick", &kcdmp::hits::tick);
+    kcdmp::main_thread::post_repeating("wo132::tick", &kcdmp::wo132::tick);   // WO-132: the host's NPC combat-state watch
+    kcdmp::main_thread::post_repeating("wo166::tick", &kcdmp::wo166::tick);   // WO-166 C3: the copies' striking windows
+    kcdmp::main_thread::post_repeating("wo173::tick", &kcdmp::wo173::tick);
+    kcdmp::main_thread::post_repeating("wo176::tick", &kcdmp::wo176::tick);
+    kcdmp::main_thread::post_repeating("wo179::tick", &kcdmp::wo179::tick);   // WO-179: the fade edges and the relocation watch (read-only)
+    kcdmp::main_thread::post_repeating("wo178::tick", &kcdmp::wo178::tick);   // WO-178 C1: the candidate table the hostility answer reads   // WO-176 A1: a figure already in a quest's arranged fight is taken out   // WO-173 C1: the joiner's real hits' measures and corrections
+    kcdmp::main_thread::post_repeating("wo187::tick", &kcdmp::wo187::tick);   // WO-187: the copies' opponents, the moves' full-body scope
+    kcdmp::main_thread::post_repeating("wo190::tick", &kcdmp::wo190::tick);   // WO-190: the animation trace, the fighting bodies' idle watch
+    kcdmp::main_thread::post_repeating("wo194::tick", &kcdmp::wo194::tick);
+    kcdmp::main_thread::post_repeating("wo197::tick", &kcdmp::wo197::tick);   // WO-197: the local player's recoil and clinch polls   // WO-194: the holds' releases, the scenes' time of day back
+    kcdmp::main_thread::post_repeating("wo200::tick", &kcdmp::wo200::tick);
+    kcdmp::main_thread::post_repeating("wo201::tick", &kcdmp::wo201::tick);   // WO-201 B1: no joiner scene waits for the host's copies   // WO-200: the player soul the gate compares with, the closures' expiry
+    kcdmp::main_thread::post_repeating("wo203::tick", &kcdmp::wo203::tick);   // WO-203: every registered area's per-frame work
+    kcdmp::main_thread::post_repeating("rttr::swing_watch_tick", &kcdmp::rttr::swing_watch_tick);   // WO-167 C3: shown means rendered
+    // WO-124: the joiner's placement gives the fall damage back; the save-list
+    // research trigger (kcdmp-savelist-test.txt, opt-in, absent = idle).
+    // Observed: this tick runs at the MAIN MENU too on 1.5.5 (the pipe is up
+    // there), which the join's save-list rescan depends on.
+    kcdmp::main_thread::post_repeating("joinnative::tick", &kcdmp::joinnative::tick);
+    kcdmp::main_thread::post_repeating("savelist::test_watch", &kcdmp::savelist::test_watch);
+    kcdmp::main_thread::post_repeating("wo137::tick", &kcdmp::wo137::tick);   // WO-137: research file + the change queue
+    kcdmp::main_thread::post_repeating("wo138::tick", &kcdmp::wo138::tick);   // WO-138: the frame meter + the native NPC sender
+    kcdmp::main_thread::post_repeating("wo139::tick", &kcdmp::wo139::tick);   // WO-139: a new trespass level goes to the agent
+    kcdmp::main_thread::post_repeating("wo140::tick", &kcdmp::wo140::tick);   // WO-140: the sleep picker's edges go to the agent
+    kcdmp::main_thread::post_repeating("wo141::tick", &kcdmp::wo141::tick);   // WO-141: activities
+    kcdmp::main_thread::post_repeating("wo143::tick", &kcdmp::wo143::tick);   // WO-143: hands, gaits, one-shots, looks
+
+    kcdmp::pipe::start();
+    return 0;
+}
+
+} // namespace
+
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(module);
+        CloseHandle(CreateThread(nullptr, 0, plugin_main, nullptr, 0, nullptr));
+    }
+    return TRUE;
+}

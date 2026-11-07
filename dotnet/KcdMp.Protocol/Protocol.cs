@@ -1,0 +1,1944 @@
+// Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
+// GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
+// content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
+namespace KcdMp.Wire;
+
+/// <summary>
+/// The relay wire protocol.
+///
+/// Framing (every packet):  [type:1][payloadLen:2 LE][payload:N]
+/// Floats are little-endian IEEE-754.
+///
+/// Presence layer:
+/// C→S  0x00  Handshake:  [version:1][nameLen:1][name:UTF-8]
+/// C→S  0x01  Position:   [x:4f][y:4f][z:4f][rotZ:4f][flags:1]  (17 bytes)
+///                          flags bit 0: isRiding
+/// C→S  0x04  Ping:       [timestamp:8 LE int64]
+/// C→S  0x07  Voice:      [pcm:640]  (16 kHz mono 16-bit, 20 ms frame)
+/// S→C  0x02  Ghost:      [ghostId:1][x:4f][y:4f][z:4f][rotZ:4f][flags:1]  (18 bytes)
+/// S→C  0x03  Name:       [ghostId:1][name:UTF-8]
+/// S→C  0x05  Pong:       [timestamp:8 LE int64]  (echo of Ping)
+/// S→C  0x06  Disconnect: [ghostId:1]
+/// S→C  0x08  Voice:      [sourceId:1][pcm:640]
+/// S→C  0x09  VersionMismatch: [serverVersion:1]
+/// S→C  0xFF  Ack:        [assignedId:1]
+///
+/// Interaction layer (WO-2). Opt-in paired interactions: one player invites,
+/// the other accepts or declines, both enter a session the relay arbitrates,
+/// both leave. Dice (WO-5) and duelling are clients of this rather than
+/// separate protocols.
+/// C→S  0x0A  Invite:         [targetGhostId:1][kind:1][configLen:1][config:configLen]
+/// S→C  0x0B  InviteReceived: [sessionId:2][fromGhostId:1][kind:1]
+/// C→S  0x0C  InviteResponse: [sessionId:2][accept:1]
+/// S→C  0x0D  SessionStart:   [sessionId:2][peerGhostId:1][kind:1][role:1]
+/// C→S  0x0E  SessionEvent:   [sessionId:2][payload:N]
+/// S→C  0x0F  SessionEvent:   [sessionId:2][fromGhostId:1][payload:N]
+/// C→S  0x10  SessionLeave:   [sessionId:2][reason:1]
+/// S→C  0x11  SessionEnd:     [sessionId:2][reason:1]
+///
+/// Session event payloads are deliberately opaque to this layer. Each
+/// interaction kind defines its own, so dice scoring or duel arbitration can
+/// change without touching the session framing.
+///
+/// [configLen:1][config:configLen] on Invite is new in WO-5 and optional: a
+/// 2-byte Invite (no config) is still valid, matching the WO-2 wire exactly,
+/// so the presence layer and old test scripts needed no changes. It carries
+/// kind-specific open-time settings the same way SessionEvent carries
+/// kind-specific in-play events -- opaque to this layer, interpreted only by
+/// whichever kind reads it. Dice's config is
+/// [targetScore:2 LE][debugSeedOverride:4 LE, optional, debug relay builds only]
+/// [wagerAmount:4 LE, optional] (WO-33). wagerAmount sits after the debug
+/// field rather than replacing it, so the fixed offsets already read by
+/// <c>CreateDiceGame</c> do not move; a config shorter than 10 bytes means no
+/// wager (0), same optional-trailing-field idiom as everything else on this
+/// wire. In whole groschen, since <c>Inventory.AddMoney</c>/<c>RemoveMoney</c>
+/// take a float but the board only ever deals in whole numbers.
+///
+/// InviteReceived (0x0B) carries the same [configLen:1][config:configLen]
+/// trailer as Invite itself (WO-33) -- added so the invitee can see the
+/// stakes (and check their own balance) before answering, not just after
+/// accepting. Optional and trailing, same backward-compat idiom.
+///
+/// Combat layer (WO-4). Replicates damage and death against shared NPCs.
+/// C→S  0x12  Damage: [targetGuid:16][stamina:4f][health:4f][flags:1]  (25 bytes)
+/// S→C  0x13  Damage: [sourceGhostId:1][targetGuid:16][stamina:4f][health:4f][flags:1]  (26)
+/// C→S  0x14  Death:  [targetGuid:16]  (16 bytes)
+/// S→C  0x15  Death:  [sourceGhostId:1][targetGuid:16]  (17 bytes)
+///                      flags bit 0: suppressHitReaction
+///
+/// targetGuid is the NPC's SharedSoulGuid, in the same 16-byte order the game
+/// stores it. It is authored content shipped in the level data, so it is
+/// byte-identical on every installation — which is what makes a raw GUID a
+/// valid cross-client key at all. Entity ids and pointers are not: the same
+/// soul has different addresses in each process, and a runtime-spawned NPC has
+/// a different GUID per save, so only hand-placed souls may be addressed here.
+///
+/// The relay stays stateless, exactly as for voice: it orders and forwards and
+/// holds no world state. Authority is per-hit and belongs to the client whose
+/// player landed the blow.
+///
+/// Death is a separate packet, NOT inferred from health reaching zero. Two
+/// clients computing "dead" independently from slightly divergent health will
+/// eventually disagree, and disagreement about who is alive does not
+/// self-correct the way a health value does. Receivers must treat Death as
+/// idempotent and ignore a repeat for a soul already dead.
+///
+/// Loop prevention is the receiving client's job: damage applied because a
+/// Damage packet arrived must never itself be broadcast, or two clients will
+/// bounce a hit back and forth forever. That is local state, so it is
+/// deliberately not on the wire.
+///
+/// Dice layer (WO-5). Unlike SessionEvent, these do not just relay -- the
+/// relay itself is the authority (RNG, turn order, scoring, win detection),
+/// so it terminates and interprets DiceIntent rather than forwarding it, and
+/// DiceState is always the relay's own current snapshot, never a passthrough.
+/// C→S  0x16  DiceIntent: [sessionId:2][intentType:1][data:N]
+///              intentType: 0=Roll (no data), 1=Keep ([mask:1]), 2=Bank
+///              (no data), 3=Forfeit (no data). mask bit i selects the i-th
+///              die in the most recent DiceState's freeDice.
+/// S→C  0x17  DiceState:  [sessionId:2][currentPlayerRole:1][scoreInitiator:4][scoreAcceptor:4]
+///                        [turnTotal:4][targetScore:4][phase:1]
+///                        [freeDiceCount:1][freeDiceFaces:freeDiceCount]
+///                        [keptDiceCount:1][keptDiceFaces:keptDiceCount]
+///                        [bustedDiceCount:1][bustedDiceFaces:bustedDiceCount]
+///              A full snapshot, always -- never a delta. Sent to both
+///              participants identically; each already knows its own role
+///              from SessionStart. phase: 0=AwaitingRoll, 1=AwaitingKeep.
+///              bustedDiceFaces is the roll that just busted, non-empty only
+///              on the one snapshot immediately after a bust (freeDice is
+///              already empty by then -- the engine clears it in the same
+///              call that busts it, before this is ever sent). Appended
+///              after the original WO-5 layout; a parser that stops after
+///              keptDiceFaces still works, since the framing is
+///              length-prefixed.
+/// S→C  0x18  DiceError:  [sessionId:2][reason:1]  -- sent to the rejected
+///              sender only. The game state is unchanged; retry with a
+///              corrected intent.
+/// S→C  0x19  DiceEnd:    [sessionId:2][outcome:1][scoreInitiator:4][scoreAcceptor:4]
+///              [wagerAmount:4 LE, optional]
+///              outcome: 0=Initiator won, 1=Acceptor won. Sent to both
+///              participants, immediately followed by a normal SessionEnd
+///              (Completed) that removes the session.
+///
+///              wagerAmount (WO-33) is the amount agreed at invite time,
+///              echoed back rather than requiring either client to remember
+///              it from the original Invite/InviteReceived. Each client
+///              applies it to its OWN local currency only, once, right here
+///              -- winner Inventory.AddMoney, loser Inventory.RemoveMoney,
+///              never a cross-save write. This is also why a mid-match
+///              disconnect is safe by construction: SessionEnd(PeerDisconnected)
+///              fires instead of DiceEnd in that case, and nothing in this
+///              layer ever applies a wager outside this one packet handler.
+///              Absent (payload &lt; 15 bytes) means no wager, same optional-
+///              trailing-field idiom as everything else here.
+///
+/// Appearance layer (WO-9 armor, WO-10 weapons). Replicates the local
+/// player's currently-equipped clothing/armor AND weapons onto their ghost,
+/// per item, instead of the single hardcoded spawn-time preset.
+/// C→S  0x1A  AppearanceUp:   [itemCount:1][itemClass:16]*itemCount
+/// S→C  0x1B  AppearanceDown: [sourceGhostId:1][itemCount:1][itemClass:16]*itemCount
+///
+/// itemClass is the item's ItemClass GUID (the game's per-type id, e.g. every
+/// "GambesonShort01_m04_D2" shares one), read from
+/// EquipmentManager.EquippedArmorsByClassId AND EquippedWeaponsByClassId via
+/// the reflection debug API -- NOT the SharedSoulGuid used by the combat
+/// layer, and not an item instance id. Weapons (WO-10) were added to the same
+/// message rather than a sibling one: EquipItem/UnequipItem/CreateItems are
+/// item-class-agnostic (confirmed live, WO-10 -- the same calls that equip an
+/// armor class equip a weapon class), so the wire payload and the receiver's
+/// diff/apply logic need no new shape, only a second source map on the
+/// outbound read. itemCount is small in practice (a full outfit plus one or
+/// two weapons is under 20 slots) but bounded at
+/// <see cref="Protocol.MaxAppearanceItems"/> so a malformed sender cannot
+/// make a receiver allocate an unbounded array.
+///
+/// Sent only when the local player's equipped set changes, plus a slow
+/// unconditional heartbeat (see GameBridge) so a peer who joins after the
+/// last real change still converges -- the relay is stateless and does not
+/// remember or replay appearance for a late joiner, exactly like it does not
+/// for position.
+///
+/// The receiver diffs against what it last applied to that ghost (client-side
+/// state, not on the wire) and only touches the slots that actually changed:
+/// unequip what dropped out, equip what is new. This is the same
+/// per-hit-authority, no-new-server-state shape as the combat layer.
+///
+/// Pause/world-halt mitigation layer (WO-11). KCD2's UI-state pauses (the
+/// system menu, inventory, sleeping/skipping time) have no reachable native
+/// veto (docs/WO-11-findings.md, tier A closed) -- the local player's own
+/// tick keeps running, so this is not about un-pausing them. The problem is
+/// the shared-world side effect. Each client runs its own full simulation
+/// (HANDOFF-WO4-combat.md), so a player sitting in a menu stops advancing
+/// relative to a peer who is not.
+/// C→S  0x1C  PauseUp:   [state:1]                       (1 byte)
+/// S→C  0x1D  PauseDown: [sourceGhostId:1][state:1]       (2 bytes)
+///
+/// state: 1 = entered a pausing-like UI state, 0 = exited. Sent on every
+/// transition, not on a timer -- unlike Appearance there is no heartbeat,
+/// because a late joiner who missed an "entered" they cannot still be
+/// relevant to (the source's own tick has not stopped, so nothing about a
+/// missed transition compounds the way a missed appearance change would).
+///
+/// Detected client-side by tailing kcd.log for engine-emitted markers that
+/// bracket each state (docs/WO-11-findings.md addendum) -- no native hook,
+/// since 0.2 showed none exists for these states. Only the log-tail
+/// transport can see these lines; the HTTP transport never sends PauseUp.
+///
+/// **What a receiver does with it changed in WO-13.** WO-11 had every
+/// receiver drop its own t_scale for as long as any peer reported paused.
+/// That is retired and must not come back: it is correct for two players and
+/// wrong at any real size, because in a 20-person session one player opening
+/// their inventory would visibly slow the other nineteen. A player's own game
+/// must never slow because someone else paused.
+///
+/// The packet survives as a pure presence signal: the receiver tags that
+/// peer's ghost "[in menu]" so a motionless figure reads as "stepped away"
+/// rather than broken. A manual `mp_slow_time` console command remains as an
+/// independent, OR'd-in source of the same state, for states automatic
+/// detection misses (tutorial popups and photo mode were never confirmed to
+/// emit a log marker). Its name is now a misnomer -- it slows nothing; it
+/// marks you as away.
+///
+/// Release version layer (WO-19). A friendly, non-fatal companion to the
+/// Handshake version byte above -- that byte is wire *protocol*
+/// compatibility and the relay hard-refuses a mismatch there, unconditionally,
+/// unchanged by this. This layer is release *versioning* (VERSION,
+/// docs/VERSIONING.md): two builds can speak identical protocol and still be
+/// different releases, and a player on either side benefits from knowing that
+/// even though the connection itself will work.
+///
+/// C→S  Handshake gains an optional trailing field, appended after
+///      [name:UTF-8]: the sender's release version as UTF-8 text (e.g.
+///      "0.9.5"). Optional and trailing, the same idiom as Invite's
+///      [configLen][config] -- an old relay reads exactly
+///      [version][nameLen][name] and never looks past it, so a new client's
+///      extra bytes are silently ignored rather than breaking the parse.
+///      A new relay talking to an old client simply finds nothing there.
+/// S→C  0x1E  ReleaseVersion: [ghostId:1][releaseVersion:UTF-8]  -- no
+///      explicit length field, exactly like Name (0x03): the outer
+///      [type][payloadLen] framing already carries it. Broadcast to existing
+///      peers when a client's Handshake carried one (mirrors BroadcastName),
+///      and replayed to a new client for every existing peer that has one
+///      (mirrors SendAllNamesTo). Never sent for a client whose Handshake
+///      carried no release version, so an old agent build simply never
+///      appears in a peer's map -- nothing to compare, nothing shown.
+///
+/// See <see cref="ReleaseVersionCompare"/> for how a receiver turns two of
+/// these strings into "who's behind."
+///
+/// Shared player combat layer (WO-28). Replicates a *player's own* health,
+/// hits taken from NPCs, and death -- the gap WO-26 Phase 3 measured: the
+/// emit line carried position, rotation and two booleans, so when a test
+/// ghost was killed the player it represented kept playing at full health.
+///
+/// The existing combat layer (0x12-0x15) cannot carry this and Protocol's own
+/// comment above already says why: its targetGuid is only a valid cross-client
+/// key because it names *authored* content, and every player's real Henry
+/// carries the same SharedSoulGuid (4c2dcffb-... = player_henry, confirmed
+/// live in WO-26 Phase 1) so it cannot distinguish one player from another
+/// even in principle. Players are addressed by ghostId here instead.
+///
+/// C→S  0x1F  PlayerStateUp:   [health:4f][stamina:4f][flags:1]              (9)
+/// S→C  0x20  PlayerStateDown: [ghostId:1][health:4f][stamina:4f][flags:1]   (10)
+///              flags bit 0: isUnconscious
+///                   bit 1: isBleeding
+///
+/// Flow A, continuous player health. Deliberately a separate, low-rate pair
+/// rather than widening Position (0x01) / Ghost (0x02): those are the hottest
+/// packets in the protocol and health changes far less often than position.
+/// Sent on a change beyond <see cref="Protocol.PlayerStateHealthThreshold"/>,
+/// rate-limited to <see cref="Protocol.PlayerStateMinIntervalMs"/>, plus a slow
+/// unconditional heartbeat (<see cref="Protocol.PlayerStateHeartbeatSeconds"/>)
+/// so a peer who joins after the last real change still converges -- the relay
+/// is stateless and replays nothing, exactly as for appearance.
+///
+/// A receiver renders this and does not compute it: a player's health is
+/// authoritative on that player's own machine (Rule 1), and it is the only
+/// rule that cannot produce a disagreement which fails to self-correct.
+///
+/// C→S  0x21  PlayerHitUp:   [targetGhostId:1][health:4f][stamina:4f][flags:1]  (10)
+/// S→C  0x22  PlayerHitDown: [health:4f][stamina:4f][flags:1]                   (9)
+///
+/// Flow B, an NPC hurt a player. health/stamina are *loss amounts* (positive
+/// magnitudes), matching CombatSoul::TakeDamage's own argument semantics, not
+/// absolute values -- see the DLL's apply_damage. PlayerHitUp says "the ghost
+/// representing player N lost this much in my world"; the relay routes it to
+/// player N alone (it is NOT a broadcast) and drops the targetGhostId, since
+/// the recipient does not need to be told it is about themselves.
+///
+/// Each peer runs an independent single-player simulation, so if every peer's
+/// local NPCs generated hits against their local copy of every ghost, N peers
+/// would produce N damage streams for one conceptual fight and multiply the
+/// damage by N. NPC-versus-player combat is therefore authoritative on exactly
+/// one client (Rule 2) -- see 0x25 below, which is how a client knows whether
+/// it is that one.
+///
+/// C→S  0x23  PlayerDeathUp:   []                    (0) -- "I died"
+/// S→C  0x24  PlayerDeathDown: [ghostId:1]           (1)
+///
+/// Flow C, a player died. Sent by the dying player's own client (Rule 1) and
+/// never inferred by a peer from health reaching zero, for exactly the reason
+/// 0x14 already gives: two clients computing "dead" from slightly divergent
+/// health eventually disagree, and that disagreement does not self-correct.
+/// Idempotent -- a repeat for an already-dead player is ignored.
+///
+/// What death *does* is settled outside this protocol: the player who died
+/// reloads their own most recent save, ordinary single-player behaviour. Every
+/// player has always run a fully separate save and there is no mechanism to
+/// sync one player's save state to another's, so nobody else's world reverts.
+/// Peers simply see that player's ghost reappear wherever their save point put
+/// them once their game is back. See docs/WO-28-findings.md Phase 0 for what a
+/// mid-session reload actually does to the connection and the mod's Lua state.
+///
+/// S→C  0x25  CombatRole: [isDamageAuthority:1]      (1)
+///
+/// Which client currently holds Rule 2's NPC→player damage authority. The
+/// design this implements (docs/WO-26-shared-combat-design.md s3) names the
+/// role but not how a client learns it holds it, and the agent has no notion
+/// of "host" of its own -- ClientConfig only knows a relay address, and
+/// inferring authority from that address being loopback would break silently
+/// for anyone who starts the agent by hand. So the relay says so explicitly:
+/// it designates the lowest-id ready client and sends this on assignment and
+/// on every change (including when the holder leaves and it moves on).
+///
+/// This is the relay's only piece of derived per-session state, and it is not
+/// world state -- it is a fact about the connection set the relay already
+/// tracks. Both ends gate on it: a non-holder never sends PlayerHitUp, and the
+/// relay drops a PlayerHitUp from a non-holder anyway.
+///
+/// ---- NPC sync layer (WO-32) ----
+///
+/// C→S  0x26  NpcStateUp:   [nameLen:1][name:UTF-8][x:4f][y:4f][z:4f][rotZ:4f][health:4f][flags:1]
+/// S→C  0x27  NpcStateDown: [sourceGhostId:1] + the upstream body verbatim
+///                            flags bit 0: dead in the authority's world
+///                                 bit 1: knocked out in the authority's world (WO-38 Phase 6)
+///
+/// One hand-placed NPC's position/state, streamed by the world authority so
+/// every peer's local copy of that NPC mirrors the authority's copy instead of
+/// running its own schedule. WO-32's live finding is what makes this a stream
+/// and not a one-shot: a single external position write on a real NPC lands
+/// and is then reverted by the engine to the NPC's schedule anchor within
+/// ~1.5 s, while a continuous 50 ms write stream holds completely -- so the
+/// receiver drives the NPC every interp tick for as long as packets keep
+/// arriving, and simply stops when they stop, at which point the engine
+/// restores the NPC to its own schedule on its own (observed: back on anchor
+/// within 3 s, dialogue intact, no crime/faction side effects).
+///
+/// Addressed by entity NAME, not SharedSoulGuid: hand-placed NPCs' names are
+/// authored level content, byte-identical on every install (same reason soul
+/// GUIDs are a valid key for 0x12), and the receiving side is Lua, where
+/// System.GetEntityByName is the only cheap lookup -- a GUID would have to be
+/// resolved through the REST API on every apply. Runtime-spawned entities
+/// (ghosts, kcd2mp_*) are excluded by the emitter; names are validated
+/// [A-Za-z0-9_]+ before being interpolated into Lua.
+///
+/// Authority: reuses Rule 2's holder (0x25) as the DEFAULT stream -- one
+/// world dictates NPC state, same single-authority shape and enforcement
+/// point as PlayerHitUp. The emitting mod gates its ambient 30 m stream on
+/// the same flag (KCD2MP.hitSensorOn), so a non-authority never ambiently
+/// samples in the first place.
+///
+/// **Per-entity authority migration (WO-39 Phase 2):** a non-authority
+/// client MAY send NpcStateUp for an entity its player is physically
+/// manipulating (dragging/carrying a downed body -- the WO-38 report's
+/// corpse-drag gap). Sending state for an entity IS the claim: there is no
+/// claim packet. The relay's per-entity table (first claim wins, by relay
+/// arrival order -- the TimeSkip arbitration shape) then routes that
+/// entity's stream from the claimant and DROPS the global authority's
+/// packets for it, which is also what closes the echo loop (the authority
+/// re-sampling its own driven copy cannot re-broadcast it). The claim is
+/// refreshed by every packet and expires after
+/// <see cref="Protocol.NpcClaimTimeoutSeconds"/> of silence, or immediately
+/// on the claimant's disconnect; the authority's stream then resumes.
+/// Receivers need no notion of any of this -- they apply whatever
+/// NpcStateDown arrives, whoever sent it.
+///
+/// **Proximity claims (WO-60):** a non-authority also runs the same 30 m
+/// rescan/emit loop around its OWN player (mod toggle mp_npc_proximity, on
+/// by default) and claims nearby NPCs through this exact mechanism -- a new
+/// emitter, not a new rule. NPCs already streamed by someone else are
+/// puppets on that machine and are excluded from its rescan, so a claim is
+/// only ever attempted for an entity nobody is actively driving; the relay
+/// stays the arbiter for races. Packets whose flags carry
+/// <see cref="Protocol.NpcStateFlagEngaged"/> additionally arm a per-claim
+/// engagement hold (<see cref="Protocol.NpcClaimEngagedHoldSeconds"/>) so a
+/// claim on an actively-fought NPC cannot flap to another sender through a
+/// brief packet gap. This is what closes WO-51 §1.4's "radius gap" and
+/// "engagement asymmetry" rows: the machine actually near an NPC -- the one
+/// simulating it at full fidelity -- becomes its stream.
+///
+/// A receiver that has no entity by that name loaded (different streaming
+/// state, different world area) ignores the packet -- there is nothing to
+/// drive and nothing to create. This layer moves EXISTING NPCs; it never
+/// spawns one.
+///
+/// ---- Time-skip sync layer (WO-38 Phase 1) ----
+///
+/// C→S  0x28  TimeSkipUp:   [phase:1][kind:1][worldTime:4 LE uint32]                  (6)
+/// S→C  0x29  TimeSkipDown: [sourceGhostId:1][phase:1][kind:1][worldTime:4 LE uint32] (7)
+///
+/// Synchronises the day/night clock across players -- the WO-38 report's
+/// Section F: a player who sleeps to midnight leaves every peer still in
+/// daytime, and the diverged clocks put each world's NPCs on different
+/// schedules (a major driver of the Section C/G phasing).
+///
+/// worldTime is Calendar.GetWorldTime()'s value: whole seconds from start of
+/// level, authored world data, byte-identical semantics on every install --
+/// the same reasoning that makes soul GUIDs and entity names valid
+/// cross-client keys. It is meaningful only on a done phase; senders put 0 on
+/// a start.
+///
+/// phase: 0 = start (a skip began; carries no time yet -- the target of a
+///            vanilla sleep/wait is not knowable from outside until it
+///            resolves), 1 = done (the skip resolved; worldTime is the
+///            resulting clock), 2 = done-quiet (S→C only: apply the time but
+///            do not announce it -- see the join rule below).
+/// kind:  0 = bed sleep, 1 = wait/pass-time, 2 = fast travel, 255 = unknown.
+///        Wording only ("slept till" vs "passed time to"); receivers treat
+///        every non-zero kind the same mechanically.
+///
+/// **One active skip per session** (the WO-38 design rule): the relay tracks
+/// which client's start arrived first and that skip becomes the session's one
+/// active skip. A start from anyone else while one is active is dropped --
+/// that player is *joined* to the active skip instead, recorded in a joined
+/// set. Deterministic by relay arrival order of the start packets, never by
+/// comparing two finished results after the fact.
+///
+/// Done routing:
+///  - done from the active skip's owner: broadcast as phase=done (announce --
+///    receivers show "&lt;name&gt; slept till 8:00 AM"), active skip cleared
+///    into a short grace record.
+///  - done from a joined client (while active, or within the grace window
+///    after the owner finished): broadcast as phase=done-quiet. Their own
+///    vanilla skip cannot be retargeted or rewound from outside
+///    (Calendar.SetWorldTime is documented "Must not be set backwards"), so
+///    if they overshot the owner's target the session converges *up* to
+///    their result -- silently, because the spec's join rule is that being
+///    absorbed into an active skip must not produce a second notification.
+///  - done from a client with no active skip and no grace membership: an
+///    instant skip (start+done in one) -- this is what a fast-travel time
+///    jump looks like, detected agent-side by a clock-jump watcher rather
+///    than a log marker. Broadcast as phase=done (announced).
+///
+/// Receivers apply with Calendar.SetWorldTime(target) **forward only** (the
+/// engine's own documented constraint); a receiver already past the target
+/// keeps its own clock, so the residual divergence after any exchange is
+/// bounded by overshoot, never by hours. A receiver whose own skip is still
+/// resolving queues the target and applies it when its own skip ends.
+///
+/// Deliberately NOT gated on Rule 2's authority: any player's sleep counts
+/// (the WO-38 spec: "when any player sleeps/waits/fast-travels"), so this
+/// layer has its own first-come arbitration instead of the damage
+/// authority's.
+///
+/// The relay's active-skip record expires after
+/// <see cref="TimeSkipTimeoutSeconds"/> (a vanilla skip resolves in well
+/// under a minute of real time) and is cleared into grace when its owner
+/// disconnects, so a crashed sleeper cannot wedge the session.
+///
+/// ---- Horse identity layer (WO-38 Phase 5) ----
+///
+/// C→S  0x2A  HorseInfoUp:   [nameLen:1][name:UTF-8]                  (1 + nameLen)
+/// S→C  0x2B  HorseInfoDown: [sourceGhostId:1][nameLen:1][name:UTF-8] (2 + nameLen)
+///
+/// Which world horse the sending player is currently riding, by entity name
+/// -- the same cross-client key as the NPC sync layer, valid for the same
+/// reason (authored entity names are byte-identical per install). nameLen 0
+/// means dismounted, or mounted on a horse whose identity could not be read
+/// (runtime-spawned horses have per-save generated names that do NOT travel).
+///
+/// The WO-38 report's Section D is the entire motivation: mounting used to
+/// exist only as a boolean on the position stream, so the receiver spawned a
+/// generic Horse-class proxy -- always the default (grey) look, phantom
+/// (nothing but the mod knows it exists, so it cannot be mounted or hit),
+/// and despawned on dismount. With the name on the wire, a receiver whose
+/// world has the same-named horse adopts THAT entity as the ghost's mount:
+/// right look, and a real, interactive horse that stays in the world after
+/// the dismount. The proxy remains the fallback when the name is unknown or
+/// not loaded here.
+///
+/// Sent on mount/dismount transitions plus a slow re-emit while mounted so a
+/// late joiner converges -- the relay is stateless and replays nothing, the
+/// same reasoning as Appearance. Broadcast to everyone; no authority gate
+/// (like the pause layer, it is a fact about the sender, not about the
+/// shared world).
+///
+/// ---- Combat visibility layer (WO-39 Phase 1) ----
+///
+/// C→S  0x2C  CombatEventUp:   [event:1]                    (1)   v2 (WO-99): [event:1][sid:2]                 (3)
+/// S→C  0x2D  CombatEventDown: [sourceGhostId:1][event:1]   (2)   v2 (WO-99): [sourceGhostId:1][event:1][sid:2] (4)
+///            sid = the sender's swing counter, the cross-machine correlation id for MP-SWING.
+///            Relay accepts both lengths and forwards the body verbatim; a v1 receiver drops a v2 packet.
+///
+/// The WO-38 report's Phase 4 gap: the emit line carries position, rotation,
+/// riding/sneaking flags, health, stamina, dead, unconscious -- and NOTHING
+/// combat-shaped, so an observing player watched a friend stand motionless
+/// with arms down through a whole real fight. This layer carries the visual
+/// facts of the sender's combat state so their ghost can act them out.
+///
+/// event: 0 = weapon drawn, 1 = weapon sheathed, 2 = swing, 3 = block.
+///
+/// These are discrete transitions/events, not continuous state, which is why
+/// this is its own low-rate packet pair (the PlayerHit shape) rather than a
+/// widened Position/Ghost -- those are the hottest packets in the protocol
+/// and a swing happens at most a couple of times per second. The mod
+/// rate-limits swing/block emission and re-emits the drawn state on a slow
+/// heartbeat while it holds (<see cref="CombatDrawnHeartbeatSeconds"/>), so a
+/// late joiner converges -- the relay is stateless and replays nothing,
+/// exactly as for Appearance and HorseInfo.
+///
+/// Everything here is COSMETIC on the receiving side: draw/sheathe call the
+/// ghost's own Human scriptbinds (DrawWeapon/HolsterWeapon), swing/block play
+/// one-shot animations. No damage flows through this layer -- real damage
+/// keeps its existing authoritative paths (0x12 for NPCs, 0x21 for players),
+/// so a spoofed or duplicated combat event can make a ghost wave a sword,
+/// never hurt anyone. Broadcast to everyone; no authority gate (like the
+/// pause and horse layers, it is a fact about the sender, not about the
+/// shared world). Unknown event bytes are ignored by receivers, so this
+/// enum can grow (stagger, hit-reaction) without a protocol bump.
+///
+/// ---- Weather sync layer (WO-40 Phase 3) ----
+///
+/// C→S  0x2E  WeatherUp:   [nameLen:1][profileName utf8][blendSec:2]                  (var)
+/// S→C  0x2F  WeatherDown: [sourceGhostId:1][nameLen:1][profileName utf8][blendSec:2] (var)
+///
+/// The 2026-08-18 footage: "Weather is not synced at all... for PA it is
+/// sunny, for PB it is foggy." The engine exposes a write
+/// (EnvironmentModule.BlendTimeOfDay(profile, blend, force) -- officially
+/// documented, used by Warhorse's own scripts) but NO current-profile read
+/// (GetRainIntensity is the only readback), so the time-sync shape
+/// "detect a local change, broadcast it" cannot work here: nobody can detect
+/// vanilla weather changing. The session's weather is therefore
+/// MOD-ARBITRATED: the damage-authority holder (an existing single-role
+/// concept with relay-managed failover) picks a profile on a slow cadence,
+/// applies it locally and broadcasts it; receivers apply the same profile.
+/// Late joiners converge via the arbiter's heartbeat re-send (the relay is
+/// stateless and replays nothing, exactly as for Appearance/HorseInfo).
+///
+/// Cosmetic by construction: weather affects mood and NPC flavor behavior,
+/// no damage or authority flows through it. Broadcast, no relay gate -- only
+/// the authority sends by convention, and a spoofed profile name can only
+/// ever name a real table row (receivers validate charset; the engine
+/// ignores unknown profiles).
+///
+/// ---- Name-addressed NPC damage layer (WO-40 Phase 5) ----
+///
+/// C→S  0x30  NpcDamageUp:   [nameLen:1][name][stamina:4f][health:4f][flags:1]                  (var)
+/// S→C  0x31  NpcDamageDown: [sourceGhostId:1][nameLen:1][name][stamina:4f][health:4f][flags:1] (var)
+///
+/// WO-39 Phase 3 proved the 0x12 wire guid is the per-save Soul Guid, not
+/// SharedSoulGuid, and flagged cross-install stability as the open premise.
+/// The 2026-08-18 bundles settled it: PA's guard-fight damage failed to
+/// resolve on PB 571/571 times ("soul not loaded here") while the choke
+/// victim applied 176/176 -- per-save Guids match for some NPCs and not
+/// others, so guid-addressed damage is unreliable across installs. Entity
+/// NAME is the proven stable cross-client key (NPC sync has used it since
+/// WO-32). This layer sends damage by name: the sender translates its
+/// per-save guid to the soul's name once (reflection REST, cached); the
+/// receiver translates the name to ITS OWN per-save guid once (same REST,
+/// cached) and applies through the existing DLL pipe. 0x12 remains the
+/// fallback when the sender's name lookup fails, and still works whenever
+/// the guids happen to match. A sender uses 0x30 OR 0x12 for one hit, never
+/// both -- both resolving on the receiver would double-apply.
+///
+///                      flags bit 0: suppressHitReaction (as 0x12)
+///                      flags bit 1: FATAL (WO-86) -- the sender's copy of this
+///                                   NPC is dead. The receiver applies the
+///                                   carried damage as usual and then kills
+///                                   its own copy (the idempotent ApplyDeath
+///                                   pipe command 0x14/0x15 were built for).
+///
+/// WO-86: death was never on the wire for NPCs. 0x14/0x15 (WO-4) exist with
+/// a relay route and a receiver, but no client ever sent one -- the DLL's
+/// LocalHit frame dropped its own `died` bit and SendLocalDeathAsync had no
+/// caller -- so "is this NPC dead" was decided on every machine independently
+/// from health deltas, which is exactly the divergence the 0x14 comment
+/// predicted would never self-correct. A dead NPC is a name-addressed fact
+/// like the damage that killed it, so it travels as a flag on 0x30 rather
+/// than by re-wiring the guid-addressed 0x14 (per-save guids are unreliable
+/// across installs, the premise WO-40 settled). health may be 0 on a FATAL
+/// packet (the Lua observer saw the death, not the blow) or carry the killing
+/// blow's delta (the DLL saw both). Protocol.Version is NOT bumped: additive
+/// -- a pre-WO-86 receiver applies the damage and ignores the bit, a
+/// pre-WO-86 sender never sets it -- the same reasoning as the WO-28 layer.
+/// Relay: pass-through, unchanged body; it logs FATAL packets (WO-81 idiom).
+///
+/// ---- Dropped-item sync layer (WO-48) ----
+///
+/// C→S  0x32  ItemDropUp:   [dropId:4 LE][itemClass:16][amount:2 LE][health:4f][x:4f][y:4f][z:4f]  (38)
+/// S→C  0x33  ItemDropDown: [sourceGhostId:1] + the upstream body verbatim                          (39)
+/// C→S  0x34  ItemClaimUp:  [dropId:4 LE]                                                            (4)
+/// S→C  0x35  ItemClaimDown:[claimerGhostId:1][dropId:4 LE]                                          (5)
+///
+/// A player deliberately dropping an item for another player is direct
+/// interaction, so it is shared; chests and NPC pockets stay per-player on
+/// purpose (whoever loots first would empty them for everyone). This is a
+/// TRANSACTIONAL layer, not a stream: a drop happens once, sits inert, and is
+/// consumed exactly once — the time-skip arbitration shape, not the NPC
+/// sync's continuous per-entity authority (whose flapping risk a static item
+/// does not need to buy).
+///
+/// itemClass is the ItemClass GUID, the appearance layer's established
+/// per-type key (byte-identical on every install). dropId is minted by the
+/// dropping client's agent (random nonzero uint32) at broadcast time — a
+/// player-dropped item has no authored identity, so one is created for it,
+/// the same runtime-minting idiom as ghost ids. Every client keys its local
+/// bookkeeping (dropId → its own world's entity/wuid) off it. health rides
+/// along because two same-class items differ by condition, and the receiver's
+/// CreateItem wants it; amount covers stackables (arrows, herbs).
+///
+/// Drop flow: the dropper's mod detects its player's own drop locally (new
+/// PickableItem entity near the player + that class's inventory count
+/// decreased — both halves required, which is what filters out world items
+/// streaming in and NPCs dropping things nearby), the agent minted a dropId
+/// and sends 0x32, the relay broadcasts 0x33 to the others. Receivers hold
+/// the drop pending and only materialize the pickup entity once their local
+/// player is within ~70 m — placing farther away was observed to drop the
+/// entity through unstreamed ground (WO-48 findings). The dropper's agent
+/// re-sends its still-unclaimed drops every
+/// <see cref="ItemDropHeartbeatSeconds"/> so a late joiner converges;
+/// receivers dedupe by dropId. The relay is stateless and replays nothing,
+/// exactly as for Appearance.
+///
+/// Claim flow — the race case is the design case: both players can go for
+/// the same item within one RTT. Each client's watcher notices its local
+/// copy vanish (without the mod itself having removed it) and sends 0x34.
+/// The relay echoes 0x35 to ALL clients INCLUDING the claimant, in arrival
+/// order — its TCP serialization is the whole arbiter, no claim table. Every
+/// client resolves a dropId on the FIRST 0x35 it sees and ignores repeats:
+/// a copy still on the ground is removed (flagged first, so the watcher does
+/// not read the removal as another claim — the 0x13 loop-prevention idiom);
+/// the winning claimant keeps the item; a losing claimant deletes the gained
+/// item from its inventory by the wuid it recorded at spawn time. The echo
+/// must include the claimant: with others-only broadcast, two simultaneous
+/// claimants would each see only the OTHER's claim and both roll back — the
+/// item would evaporate. No client ever concludes "I won" from local state;
+/// only the echo decides.
+///
+/// ---- Capacity layer (WO-76) ----
+///
+/// S→C  0x36  ServerFull: [maxPlayers:1]
+///
+/// Sent instead of silently closing the socket when a handshake arrives at a
+/// relay already at ServerInfo:MaxPlayers (docs/WO-75-audit-findings.md s1,
+/// PR #1 merge message). Before this, a full relay just dropped the
+/// connection with no packet, so a reconnecting client's generic "expected
+/// Ack" error path could not tell "full" from any other refusal and kept
+/// retrying every few seconds forever -- burning one byte-wide session id per
+/// attempt on top of it. Fatal for the client like VersionMismatch: retrying
+/// immediately cannot help, so the agent stops reconnecting on sight of this
+/// rather than looping.
+///
+/// ---- Story progress layer (WO-90) ----
+///
+/// C→S  0x37  StoryBeatUp:   [kind:1][len:1][text utf8]                  (var)
+/// S→C  0x38  StoryBeatDown: [sourceGhostId:1][kind:1][len:1][text utf8] (var)
+///
+/// kind 1 = quest objective key (WO-90). WO-94 adds, on the SAME two bytes,
+/// kind 2 = "approaching main-quest beat <quest>.<trigger>", kind 3 =
+/// "catch-up fired for <beat>" and kind 4 = "catch-up window closed for
+/// <beat>". The relay copies the body verbatim whatever the kind; a WO-90
+/// receiver checks kind == 1 and drops the rest, so no version bump.
+///
+/// The first quest-state anything this project has carried. Before WO-90 the
+/// mod synchronized position, animation, vitals, combat, NPCs, appearance,
+/// horses, weather, world time, dropped items, dice and voice -- and nothing
+/// whatsoever about where each player was in the story. Two players ran two
+/// independent campaigns in one shared NPC name space, which is what the
+/// 2026-09-12 session's story-beat findings are all downstream of.
+///
+/// `text` is the engine's own quest+objective localisation key, taken
+/// verbatim from the line kcd.log already writes at every checkpoint save:
+///
+///   InitiateSaveGame() type: AutoSave, overwriteSaveId: -1,
+///     questNameOverride: '@qname_prepadeni_KsSs|@prepadeni_nasleduj_ptacka_ZyXB'
+///
+/// Verbatim on purpose: the key is byte-identical on both machines for the
+/// same objective (confirmed across every shared beat in that session), so
+/// exact string equality is a sound "are we at the same point" test, while
+/// any prettifying is display-only and cannot affect the comparison.
+///
+/// **This layer is pure telemetry and deliberately changes no behaviour.** It
+/// exists so each client can NAME the divergence it is already reacting to
+/// locally (the receiver-side divergence release in kdcmp.lua, which needs no
+/// agreement from anyone). A checkpoint save is a coarse clock -- six markers
+/// in ninety minutes in the field logs -- which is precisely why it is not
+/// used to gate anything: for most of the session in which one player dragged
+/// the other's NPCs around, both clients' last-known objective was the SAME
+/// string. Anything that gated NPC sync on this comparison would have been
+/// silent through the actual damage. See docs/WO-90-findings.md.
+///
+/// Relayed verbatim to every other client with the sender prefixed, like
+/// HorseInfo and Weather: a fact about the sender, not about the shared
+/// world, with no arbitration to do.
+///
+/// ---- Clock-offset sampling (WO-98 Phase 1) ----
+///
+/// C→S  0x39  ClockSyncUp:   [clientSendUtcTicks:8 LE int64]                                   (8)
+/// S→C  0x3A  ClockSyncDown: [clientSendUtcTicks:8][relayRecvUtcTicks:8][relaySendUtcTicks:8]  (24)
+///
+/// NTP-shaped: the client stamps t0 on send, the relay stamps t1 on receipt
+/// and t2 on reply, the client stamps t3 on receipt, and
+///   offset = ((t1 - t0) + (t2 - t3)) / 2      (relay clock minus client clock)
+///   rtt    = (t3 - t0) - (t2 - t1)
+/// The relay runs on the host's machine, so a joiner's offset IS the
+/// host-vs-joiner wall-clock skew -- the 2026-09-15 session measured ~4.8 s
+/// of it from story-beat propagation alone (docs/WO-98-findings.md s1), and
+/// nothing in the stack could see it. MEASUREMENT ONLY: nothing consumes the
+/// estimate yet; it is logged (MP-CLOCK) and handed to the mod for display.
+/// Ping (0x04/0x05) is left alone: its echo carries only the client's own
+/// stamp, so it can measure RTT but never offset.
+///
+/// A pre-WO-98 relay skips an unknown 0x39 (payload read and discarded, the
+/// read loop's fall-through), so a new client against an old relay simply
+/// never gets an estimate; an old client never sends it. No version bump.
+///
+/// ---- Release-version enforcement (WO-110 R9) ----
+///
+/// S→C  0x3D  ReleaseVersionMismatch: [relayReleaseVersion:UTF-8]
+///
+/// Sent instead of the Ack when a Handshake's trailing release-version field
+/// is non-empty and differs from the relay's own build version, then the
+/// socket is closed. Until 0.26.4 the release string was logged, forwarded
+/// (0x1E) and shown by the launcher for the first peer only, and enforced
+/// nowhere: 0.26.3 and 0.26.4 connected silently, one side with the pause
+/// lever off (docs/WO-109-audit.md R9). Fatal for the client like
+/// VersionMismatch (0x09): it prints both versions and stops retrying. A
+/// Handshake with NO release field (a pre-WO-19 build or a synthetic test
+/// peer) is still accepted and logged; the field is what is compared.
+///
+/// ---- Death without Game Over (WO-113) ----
+///
+/// C→S  0x3E  PlayerRespawnedUp:   [x:4f][y:4f][z:4f][reason:1]              (13)
+/// S→C  0x3F  PlayerRespawnedDown: [sourceGhostId:1][x:4f][y:4f][z:4f][reason:1] (14)
+/// C→S  0x40  GraveAddUp:          [graveId:8 LE][x:4f][y:4f][z:4f]          (20)
+/// S→C  0x41  GraveAddDown:        [sourceGhostId:1][graveId:8][x:4f][y:4f][z:4f] (21)
+/// C→S  0x42  GraveRemoveUp:       [graveId:8 LE]                            (8)
+/// S→C  0x43  GraveRemoveDown:     [sourceGhostId:1][graveId:8]              (9)
+///
+/// Under the WO-113 death guard a player is never dead: the engine floors
+/// health at 1.0 and the mod's DLL respawns them (reason 0 = death, at the
+/// nearest blackout wake-up spot, leaving a grave) or wakes them in place
+/// (reason 1 = a fistfight knockdown; 2 = a crime execution, treated as a
+/// death). 0x23 is therefore never sent for such a downing; while it lasts the
+/// sender sets 0x1F flags bit 0 (unconscious), which peers already render as a
+/// body (WO-38 Phase 6), and clears it on the wake-up. 0x3E then names where
+/// the player stands, so a peer logs it and the ghost snaps (its interpolator
+/// teleports any jump over 5 m) rather than walking there.
+///
+/// A grave is the dying player's own container, lootable only in their world
+/// in this release; 0x40/0x42 let peers show a mirror gravestone and map
+/// marker (never lootable, never saved) and remove it when the owner loots it
+/// empty or it expires (3 in-game days). The relay is stateless, so the owner
+/// re-announces every grave it still holds on connect and on a slow heartbeat,
+/// like WO-48's dropped items. graveId is the owner's own 64-bit id; a peer
+/// keys mirrors on (sourceGhostId, graveId) and clears an owner's mirrors when
+/// that peer disconnects.
+///
+/// All three are facts about the sender, relayed verbatim with no gate, under
+/// the relay's usual exact-length discipline. Additive: an older relay drops
+/// them (counted, MP-RELAY-DROPS) and an older client never sends them, so
+/// Protocol.Version stays 7 -- but the release-version check (0x3D) already
+/// refuses a mixed pair, and both machines must run the same build.
+///
+/// Free type bytes for new features: 0x7E and up (0x7A/0x7B WO-208 npc-anim, 0x7C/0x7D WO-209 npc-opp; 0x44/0x45 are WO-121 PlayerHit, ProtocolV8.cs;
+/// 0x46/0x47 WO-122 WorldSaved, ProtocolWo122.cs; 0x48-0x57 the WO-123 join, ProtocolWo123.cs;
+/// 0x58-0x5B WO-114 leash; 0x5C-0x5F WO-134 loot; 0x60-0x63 WO-137 quests; 0x64-0x67 WO-139 crime;
+/// 0x68/0x69 WO-140 sleep vote; 0x6A-0x6D WO-141 activities; 0x6E/0x6F WO-143 activities part 2;
+/// 0x70/0x71 WO-148 carrying, ProtocolWo148.cs; 0x72/0x73 WO-161 hit verdict; 0x74/0x75 WO-164, ProtocolWo164.cs;
+/// 0x76/0x77 WO-203 conversations and 0x78/0x79 WO-203's side channel, ProtocolWo203.cs). A new up type gets a relay
+/// rule in the same change -- Protocol.RelayUp or a JoinWire row -- or RelayTableGateTests fails the build (WO-203 II.5).
+///
+/// **Protocol.Version is deliberately NOT bumped for this layer.** Everything
+/// above is additive: a client that predates it never sends 0x1F/0x21/0x23 and
+/// silently ignores 0x20/0x22/0x24/0x25 (the receive loop's dispatch falls
+/// through on an unknown type), so such a session degrades -- ghost health
+/// stops updating, NPC hits stop crossing -- rather than breaking. Bumping
+/// would instead make the relay hard-refuse those clients at Handshake, which
+/// is a worse outcome for a strictly optional feature, and it would invalidate
+/// the version pin in every existing test script for no benefit.
+///
+/// This file lives in the shared KcdMp.Protocol project (net8.0, no
+/// dependencies). Both KcdMp.Client and KcdMp.Server reference it, so there is
+/// exactly one copy of the wire contract to keep in sync with itself.
+/// </summary>
+public static partial class Protocol
+{
+    /// <summary>
+    /// Protocol version, negotiated in the Handshake.
+    ///
+    /// Bumped to 6 for the pause-mitigation layer. The relay refuses any
+    /// handshake version that isn't an exact match, so a peer that is
+    /// actually connected always speaks the relay's own pause vocabulary --
+    /// there is no separate "does the peer support this" gate to add on top
+    /// of that, because a peer that didn't would never have gotten past
+    /// Handshake.
+    ///
+    /// Bumped to 7 in WO-110: the NpcState (0x26/0x27) body gains a sender
+    /// sequence number and sender millisecond stamp (R6), and the relay now
+    /// also refuses a release-version mismatch (R9, 0x3D). A v6 agent and a
+    /// v7 relay refuse each other at Handshake with a clear message on both
+    /// sides, instead of silently dropping every NPC packet on a length check
+    /// the way 0.23.1 did.
+    ///
+    /// Bumped to 8 in WO-121 (movement and combat, ProtocolV8.cs): the
+    /// Position/Ghost body state is replaced (flag 0x10, 12 bytes, which a v7
+    /// relay's exact-length gate would drop), the action channel gains
+    /// row-carrying events, and PlayerHit 0x44/0x45 is new. One bump for the
+    /// whole WO; a v7 agent and a v8 relay refuse each other at Handshake.
+    ///
+    /// Bumped to 9 in WO-123 (the join: send the world, pause the host,
+    /// ProtocolWo123.cs, 0x48-0x57). WO-122's WorldSaved (0x46/0x47), added
+    /// without a bump, rides along with this one. A v8 relay would drop every
+    /// join frame and count it; v8 and v9 now refuse each other at Handshake.
+    ///
+    /// Bumped to 10 in WO-114 (the leash, ProtocolWo114.cs): Leash 0x58/0x59
+    /// and LeashState 0x5A/0x5B ride the join channel as two new JoinWire
+    /// rows. A v9 relay would drop both as unknown types; v9 and v10 refuse
+    /// each other at Handshake.
+    /// </summary>
+    public const byte Version = 10;
+
+    // C→S
+    public const byte Handshake      = 0x00;
+    public const byte Position       = 0x01;
+    public const byte Ping           = 0x04;
+    public const byte VoiceUp        = 0x07;
+    public const byte Invite         = 0x0A;
+    public const byte InviteResponse = 0x0C;
+    public const byte SessionEventUp = 0x0E;
+    public const byte SessionLeave   = 0x10;
+    public const byte DamageUp       = 0x12;
+    public const byte DeathUp        = 0x14;
+    public const byte DiceIntent     = 0x16;
+    public const byte AppearanceUp   = 0x1A;
+    public const byte PauseUp        = 0x1C;
+    public const byte PlayerStateUp  = 0x1F;
+    public const byte PlayerHitUp    = 0x21;
+    public const byte PlayerDeathUp  = 0x23;
+    public const byte NpcStateUp     = 0x26;
+    public const byte TimeSkipUp     = 0x28;
+    public const byte HorseInfoUp    = 0x2A;
+    public const byte CombatEventUp  = 0x2C;
+    public const byte WeatherUp      = 0x2E;
+    public const byte NpcDamageUp    = 0x30;
+    public const byte ItemDropUp     = 0x32;
+    public const byte ItemClaimUp    = 0x34;
+    public const byte StoryBeatUp    = 0x37;
+    public const byte ClockSyncUp    = 0x39;   // WO-98
+    public const byte ActionUp       = 0x3B;   // WO-100.5 Phase 3
+    public const byte PlayerRespawnedUp = 0x3E;   // WO-113
+    public const byte GraveAddUp        = 0x40;   // WO-113
+    public const byte GraveRemoveUp     = 0x42;   // WO-113
+
+    // S→C
+    public const byte Ghost            = 0x02;
+    public const byte Name             = 0x03;
+    public const byte Pong             = 0x05;
+    public const byte Disconnect       = 0x06;
+    public const byte VoiceDown        = 0x08;
+    public const byte VersionMismatch  = 0x09;
+    public const byte InviteReceived   = 0x0B;
+    public const byte SessionStart     = 0x0D;
+    public const byte SessionEventDown = 0x0F;
+    public const byte SessionEnd       = 0x11;
+    public const byte DamageDown       = 0x13;
+    public const byte DeathDown        = 0x15;
+    public const byte DiceState        = 0x17;
+    public const byte DiceError        = 0x18;
+    public const byte DiceEnd          = 0x19;
+    public const byte AppearanceDown   = 0x1B;
+    public const byte PauseDown        = 0x1D;
+    public const byte ReleaseVersion   = 0x1E;
+    public const byte PlayerStateDown  = 0x20;
+    public const byte PlayerHitDown    = 0x22;
+    public const byte PlayerDeathDown  = 0x24;
+    public const byte CombatRole       = 0x25;
+    public const byte NpcStateDown     = 0x27;
+    public const byte TimeSkipDown     = 0x29;
+    public const byte HorseInfoDown    = 0x2B;
+    public const byte CombatEventDown  = 0x2D;
+    public const byte WeatherDown      = 0x2F;
+    public const byte NpcDamageDown    = 0x31;
+    public const byte ItemDropDown     = 0x33;
+    public const byte ItemClaimDown    = 0x35;
+    public const byte ServerFull       = 0x36;
+    public const byte StoryBeatDown    = 0x38;
+    public const byte ClockSyncDown    = 0x3A;   // WO-98
+    public const byte ActionDown       = 0x3C;   // WO-100.5 Phase 3
+    public const byte ReleaseVersionMismatch = 0x3D;   // WO-110 R9
+    public const byte PlayerRespawnedDown = 0x3F;   // WO-113
+    public const byte GraveAddDown        = 0x41;   // WO-113
+    public const byte GraveRemoveDown     = 0x43;   // WO-113
+    public const byte Ack              = 0xFF;
+
+    /// <summary>WO-98: ClockSyncUp payload -- one int64 of client UTC ticks.</summary>
+    public const int ClockSyncUpPayloadLen = 8;
+    /// <summary>WO-98: ClockSyncDown payload -- client send, relay receive, relay send (UTC ticks each).</summary>
+    public const int ClockSyncDownPayloadLen = 24;
+
+    // ---- WO-113: death without Game Over ----
+    /// <summary>Exact PlayerRespawnedUp (0x3E) payload: x, y, z, reason.</summary>
+    public const int PlayerRespawnedUpPayloadLen = 4 + 4 + 4 + 1;
+    /// <summary>Exact PlayerRespawnedDown (0x3F) payload: sourceGhostId + the Up body.</summary>
+    public const int PlayerRespawnedDownPayloadLen = 1 + PlayerRespawnedUpPayloadLen;
+    /// <summary>Exact GraveAddUp (0x40) payload: graveId, x, y, z.</summary>
+    public const int GraveAddUpPayloadLen = 8 + 4 + 4 + 4;
+    /// <summary>Exact GraveAddDown (0x41) payload.</summary>
+    public const int GraveAddDownPayloadLen = 1 + GraveAddUpPayloadLen;
+    /// <summary>Exact GraveRemoveUp (0x42) payload: graveId.</summary>
+    public const int GraveRemoveUpPayloadLen = 8;
+    /// <summary>Exact GraveRemoveDown (0x43) payload.</summary>
+    public const int GraveRemoveDownPayloadLen = 1 + GraveRemoveUpPayloadLen;
+    /// <summary>PlayerRespawned reason: a death (grave + wake-up spot).</summary>
+    public const byte RespawnReasonDeath = 0;
+    /// <summary>PlayerRespawned reason: a fistfight knockdown (woke in place).</summary>
+    public const byte RespawnReasonKnockdown = 1;
+    /// <summary>PlayerRespawned reason: a crime execution, handled as a death.</summary>
+    public const byte RespawnReasonExecution = 2;
+    public static string RespawnReasonName(byte r) => r switch
+    {
+        RespawnReasonDeath => "death", RespawnReasonKnockdown => "knockdown", RespawnReasonExecution => "execution",
+        _ => $"unknown-{r}",
+    };
+    /// <summary>How often the owner re-announces its graves for late joiners.</summary>
+    public const int GraveHeartbeatSeconds = 30;
+
+    /// <summary>Exact Position (0x01) payload length.</summary>
+    public const int PositionPayloadLen = 17;
+
+    /// <summary>Position/Ghost flags bit: the sender is mounted.</summary>
+    public const byte PositionFlagRiding = 0x01;
+    /// <summary>
+    /// WO-99 Phase 1: Position/Ghost flags bit: this is a STALE heartbeat --
+    /// the sender's mod is suspended (menu, loading, cutscene, dialogue halt
+    /// every Script.SetTimer chain) so no fresh sample exists; the position is
+    /// the last one read, re-sent at the heartbeat cadence so a receiver can
+    /// tell "paused" from "gone". The relay forwards the byte verbatim; a
+    /// pre-WO-99 receiver masks bit 0 only and sees an ordinary packet.
+    /// </summary>
+    public const byte PositionFlagStale  = 0x02;
+
+    /// <summary>
+    /// WO-100.5 Phase 2: Position/Ghost flags bit: the packet carries five
+    /// extra BODY STATE bytes after the flags byte --
+    /// [pace:1][dir:1][stance:1][animSpeedCenti:2 LE].
+    ///
+    /// Additive in the WO-99 STALE-bit shape: the length dispatch accepts the
+    /// old length OR the new one, so a pre-WO-100.5 receiver sees a packet of
+    /// an unknown length and ignores it, and a pre-WO-100.5 SENDER simply
+    /// never sets the bit. Both halves degrade to exactly the old behaviour.
+    ///
+    /// The three enum bytes are OURS, keyed on Mannequin tag NAMES, never on
+    /// engine TagIDs -- a TagID is a position in a CTagDefinition rebuilt from
+    /// XML per build, which is precisely the table index WO-100 S6.5's rule
+    /// keeps off the wire.
+    /// </summary>
+    public const byte PositionFlagBodyState = 0x04;
+
+    /// <summary>WO-100.5: bytes appended when <see cref="PositionFlagBodyState"/> is set.</summary>
+    public const int BodyStateLen = 5;
+
+    /// <summary>WO-100.5: Position (0x01) payload length when body state rides along.</summary>
+    public const int PositionPayloadLenV2 = PositionPayloadLen + BodyStateLen;   // 22
+
+    /// <summary>Exact Ghost (0x02) payload length.</summary>
+    public const int GhostPayloadLen = 18;
+
+    /// <summary>WO-100.5: Ghost (0x02) payload length when body state rides along.</summary>
+    public const int GhostPayloadLenV2 = GhostPayloadLen + BodyStateLen;         // 23
+
+    /// <summary>
+    /// WO-118 follow-up: Position/Ghost flags bit: the packet carries the
+    /// sender's clock -- a u32 LE millisecond stamp (1 ms QPC time, the same
+    /// clock as the NpcState stamp, bd26225) -- AFTER the body-state bytes when
+    /// both ride along. A receiver places the sample on the sender's timeline
+    /// (the DLL's per-source sender clock and need tracker) instead of on its
+    /// arrival time, which is what made a peer's ghost wobble in pace:
+    /// speed sd 0.56-1.04 m/s against 0.01-0.02 for sender-stamped NPC streams
+    /// (docs/WO-118-findings.md s3.4). Additive in the WO-100.5 shape and the
+    /// protocol stays v7 (the maintainer's call): the release check already
+    /// refuses a mixed pair at the handshake, so no receiver ever meets a
+    /// length it does not know.
+    /// </summary>
+    public const byte PositionFlagSenderMs = 0x08;
+
+    /// <summary>WO-118 follow-up: bytes appended when <see cref="PositionFlagSenderMs"/> is set.</summary>
+    public const int SenderMsLen = 4;
+
+    /// <summary>The largest Position payload the relay accepts.</summary>
+    /// WO-121 (v8): the largest is now state block 2 + sender ms (33); the
+    /// relay sizes its read buffer from this, so it must always be the max.
+    public const int PositionPayloadLenMax = PositionPayloadLenV8Max;
+
+    /// <summary>The largest Ghost payload an agent accepts.</summary>
+    /// WO-121 (v8): state block 2 + sender ms (34).
+    public const int GhostPayloadLenMax = GhostPayloadLenV8Max;
+
+    /// <summary>
+    /// Every Position (0x01) payload length the relay accepts: 17 (bare, and
+    /// every STALE heartbeat of an old sender), 21 (+ sender ms), 29 (+ body
+    /// state 2), 33 (both). Exact lengths, never a range (WO-101).
+    /// WO-121 (v8): the WO-100.5 body state (0x04, +5) is superseded by
+    /// BodyState2 (0x10, +12), so the set is 17, 21, 29, 33. A v8 relay drops a
+    /// 22- or 26-byte Position (counted, MP-RELAY-DROPS) -- only a v7 sender
+    /// builds one, and the handshake already refuses a v7 sender.
+    /// </summary>
+    public static bool IsPositionPayloadLen(int len) =>
+        len == PositionPayloadLen || len == PositionPayloadLen + SenderMsLen
+        || len == PositionPayloadLenV8 || len == PositionPayloadLenV8Max;
+
+    /// <summary>Every Ghost (0x02) payload length an agent accepts (v8): 18, 22, 30, 34.</summary>
+    public static bool IsGhostPayloadLen(int len) =>
+        len == GhostPayloadLen || len == GhostPayloadLen + SenderMsLen
+        || len == GhostPayloadLenV8 || len == GhostPayloadLenV8Max;
+
+    /// <summary>Exact voice frame length: 20 ms of 16 kHz mono 16-bit PCM.</summary>
+    public const int VoiceFrameLen = 640;
+
+    /// <summary>Length of a SharedSoulGuid on the wire.</summary>
+    public const int SoulGuidLen = 16;
+
+    /// <summary>Exact Damage (0x12) upstream payload length.</summary>
+    public const int DamageUpPayloadLen = SoulGuidLen + 4 + 4 + 1;
+
+    /// <summary>Exact Damage (0x13) downstream payload length.</summary>
+    public const int DamageDownPayloadLen = 1 + DamageUpPayloadLen;
+
+    /// <summary>Exact Death (0x14) upstream payload length.</summary>
+    public const int DeathUpPayloadLen = SoulGuidLen;
+
+    /// <summary>Exact Death (0x15) downstream payload length.</summary>
+    public const int DeathDownPayloadLen = 1 + SoulGuidLen;
+
+    /// <summary>Damage flag: apply without playing a hit reaction.</summary>
+    public const byte DamageFlagSuppressHitReaction = 0x01;
+
+    /// <summary>Exact PauseUp (0x1C) payload length.</summary>
+    public const int PauseUpPayloadLen = 1;
+
+    /// <summary>Exact PauseDown (0x1D) payload length.</summary>
+    public const int PauseDownPayloadLen = 2;
+
+    /// <summary>PauseUp/PauseDown state byte: entered a pausing-like UI state.</summary>
+    public const byte PauseStateEntered = 1;
+
+    /// <summary>PauseUp/PauseDown state byte: exited it.</summary>
+    public const byte PauseStateExited = 0;
+
+    /// <summary>Length of an ItemClass GUID on the wire (Appearance layer).</summary>
+    public const int ItemClassLen = 16;
+
+    /// <summary>
+    /// Upper bound on items in one Appearance packet. A full authored outfit
+    /// tops out around 15 slots; this is headroom, not a measured ceiling, and
+    /// exists so a malformed itemCount byte cannot make a receiver allocate
+    /// 255 * 16 bytes on bad input.
+    /// </summary>
+    public const int MaxAppearanceItems = 32;
+
+    /// <summary>How often the appearance layer resends unconditionally, so a peer who joins after the last real change still converges. The relay does not remember or replay it for a late joiner.</summary>
+    public const int AppearanceHeartbeatSeconds = 30;
+
+    /// <summary>
+    /// How long an invite waits for a response before the relay expires it.
+    /// Long enough to notice a prompt mid-game, short enough that a forgotten
+    /// invite does not keep the target blocked.
+    /// </summary>
+    public const int InviteTimeoutSeconds = 30;
+
+    /// <summary>Default Farkle target score, used when the Invite config omits it.</summary>
+    public const int DefaultDiceTargetScore = 4000;
+
+    // ---- Shared player combat layer (WO-28) ----
+
+    /// <summary>Exact PlayerStateUp (0x1F) payload length.</summary>
+    public const int PlayerStateUpPayloadLen = 4 + 4 + 1;
+
+    /// <summary>Exact PlayerStateDown (0x20) payload length.</summary>
+    public const int PlayerStateDownPayloadLen = 1 + PlayerStateUpPayloadLen;
+
+    /// <summary>Exact PlayerHitUp (0x21) payload length.</summary>
+    public const int PlayerHitUpPayloadLen = 1 + 4 + 4 + 1;
+
+    /// <summary>Exact PlayerHitDown (0x22) payload length.</summary>
+    public const int PlayerHitDownPayloadLen = 4 + 4 + 1;
+
+    /// <summary>Exact PlayerDeathUp (0x23) payload length -- it carries nothing; the relay knows who sent it.</summary>
+    public const int PlayerDeathUpPayloadLen = 0;
+
+    /// <summary>Exact PlayerDeathDown (0x24) payload length.</summary>
+    public const int PlayerDeathDownPayloadLen = 1;
+
+    /// <summary>Exact CombatRole (0x25) payload length.</summary>
+    public const int CombatRolePayloadLen = 1;
+
+    // ---- NPC sync layer (WO-32) ----
+
+    /// <summary>
+    /// Upper bound on an NPC entity name in an NpcState packet. Real authored
+    /// names ("ttkc_man_16", "ttkc_inkeeper") top out well under 32; this is
+    /// headroom plus a cap so a malformed nameLen cannot desync framing.
+    /// </summary>
+    public const int MaxNpcNameLen = 64;
+
+    /// <summary>
+    /// WO-66: entity-name prefix reserved by the mod's own spawns. Every
+    /// entity kdcmp.lua creates is named under this prefix -- "kcd2mp_&lt;id&gt;"
+    /// ghosts, "kcd2mp_horse_&lt;id&gt;" ghost horses, "kcd2mp_npc_&lt;n&gt;" test
+    /// spawns, "kcd2mp_ianchor_*" item anchors. The relay REFUSES an NPC
+    /// claim for any name under it (ClientHandler.RouteNpcState): a claim
+    /// for one of our own spawns is the recursive-puppet-discovery bug (a
+    /// rescan picking up a ghost and streaming it back), never a legitimate
+    /// world NPC. Defense in depth behind the Lua-side registry guard
+    /// (mp_is_mod_entity in kdcmp.lua), which additionally covers ghosts
+    /// after their WO-26 rename to player nicks -- a rename this name gate
+    /// cannot see. IF THE LUA SPAWN-NAME SCHEME EVER CHANGES, CHANGE BOTH:
+    /// this constant and the "kcd2mp_" spawn names in kdcmp.lua.
+    /// </summary>
+    public const string NpcReservedNamePrefix = "kcd2mp_";
+
+    /// <summary>
+    /// WO-90: entity-name prefix the ENGINE reserves for per-conversation
+    /// stand-ins. Every staged conversation spawns one
+    /// "DialogTwin_&lt;soulName&gt;" per participant, including
+    /// "DialogTwin_Dude" for the local player's own character, and the
+    /// conversation camera is attached to it (the 2026-09-12 field logs show
+    /// <c>MasterSlaveManager is setting context: '5' for entities
+    /// 'DialogTwin_Dude' -&gt; 'DialogTwin_DudeCharacterCameraAttachment'</c> on
+    /// both machines).
+    ///
+    /// They are class NPC with plain authored names, so the mod's scanner
+    /// treated them as world NPCs: both clients emitted state for
+    /// identically-named twins and each drove the other's conversation rig.
+    /// Observed: the host's own DialogTwin_Dude became a puppet 1.2 s after
+    /// the host opened a conversation, rendered at an apparent 10.6 m/s; the
+    /// joiner's own twin took the same treatment four times, up to 28.1 m/s.
+    /// Eight claims were granted on DialogTwin_* names, held up to 618 s.
+    ///
+    /// A conversation stand-in is private to the world that staged it and is
+    /// never shareable, so the relay refuses it on EVERY path -- including
+    /// the damage authority's ambient stream, which the reserved-name gate
+    /// above never covered because the authority returns before reaching it.
+    /// </summary>
+    public const string NpcDialogTwinNamePrefix = "DialogTwin_";
+
+    /// <summary>
+    /// WO-90: true for an entity name that must never cross the wire in an
+    /// NpcState packet, whoever sends it and whatever their role. Covers this
+    /// mod's own spawns (<see cref="NpcReservedNamePrefix"/>) and the engine's
+    /// conversation stand-ins (<see cref="NpcDialogTwinNamePrefix"/>).
+    ///
+    /// Checked before any claim bookkeeping, so a refused packet mutates
+    /// nothing -- WO-66's invariant. The Lua side excludes the same families
+    /// on both the send and apply paths (mp_is_excluded_npc_name in
+    /// kdcmp.lua); this is the defence that still holds when one client runs
+    /// an older build.
+    /// </summary>
+    /// <summary>
+    /// WO-90: upper bound on a StoryBeat (0x37/0x38) text field. The engine's
+    /// quest+objective keys in the field logs run to 47 characters
+    /// ("@qname_prepadeni_KsSs|@prepadeni_nasleduj_ptacka_ZyXB" is 52); 128
+    /// leaves generous room for longer quest names without letting a peer
+    /// push an unbounded string at the toast layer.
+    /// </summary>
+    public const int MaxStoryBeatTextLen = 128;
+
+    /// <summary>
+    /// WO-90: StoryBeat kind byte. 1 is the engine's quest+objective
+    /// localisation key from a checkpoint save. Deliberately the only kind
+    /// defined: cutscene and dialogue edges are detectable on the same log
+    /// channel but nothing consumes them yet, and shipping a kind with no
+    /// consumer would be a wire commitment made on speculation.
+    /// </summary>
+    public const byte StoryBeatKindObjective = 1;
+
+    /// <summary>
+    /// WO-94 Shared Quests: the sender's mod saw its player inside the
+    /// proximity radius of a registered main-quest beat. Text is the Haste
+    /// path "<quest>.<trigger>" (letters, digits, '_' and '.' only -- see
+    /// StoryBeat.IsValidBeatPath). The receiver may raise a readiness prompt.
+    /// </summary>
+    public const byte StoryBeatKindApproach = 2;
+
+    /// <summary>
+    /// WO-94: the sender fired wh_concept_HasteTrigger for this beat. Peers
+    /// open a hazard-logging window so deaths, teleports, clock changes and
+    /// chain suspensions on THEIR machine during the replay are logged as
+    /// candidate consequences of it.
+    /// </summary>
+    public const byte StoryBeatKindCatchupBegin = 3;
+
+    /// <summary>WO-94: the sender's catch-up hazard window closed.</summary>
+    public const byte StoryBeatKindCatchupEnd = 4;
+
+    /// <summary>
+    /// WO-96: a per-quest story fingerprint, "&lt;registryId&gt;:&lt;questKey&gt;:&lt;hex&gt;"
+    /// -- the state of every registered journal objective of the sender's
+    /// current main quest, two bits each, read from the sender's newest save
+    /// (StoryFingerprint). A receiver compares only when its own objective
+    /// registry id matches; a WO-94 receiver drops the unknown kind.
+    /// </summary>
+    public const byte StoryBeatKindFingerprint = 5;
+
+    /// <summary>
+    /// WO-98: a cutscene edge on the sender's machine, text
+    /// "start|end &lt;type&gt; &lt;name&gt;" (e.g. "start Ingame socky_3_tavern"),
+    /// straight from the engine's own CutscenePlayer::PlayCutscene /
+    /// OnCutsceneEnd log lines. Informational: the receiver logs it beside its
+    /// own cutscene state and tells the mod, which holds the readiness prompt
+    /// while a cutscene plays. Nothing is gated or synchronised on it yet --
+    /// with ~4.8 s of wall-clock skew between machines (Phase 1), alignment
+    /// cannot be timestamp-based until the offset estimate is consumed.
+    /// An older receiver drops the unknown kind.
+    /// </summary>
+    public const byte StoryBeatKindCutscene = 6;
+
+    public static bool IsNeverSyncedNpcName(string npcName) =>
+        npcName.StartsWith(NpcReservedNamePrefix, StringComparison.OrdinalIgnoreCase)
+        || npcName.StartsWith(NpcDialogTwinNamePrefix, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// NpcStateUp (0x26) payload bytes after the variable-length name:
+    /// x, y, z, rotZ, health (4f each) + flags, then (protocol v7, WO-110 R6)
+    /// [seq:u16 LE][senderMs:u32 LE]. Full payload length is
+    /// 1 (nameLen) + name + this.
+    ///
+    /// seq is per sender per NPC name and wraps; senderMs is the sending
+    /// agent's monotonic millisecond clock (Environment.TickCount64 truncated
+    /// to 32 bits, wraps every ~49 days). The receiver renders on SENDER time
+    /// mapped through a per-source offset instead of on arrival time, so the
+    /// agent loop's 10 ms quantisation, batch flushes, 2 s scan stalls and
+    /// Nagle no longer land in the interpolation, and a dropped or reordered
+    /// sample is visible (seq gap / seq behind) instead of silent
+    /// (docs/WO-109-audit.md R6). v6 senders are refused at Handshake (R9),
+    /// so no mixed layout ever reaches this parser.
+    /// </summary>
+    public const int NpcStateFixedTail = 4 + 4 + 4 + 4 + 4 + 1 + 2 + 4;
+    /// <summary>Offset of the flags byte inside the fixed tail (after the five floats).</summary>
+    public const int NpcStateFlagsOffset = 20;
+    /// <summary>Offset of the u16 sequence number inside the fixed tail.</summary>
+    public const int NpcStateSeqOffset = 21;
+    /// <summary>Offset of the u32 sender-ms stamp inside the fixed tail.</summary>
+    public const int NpcStateSenderMsOffset = 23;
+
+    /// <summary>NpcState flag: the NPC is dead in the authority's world.</summary>
+    public const byte NpcStateFlagDead = 0x01;
+
+    /// <summary>
+    /// NpcState flag: the NPC is knocked out (unconscious, not dead) in the
+    /// authority's world (WO-38 Phase 6). Receivers freeze their copy exactly
+    /// as for dead -- KCD2's unconsciousness is a real state distinct from
+    /// death, and a knocked-out body being walked by a position stream was
+    /// the WO-38 Section G report.
+    /// </summary>
+    public const byte NpcStateFlagUnconscious = 0x02;
+
+    /// <summary>
+    /// NpcState flag: the emitter's own player is actively engaged with this
+    /// NPC (WO-60: the NPC's weapon is drawn, it is neither dead nor KO, and
+    /// it is within melee engagement range of the emitting player). On a
+    /// claimant's packet this arms the relay's engagement hold
+    /// (<see cref="NpcClaimEngagedHoldSeconds"/>); on the global authority's
+    /// packets it is carried but unused. Receivers ignore it.
+    /// </summary>
+    public const byte NpcStateFlagEngaged = 0x20;
+
+    /// <summary>
+    /// WO-102 Phase 6: this NpcState is a RESYNC sample -- one shot of the
+    /// owner's position and life state for an NPC, pushed after sleep, fast
+    /// travel, reload, a new peer, or <c>mp_resync_npcs</c>. A receiver with no
+    /// puppet for the name snaps its copy once (no puppet is created, no
+    /// stream follows); a receiver that already puppets the name treats it as
+    /// an ordinary packet. Bits 0x04 (drawn), 0x08 (swing cue) and 0x10
+    /// (carried) are the mod's own and stay clear of it.
+    /// </summary>
+    public const byte NpcStateFlagResync = 0x40;
+
+    /// <summary>
+    /// WO-131: the body is not a human (the authority's Horse-class entities).
+    /// A joiner never builds a stand-in for a name carrying it (1f: a stand-in
+    /// is only made for a human NPC the host spawned at runtime).
+    /// </summary>
+    public const byte NpcStateFlagNotHuman = 0x80;
+
+    /// <summary>
+    /// Per-entity NPC authority (WO-39 Phase 2): how long a non-authority's
+    /// claim on one entity survives without a fresh NpcStateUp for it. The
+    /// dragger's emitter sends at the ordinary npc emit cadence (250 ms) with
+    /// a ~3 s tail after the last observed local movement, so expiry here can
+    /// only ever reap a claimant that stopped emitting or crashed.
+    /// </summary>
+    public const int NpcClaimTimeoutSeconds = 5;
+
+    /// <summary>
+    /// WO-60 engagement hold: after a claimant's last ENGAGED-flagged packet
+    /// for an entity, that claim cannot be lost -- not to silence, not to the
+    /// global authority's stream, not to another claimant -- until this many
+    /// seconds have passed AND the ordinary silence timeout has also elapsed.
+    ///
+    /// This is the anti-flap rule for two players fighting the same NPC: a
+    /// claim refreshed only by packet arrival would move to whichever side's
+    /// packet lands next after any brief gap (a menu pause suspends the mod's
+    /// timers entirely, WO-12/13), snapping the NPC between two diverged
+    /// simulations. Under the hold, a holder that goes quiet mid-fight keeps
+    /// the claim through the gap; receivers release the puppet locally after
+    /// 3 s of stream silence anyway, so the cost of a held-but-silent claim
+    /// is brief local autonomy, never a snap war. Sized to cover menu blips
+    /// and reloads-in-progress but not a genuinely abandoned fight; a
+    /// disconnect still releases immediately.
+    /// </summary>
+    public const int NpcClaimEngagedHoldSeconds = 15;
+
+    /// <summary>PlayerState flag: the player is knocked out but not dead.</summary>
+    public const byte PlayerStateFlagUnconscious = 0x01;
+
+    /// <summary>PlayerState flag: the player is bleeding.</summary>
+    public const byte PlayerStateFlagBleeding = 0x02;
+
+    /// <summary>
+    /// WO-154: with <see cref="PlayerStateFlagUnconscious"/>, the down is a KNOCKDOWN (the game's own knockout,
+    /// or the death guard's knockdown kind): the player wakes where he lies. The partner's screen shows the
+    /// avatar lying there (it is not hidden at a death spot, which stays for a death or an execution).
+    /// </summary>
+    public const byte PlayerStateFlagKnockedDown = 0x04;
+
+    /// <summary>
+    /// WO-197 B4: the game's own knockout (a brawl: the RPG unconscious buff), set from the player's IsUnconscious while the death guard has
+    /// not downed him -- apart from <see cref="PlayerStateFlagKnockedDown"/>, which the death guard's knockdown sets too. The partner's
+    /// figure falls with the game's own unconsciousness and gets up with its stand-up when the bit clears (mp_anim_knockout).
+    /// </summary>
+    public const byte PlayerStateFlagEngineKnockout = 0x08;
+
+    /// <summary>
+    /// How much a player's health or stamina must move before it is worth a
+    /// PlayerStateUp. Small enough that a real hit always crosses it, large
+    /// enough that ordinary regeneration does not turn this into a second
+    /// position stream.
+    /// </summary>
+    public const float PlayerStateHealthThreshold = 0.5f;
+
+    /// <summary>
+    /// Floor on the interval between two PlayerStateUp packets, so a sustained
+    /// fight sends at roughly 4 Hz rather than at the emitter's ~50 Hz.
+    /// </summary>
+    public const int PlayerStateMinIntervalMs = 250;
+
+    /// <summary>
+    /// How often the player-state layer resends unconditionally, so a peer who
+    /// joined after this player's last real health change still converges. Same
+    /// reasoning as <see cref="AppearanceHeartbeatSeconds"/> -- the relay is
+    /// stateless and neither remembers nor replays it for a late joiner.
+    /// </summary>
+    public const int PlayerStateHeartbeatSeconds = 10;
+
+    /// <summary>
+    /// A stamina reading this agent could not obtain. Sent rather than zero so
+    /// a receiver can tell "no stamina reading available on that build" from
+    /// "that player is exhausted", and never renders a fake zero.
+    /// </summary>
+    public const float UnknownStat = -1f;
+
+    // ---- Time-skip sync layer (WO-38 Phase 1) ----
+
+    /// <summary>Exact TimeSkipUp (0x28) payload length.</summary>
+    public const int TimeSkipUpPayloadLen = 1 + 1 + 4;
+
+    /// <summary>Exact TimeSkipDown (0x29) payload length.</summary>
+    public const int TimeSkipDownPayloadLen = 1 + TimeSkipUpPayloadLen;
+
+    /// <summary>TimeSkip phase: a skip began (no time yet -- worldTime is 0).</summary>
+    public const byte TimeSkipPhaseStart = 0;
+
+    /// <summary>TimeSkip phase: a skip resolved; worldTime is the resulting clock. Announced by receivers.</summary>
+    public const byte TimeSkipPhaseDone = 1;
+
+    /// <summary>TimeSkip phase (S→C only): apply the time but do not announce it -- a joined player's own skip resolving.</summary>
+    public const byte TimeSkipPhaseDoneQuiet = 2;
+
+    /// <summary>
+    /// TimeSkip phase (C→S only, WO-59): "here is my current clock" -- sent
+    /// once shortly after connecting and again when a new peer appears, so
+    /// two players whose saves sit days apart converge WITHOUT anyone having
+    /// to sleep first. Before this phase existed, 0x28 fired only on skips
+    /// and settled clock jumps, so a session that never slept simply stayed
+    /// diverged (the day/night split of the 2026-08 field reports). The
+    /// relay rebroadcasts it as <see cref="TimeSkipPhaseDoneQuiet"/> with no
+    /// active-skip bookkeeping: receivers apply it through the ordinary
+    /// forward-only path (the behind player leaps forward, the ahead player
+    /// keeps their clock), and it feeds the reload-convergence peer-clock
+    /// cache like any other done.
+    /// </summary>
+    public const byte TimeSkipPhaseSync = 3;
+
+    /// <summary>TimeSkip kind: bed sleep ("slept till ...").</summary>
+    public const byte TimeSkipKindSleep = 0;
+
+    /// <summary>TimeSkip kind: the stand-in-place wait function ("passed time to ...").</summary>
+    public const byte TimeSkipKindWait = 1;
+
+    /// <summary>TimeSkip kind: fast travel's accelerated clock ("passed time to ...").</summary>
+    public const byte TimeSkipKindFastTravel = 2;
+
+    /// <summary>TimeSkip kind: the trigger action could not be identified ("passed time to ...").</summary>
+    public const byte TimeSkipKindUnknown = 255;
+
+    /// <summary>
+    /// How long the relay keeps an active-skip claim alive without its done
+    /// arriving. A vanilla sleep/wait resolves in well under a minute of real
+    /// time, so an expiry on this scale can only ever reap a skip whose owner
+    /// hung or quit mid-skip.
+    /// </summary>
+    public const int TimeSkipTimeoutSeconds = 180;
+
+    /// <summary>
+    /// How long after an active skip clears the relay still recognises done
+    /// packets from clients it recorded as joined to that skip, forwarding
+    /// them as done-quiet instead of announcing a phantom second skip.
+    /// </summary>
+    public const int TimeSkipJoinGraceSeconds = 120;
+
+    // ---- Horse identity layer (WO-38 Phase 5) ----
+
+    /// <summary>
+    /// Upper bound on a horse entity name in a HorseInfo packet. Same cap and
+    /// same reasoning as <see cref="MaxNpcNameLen"/> -- it is the same kind of
+    /// authored entity name.
+    /// </summary>
+    public const int MaxHorseNameLen = MaxNpcNameLen;
+
+    /// <summary>
+    /// How often the mod re-emits the mounted-horse identity while mounted,
+    /// so a peer who joined after the mount still converges. Relay replays
+    /// nothing, exactly as for Appearance.
+    /// </summary>
+    public const int HorseInfoHeartbeatSeconds = 30;
+
+    // ---- Combat visibility layer (WO-39 Phase 1) ----
+
+    /// <summary>Exact CombatEventUp (0x2C) payload length (v1: [event:1]).</summary>
+    public const int CombatEventUpPayloadLen = 1;
+    /// <summary>WO-99 Phase 4: CombatEventUp v2 payload length ([event:1][sid:2]).</summary>
+    public const int CombatEventUpPayloadLenV2 = 3;
+
+    /// <summary>Exact CombatEventDown (0x2D) payload length (v1: [sourceGhostId:1][event:1]).</summary>
+    public const int CombatEventDownPayloadLen = 2;
+    /// <summary>WO-99 Phase 4: CombatEventDown v2 payload length ([sourceGhostId:1][event:1][sid:2]).</summary>
+    public const int CombatEventDownPayloadLenV2 = 4;
+
+    /// <summary>Combat event: the sender drew their weapon. Receivers call the ghost's DrawWeapon.</summary>
+    public const byte CombatEventWeaponDrawn = 0;
+
+    /// <summary>Combat event: the sender sheathed their weapon. Receivers call the ghost's HolsterWeapon.</summary>
+    public const byte CombatEventWeaponSheathed = 1;
+
+    /// <summary>Combat event: the sender swung their weapon. Receivers play a one-shot attack animation.</summary>
+    public const byte CombatEventSwing = 2;
+
+    /// <summary>Combat event: the sender raised a block. Receivers play a one-shot block animation.</summary>
+    public const byte CombatEventBlock = 3;
+
+    /// <summary>
+    /// How often the mod re-emits "weapon drawn" while it holds, so a peer who
+    /// joined after the draw still converges. Sheathed is the default state and
+    /// is not heartbeated -- a late joiner's ghost starts sheathed anyway.
+    /// </summary>
+    public const int CombatDrawnHeartbeatSeconds = 30;
+
+    // ---- Weather sync layer (WO-40 Phase 3) ----
+
+    /// <summary>
+    /// Upper bound on a weather profile name in a Weather packet. The longest
+    /// shipped row (time_of_day_profile.xml) is well under this.
+    /// </summary>
+    public const int MaxWeatherNameLen = 48;
+
+    /// <summary>
+    /// How often the weather arbiter re-sends the current profile, so a peer
+    /// who joined after the last change still converges. Receivers apply only
+    /// on profile change, so the heartbeat costs nothing visible.
+    /// </summary>
+    public const int WeatherHeartbeatSeconds = 120;
+
+    /// <summary>
+    /// How often the arbiter re-rolls the session's weather. KCD2's own
+    /// weather changes on the scale of in-game hours; at ratio 15 this is
+    /// ~5 game hours per roll, and half of all rolls keep the current
+    /// profile, so weather feels persistent rather than strobing.
+    /// </summary>
+    public const int WeatherRepickSeconds = 1200;
+
+    // ---- Name-addressed NPC damage layer (WO-40 Phase 5) ----
+
+    /// <summary>Fixed tail after the name in an NpcDamage packet: stamina + health + flags.</summary>
+    public const int NpcDamageFixedTail = 4 + 4 + 1;
+
+    /// <summary>
+    /// NpcDamage flag (WO-86): the sender's copy of the named NPC is DEAD.
+    /// The receiver applies the carried damage, then ApplyDeath on its own
+    /// copy (idempotent -- an already-dead copy is left alone). See the 0x30
+    /// block in the file header for why this is a flag on 0x30 and not the
+    /// guid-addressed 0x14.
+    /// </summary>
+    public const byte NpcDamageFlagFatal = 0x02;
+
+    // ---- Dropped-item sync layer (WO-48) ----
+
+    /// <summary>Exact ItemDropUp (0x32) payload length: dropId + itemClass GUID + amount + health + x/y/z.</summary>
+    public const int ItemDropUpPayloadLen = 4 + ItemClassLen + 2 + 4 + 4 + 4 + 4;
+
+    /// <summary>Exact ItemDropDown (0x33) payload length.</summary>
+    public const int ItemDropDownPayloadLen = 1 + ItemDropUpPayloadLen;
+
+    /// <summary>Exact ItemClaimUp (0x34) payload length.</summary>
+    public const int ItemClaimUpPayloadLen = 4;
+
+    /// <summary>Exact ItemClaimDown (0x35) payload length.</summary>
+    public const int ItemClaimDownPayloadLen = 1 + ItemClaimUpPayloadLen;
+
+    /// <summary>
+    /// How often the dropping agent re-sends a still-unclaimed drop, so a
+    /// peer who joined after the drop still converges. The relay is stateless
+    /// and replays nothing; receivers dedupe by dropId.
+    /// </summary>
+    public const int ItemDropHeartbeatSeconds = 30;
+}
+
+/// <summary>The sub-action inside a DiceIntent (0x16) payload.</summary>
+public enum DiceIntentType : byte
+{
+    Roll = 0x00,
+    Keep = 0x01,
+    Bank = 0x02,
+    Forfeit = 0x03,
+}
+
+/// <summary>What a DiceState (0x17) snapshot is currently waiting for.</summary>
+public enum DicePhase : byte
+{
+    AwaitingRoll = 0x00,
+    AwaitingKeep = 0x01,
+}
+
+/// <summary>Why a DiceIntent was rejected. Wire-facing mirror of KcdMp.Farkle's IntentRejectReason.</summary>
+public enum DiceRejectReason : byte
+{
+    NotYourTurn = 0x01,
+    WrongPhase = 0x02,
+    EmptyKeep = 0x03,
+    KeepIndexOutOfRange = 0x04,
+    InvalidKeepSelection = 0x05,
+    NothingToBank = 0x06,
+    GameAlreadyOver = 0x07,
+}
+
+/// <summary>Who won a completed dice match, carried in DiceEnd (0x19).</summary>
+public enum DiceOutcome : byte
+{
+    InitiatorWon = 0x00,
+    AcceptorWon = 0x01,
+}
+
+/// <summary>What kind of interaction a session is running.</summary>
+public enum InteractionKind : byte
+{
+    Dice = 0x01,
+    Duel = 0x02,
+}
+
+/// <summary>
+/// Which side of the session a participant is on. Interactions needing an
+/// asymmetry — dice turn order, who strikes first — derive it from this rather
+/// than negotiating separately.
+/// </summary>
+public enum SessionRole : byte
+{
+    Initiator = 0x00,
+    Acceptor  = 0x01,
+}
+
+/// <summary>Why a session ended. Sent in SessionEnd so clients can tell the player.</summary>
+public enum SessionEndReason : byte
+{
+    /// <summary>Ran to a natural conclusion.</summary>
+    Completed = 0x00,
+    /// <summary>Invitee said no.</summary>
+    Declined = 0x01,
+    /// <summary>Nobody answered the invite in time.</summary>
+    Timeout = 0x02,
+    /// <summary>The other participant dropped off the relay.</summary>
+    PeerDisconnected = 0x03,
+    /// <summary>A participant walked away deliberately.</summary>
+    Left = 0x04,
+    /// <summary>Target was already in a session.</summary>
+    TargetBusy = 0x05,
+    /// <summary>No such target, or the target is not ready.</summary>
+    TargetUnavailable = 0x06,
+    /// <summary>Malformed or out-of-order request.</summary>
+    ProtocolError = 0x07,
+}
+
+// ---------------------------------------------------------------------------
+// WO-100.5 Phase 2 -- the continuous body-state vocabulary.
+//
+// These three enums ARE the wire format for the five bytes
+// PositionFlagBodyState adds. They are mirrored, by number, in
+//   native/KCDMP/mannequin_read.h    (kPace* / kDir* / kStance*)
+//   kdcmp/Data/Scripts/Startup/kdcmp.lua (KCD2MP.bodyPaceName / DirName / StanceName)
+// and all three must change together.
+//
+// Keyed on Mannequin tag NAMES, not on engine TagIDs. A TagID is a position in
+// a CTagDefinition that is rebuilt from XML per build (WO-100 S1.3), so it is
+// exactly the kind of table index WO-100 S6.5's rule keeps off the wire. The
+// sender maps name -> ordinal; the receiver maps ordinal -> its own build's
+// tag BY NAME, and a name its build lacks is a specific, counted rejection
+// rather than a silently different tag.
+//
+// APPEND-ONLY. Renumbering one would make a mismatched pair misreport instead
+// of reporting "unknown".
+// ---------------------------------------------------------------------------
+
+/// <summary>WO-100.5: the Mannequin MoveSpeed group. There is no "jog" -- the engine's
+/// three paces are walk/run/sprint, with dash reserved for horses.</summary>
+public enum BodyPace : byte
+{
+    None = 0, Walk = 1, Run = 2, Sprint = 3, Dash = 4, Steps = 5,
+}
+
+/// <summary>WO-100.5: the Mannequin MoveDir group.</summary>
+public enum BodyDir : byte
+{
+    None = 0, Forward = 1, Backward = 2, Left = 3, Right = 4,
+}
+
+/// <summary>
+/// WO-100.5: a MOD-OWNED reduction of the Mannequin Stance group, not the group itself.
+/// The group has 38 tags, most of them scene furniture (hanushRailing,
+/// sittingVariation03); replicating all 38 is neither useful nor honest about
+/// what we can drive. Anything outside this list reports Other and the sender
+/// logs the real tag name once.
+/// "Upright" is the ABSENCE of any Stance tag, not a tag of its own.
+/// </summary>
+public enum BodyStance : byte
+{
+    Upright = 0, Stealth = 1, Sitting = 2, Lying = 3, Horse = 4, Leaning = 5, Other = 6,
+}
+
+/// <summary>WO-100.5: the five continuous body-state bytes, as read and as sent.</summary>
+public readonly record struct BodyState(BodyPace Pace, BodyDir Dir, BodyStance Stance, ushort AnimSpeedCenti)
+{
+    /// <summary>Animation-side speed in m/s. 0 means "not reported" -- see the
+    /// pseudo-speed note in native/KCDMP/mannequin_read.cpp: the PLAYER always
+    /// reads the engine's sentinel because C_Player overrides GetPseudoSpeed,
+    /// so this is real on NPC bodies and zero on the local player by design.</summary>
+    public float AnimSpeed => AnimSpeedCenti / 100f;
+
+    public override string ToString() =>
+        $"pace={Pace} dir={Dir} stance={Stance} animSpeed={AnimSpeed:F2}";
+}
+
+// ---------------------------------------------------------------------------
+// WO-100.5 Phase 3 -- the discrete action channel (0x3B / 0x3C).
+//
+//   C->S  0x3B  ActionUp:   [kind:1][seq:2 LE][phase:1][gen:4][len:1][payload:len]
+//   S->C  0x3C  ActionDown: [sourceGhostId:1] + the upstream body verbatim
+//
+// ONE packet pair for every action kind, so a new action costs a payload and
+// not a protocol.
+//
+// This is the INPUT, not the result. `phase` is what makes that true: a press
+// that is never committed is a real thing the remote body should show and then
+// abandon, and a cancel is a first-class message rather than the absence of
+// one. WO-100 S10.4 captured the reference shape live -- RequestedInputClass
+// arriving one sample before the resolved half, with RequestedPreparedToAttack
+// as the commit.
+// ---------------------------------------------------------------------------
+
+/// <summary>WO-100.5: which action an ActionUp/ActionDown describes. APPEND-ONLY.</summary>
+public enum ActionKind : byte
+{
+    /// <summary>An attack, carrying the accepted input from the combat model.</summary>
+    Attack = 1,
+    /// <summary>A jump. WO-121: sent at the commit (the state expansion's
+    /// RequestJump accepted it on the sender), payload <c>[senderMs:4]</c>.</summary>
+    Jump = 2,
+    /// <summary>An emote, payload <c>[senderMs:4][emote:1]</c> (<see cref="EmoteId"/>). WO-151 3.5: the whistle.</summary>
+    Emote = 3,
+    /// <summary>
+    /// WO-102 Phase 5: a non-owner's attack REQUEST at an owned NPC -- the
+    /// accepted input (WO-100 S4.1) plus the target's authored entity name.
+    /// Sent at the COMMIT edge by a non-authority under host authority; the
+    /// owner logs it (MP-REQUEST) and correlates it with the damage that
+    /// follows on 0x30, which is how the request is resolved on this build
+    /// (the native queued-action resolution, CombatModule 0x76500, has never
+    /// been fired on an NPC and is a STOP -- docs/WO-102-findings.md S5).
+    /// </summary>
+    NpcRequest = 4,
+    /// <summary>
+    /// WO-102 Phase 6: a non-owner asks the owner for an NPC state burst
+    /// (positions + life state of every NPC the owner has loaded near any
+    /// player), payload <c>[reason:1]</c> = <see cref="NpcResyncReason"/>. The
+    /// owner answers with ordinary NpcStateUp packets flagged
+    /// <see cref="Protocol.NpcStateFlagResync"/>.
+    /// </summary>
+    NpcResync = 5,
+    /// <summary>WO-121: a block impulse (a one-shot block or perfect-block gesture), payload <see cref="RowEvent"/>.</summary>
+    BlockImpulse = 6,
+    /// <summary>WO-121: a dodge, payload <see cref="RowEvent"/> (the combat_action_dodge row).</summary>
+    Dodge = 7,
+    /// <summary>WO-121: ranged -- press = draw, commit = release, cancel. Reserved: not sent by 0.29 builds (Phase 7 parked).</summary>
+    Ranged = 8,
+    /// <summary>Reserved for the takedown WO (WO-119 s5.2).</summary>
+    Takedown = 9,
+    /// <summary>Reserved for the takedown WO (carry / put).</summary>
+    Carry = 10,
+    /// <summary>Reserved for the traversal WO (ladders, vaults).</summary>
+    Traverse = 11,
+    /// <summary>WO-121: a host-only session lever, payload <c>[key:1][value:1]</c> (<see cref="SessionSettingKey"/>). The relay forwards it only from the damage authority (the host).</summary>
+    SessionSetting = 12,
+    /// <summary>WO-121: the owner's NPC committed an attack row, payload <see cref="RowEvent"/> with the NPC's name. Replaces the WO-49 swing-cue flag as the NPC copy's swing.</summary>
+    NpcAttack = 13,
+    /// <summary>WO-132: the owner's NPC combat state (in a fight, guard, block, who it fights), payload <see cref="NpcCombatEvent"/>. The relay forwards it only from the damage authority (the host).</summary>
+    NpcCombat = 14,
+    /// <summary>WO-151: the owner's NPC entered a hit reaction (its committed combat_action_hit row), payload <see cref="RowEvent"/> with the NPC's name: the joiner's copy plays the host's reaction instead of its own. The relay forwards it only from the damage authority (the host).</summary>
+    NpcHit = 15,
+    /// <summary>WO-151 3.9: a door of the host's world moved or (un)locked, payload <see cref="DoorEvent"/>. The relay forwards it only from the damage authority (the host).</summary>
+    DoorState = 16,
+    /// <summary>WO-151 3.9: a joiner used a door (open/close, his key or his lockpick), payload <see cref="DoorEvent"/>: the host applies it in its world and answers with DoorState.</summary>
+    DoorAsk = 17,
+    /// <summary>WO-187 C1: a player took a blow -- the hit reaction his own engine committed (its combat_action_hit row), payload <see cref="RowEvent"/>
+    /// with no name: the partner's figure of him plays the same reaction (mp_anim_avatar_hit). Any player sends it; the relay forwards it as is.</summary>
+    AvatarHit = 18,
+    /// <summary>WO-197 B1: a player's recoil -- his blow was blocked or perfect-blocked and his own engine put a FailedAttack in his combat
+    /// director's scope 4. Payload <see cref="RowEvent"/> with no name: Flags bit 0 = perfect block (CombatAttackFailedPB), bit 1 = the kind
+    /// was read, bit 2 = Row is the engine's own failed-attack row (else empty: the receiver picks the row by the figure's weapon). Blunt and
+    /// unarmed blows have no recoil in the game's tables: nothing is sent for them. Any player sends it; the relay forwards it as is.</summary>
+    AvatarRecoil = 19,
+    /// <summary>WO-197 B3: a player's clinch -- payload <see cref="RowEvent"/> with no name: Flags bits 0-1 = the phase (1 enter: the clinch
+    /// guard, 2 a clinch move, 3 leave), bit 2 = this player is the master, bit 3 = Row (the master's row) and the slave's row (the RowEvent's
+    /// name: its 32 hex digits, "N" format) are the engine's own SyncTransition rows. Any player sends it; the relay forwards it as is.</summary>
+    AvatarClinch = 20,
+}
+
+/// <summary>WO-151 3.5: what an Emote action plays (APPEND-ONLY).</summary>
+public static class EmoteId
+{
+    /// <summary>The whistle (the `call` action): the game's v_horse_whistle at the sender's avatar.</summary>
+    public const byte Whistle = 1;
+    public const int PayloadLen = 5;
+    public static string Name(byte id) => id switch { Whistle => "whistle", _ => $"unknown-{id}" };
+}
+
+/// <summary>
+/// WO-151 3.9: a door on the action channel --
+/// <c>[senderMs:4][dir:1 sbyte][flags:1][x:4f][y:4f][z:4f][nameLen:1][name]</c>.
+/// dir: 1 open, -1 closed (0: no move). flags bit 0: locked (DoorState) / unlock (DoorAsk);
+/// bit 1 (<see cref="FlagStash"/>, DoorAsk only): the event is about a chest (class Stash), not a door -- a joiner's
+/// unlock claim, the host looks for a Stash at the pivot instead of an AnimDoor. A frame without that bit is a door,
+/// exactly as before; a peer that does not know the bit reads it as a door ask, finds no door there and refuses.
+/// The name is the door's authored level name (<c>[A-Za-z0-9_.-]</c>); the pivot tells two
+/// doors of one name apart (the receiver takes the AnimDoor within 1 m of it).
+/// </summary>
+public readonly record struct DoorEvent(uint SenderMs, sbyte Dir, byte Flags, float X, float Y, float Z, string Name)
+{
+    public const int FixedLen = 4 + 1 + 1 + 12 + 1;
+    public const int MaxNameLen = Protocol.ActionPayloadMaxLen - FixedLen;   // 45
+    public const byte FlagLocked = 0x01;
+    /// <summary>WO-195B 2a: the event names a chest (Stash), not a door.</summary>
+    public const byte FlagStash = 0x02;
+
+    /// <summary>Bit 0: locked (DoorState) / unlock claimed (DoorAsk).</summary>
+    public bool IsLocked => (Flags & FlagLocked) != 0;
+    /// <summary>Bit 1: a chest (Stash), not a door.</summary>
+    public bool IsStash => (Flags & FlagStash) != 0;
+
+    public static bool IsDoorName(string? n)
+    {
+        if (string.IsNullOrEmpty(n) || n.Length > MaxNameLen) return false;
+        foreach (char c in n)
+            if (!(c is >= 'A' and <= 'Z' or >= 'a' and <= 'z' or >= '0' and <= '9' or '_' or '.' or '-')) return false;
+        return true;
+    }
+
+    public byte[] ToBytes()
+    {
+        if (!IsDoorName(Name)) throw new ArgumentException($"not a door name: '{Name}'", nameof(Name));
+        var name = System.Text.Encoding.ASCII.GetBytes(Name);
+        var b = new byte[FixedLen + name.Length];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(b, SenderMs);
+        b[4] = (byte)Dir; b[5] = Flags;
+        System.Buffers.Binary.BinaryPrimitives.WriteSingleLittleEndian(b.AsSpan(6), X);
+        System.Buffers.Binary.BinaryPrimitives.WriteSingleLittleEndian(b.AsSpan(10), Y);
+        System.Buffers.Binary.BinaryPrimitives.WriteSingleLittleEndian(b.AsSpan(14), Z);
+        b[18] = (byte)name.Length;
+        name.CopyTo(b, FixedLen);
+        return b;
+    }
+
+    /// <summary>False on a truncated frame, a direction other than -1/0/1, a non-finite pivot or a bad name.</summary>
+    public static bool TryFromBytes(ReadOnlySpan<byte> b, out DoorEvent e)
+    {
+        e = default;
+        if (b.Length < FixedLen) return false;
+        sbyte dir = (sbyte)b[4];
+        if (dir is < -1 or > 1) return false;
+        float x = System.Buffers.Binary.BinaryPrimitives.ReadSingleLittleEndian(b[6..]);
+        float y = System.Buffers.Binary.BinaryPrimitives.ReadSingleLittleEndian(b[10..]);
+        float z = System.Buffers.Binary.BinaryPrimitives.ReadSingleLittleEndian(b[14..]);
+        if (!float.IsFinite(x) || !float.IsFinite(y) || !float.IsFinite(z)) return false;
+        int n = b[18];
+        if (n == 0 || n > MaxNameLen || b.Length < FixedLen + n) return false;
+        string name = System.Text.Encoding.ASCII.GetString(b.Slice(FixedLen, n));
+        if (!IsDoorName(name)) return false;
+        e = new DoorEvent(System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(b), dir, b[5], x, y, z, name);
+        return true;
+    }
+
+    public override string ToString() => FormattableString.Invariant($"{(IsStash ? "chest" : "door")}={Name} dir={Dir} flags={Flags} at=({X:F2},{Y:F2},{Z:F2})");
+}
+
+/// <summary>
+/// WO-100.5: where in its life the action is. A press that never commits is a
+/// real event, not a missing one.
+/// </summary>
+public enum ActionPhase : byte
+{
+    Press = 0, Commit = 1, Cancel = 2, Complete = 3,
+}
+
+/// <summary>
+/// WO-100.5 Phase 3: the validity counter, four bytes on the wire as
+/// [incarnation:2 LE][epoch:1][revision:1].
+///
+/// Locally, ONE counter is enough and that is what SwingInbox uses: death,
+/// respawn and save load all replace the ghost body and therefore change its
+/// CryEngine entity id, so a single observable covers all three. Across the
+/// wire there is no such shared observable -- the receiver cannot see the
+/// sender's discontinuity -- so the sender must NAME which kind happened.
+/// WO-191 1b: revision = the sender's agent run (a random 1..255 per run; 0 = a sender older than 0.60.7). Every run began at 1.1.x with
+/// its sequence back at 0, and a receiver that never forgot the sender refused everything below the old run's last sequence.
+/// </summary>
+public readonly record struct ActionGen(ushort Incarnation, byte Epoch, byte Revision)
+{
+    public uint Pack() => (uint)(Incarnation | (Epoch << 16) | (Revision << 24));
+    public static ActionGen Unpack(uint v) =>
+        new((ushort)(v & 0xFFFF), (byte)((v >> 16) & 0xFF), (byte)((v >> 24) & 0xFF));
+    public override string ToString() => $"{Incarnation}.{Epoch}.{Revision}";
+}
+
+/// <summary>
+/// WO-100.5 Phase 3: the attack payload -- the accepted input, as NAMES
+/// resolved to our own append-only enums rather than as the engine's table row
+/// ids. WO-100 S2.2: an attack row is addressed by an authored GUID or by the
+/// selector tuple, never by an index, so a build mismatch cannot silently
+/// select a different attack.
+/// </summary>
+/// <summary>
+/// WO-102 Phase 5: the NpcRequest action payload --
+/// <c>[inputClass:1][zone:1][attackType:1][flags:1][nameLen:1][name:utf8]</c>.
+/// The name is the target NPC's authored entity name (the same key
+/// NpcState/NpcDamage use); it is validated <c>[A-Za-z0-9_]+</c> by the
+/// receiver before it reaches anything, exactly like those two.
+/// </summary>
+/// <summary>WO-102 Phase 6: why an NPC resync was requested (the NpcResync payload byte).</summary>
+public static class NpcResyncReason
+{
+    public const byte Manual = 1, Sleep = 2, FastTravel = 3, Reload = 4, NewPeer = 5;
+    /// <summary>WO-191 3b: the joiner has no body for an NPC or animal attacking it; its name follows the byte (an older host reads the byte only).</summary>
+    public const byte Attacker = 6;
+    public static string Name(byte r) => r switch
+    {
+        Manual => "manual", Sleep => "sleep", FastTravel => "fast-travel", Reload => "reload", NewPeer => "new-peer", Attacker => "attacker",
+        _ => $"unknown-{r}",
+    };
+}
+
+public readonly record struct NpcRequestPayload(AttackPayload Attack, string TargetName)
+{
+    public const int FixedLen = AttackPayload.Len + 1;
+    /// <summary>ActionPayloadMaxLen (64) minus the fixed part.</summary>
+    public const int MaxNameLen = Protocol.ActionPayloadMaxLen - FixedLen;   // 59
+
+    public byte[] ToBytes()
+    {
+        var name = System.Text.Encoding.UTF8.GetBytes(TargetName);
+        if (name.Length > MaxNameLen) throw new ArgumentOutOfRangeException(nameof(TargetName), $"name {name.Length} > {MaxNameLen}");
+        var b = new byte[FixedLen + name.Length];
+        Attack.ToBytes().CopyTo(b, 0);
+        b[AttackPayload.Len] = (byte)name.Length;
+        name.CopyTo(b, FixedLen);
+        return b;
+    }
+
+    /// <summary>False on a truncated frame or a name that is not an authored entity name.</summary>
+    public static bool TryFromBytes(ReadOnlySpan<byte> b, out NpcRequestPayload p)
+    {
+        p = default;
+        if (b.Length < FixedLen) return false;
+        int n = b[AttackPayload.Len];
+        if (n == 0 || n > MaxNameLen || b.Length < FixedLen + n) return false;
+        string name = System.Text.Encoding.UTF8.GetString(b.Slice(FixedLen, n));
+        foreach (char c in name)
+            if (!(c is >= 'A' and <= 'Z' or >= 'a' and <= 'z' or >= '0' and <= '9' or '_')) return false;
+        p = new NpcRequestPayload(AttackPayload.FromBytes(b), name);
+        return true;
+    }
+
+    public override string ToString() => $"{Attack} target={TargetName}";
+}
+
+public readonly record struct AttackPayload(sbyte InputClass, sbyte Zone, sbyte AttackType, byte Flags)
+{
+    public const int Len = 4;
+    /// <summary>Flags bit 0: the sender had RequestedPreparedToAttack set -- the commit.</summary>
+    public const byte FlagPrepared = 0x01;
+
+    public byte[] ToBytes() => new[] { (byte)InputClass, (byte)Zone, (byte)AttackType, Flags };
+    public static AttackPayload FromBytes(ReadOnlySpan<byte> b) =>
+        new((sbyte)b[0], (sbyte)b[1], (sbyte)b[2], b[3]);
+
+    public string InputClassName => Protocol.CombatInputClassName(InputClass);
+    public string ZoneName       => Protocol.CombatZoneName(Zone);
+    public string AttackTypeName => Protocol.CombatAttackTypeName(AttackType);
+
+    public override string ToString() =>
+        $"input={InputClassName} zone={ZoneName} type={AttackTypeName} prepared={((Flags & FlagPrepared) != 0 ? 1 : 0)}";
+}
+
+public static partial class Protocol
+{
+    /// <summary>WO-100.5: exact ActionUp payload length for a given body length.</summary>
+    public const int ActionUpHeaderLen = 1 + 2 + 1 + 4 + 1;   // kind, seq, phase, gen, len
+    /// <summary>WO-100.5: the largest payload an action may carry.</summary>
+    public const int ActionPayloadMaxLen = 64;
+
+    // The shipped Libs/Tables/combat/* vocabularies (WO-100 S2.1), so a log
+    // reads in the game's own words. An id with no row prints as the number --
+    // never as a guessed name.
+    public static string CombatInputClassName(int v) => v switch
+    {
+        -1 => "none", 0 => "attack_light", 1 => "attack_heavy", 2 => "attack_special",
+        3 => "move_left", 4 => "move_right", 5 => "move_back", 6 => "move_forward", 7 => "block",
+        _ => v.ToString(System.Globalization.CultureInfo.InvariantCulture),
+    };
+    public static string CombatZoneName(int v) => v switch
+    {
+        -1 => "undefined", 0 => "head", 1 => "upper_left", 2 => "upper_right",
+        3 => "lower_left", 4 => "lower_right", 5 => "lower",
+        _ => v.ToString(System.Globalization.CultureInfo.InvariantCulture),
+    };
+    public static string CombatAttackTypeName(int v) => v switch
+    {
+        -1 => "none", 0 => "stab", 1 => "slash", 2 => "smash", 3 => "throw", 4 => "kick",
+        5 => "punch", 6 => "hook", 7 => "direct", 8 => "bite", 9 => "backoff",
+        _ => v.ToString(System.Globalization.CultureInfo.InvariantCulture),
+    };
+
+    /// <summary>
+    /// WO-100.5: is <paramref name="candidate"/> newer than <paramref name="last"/>?
+    /// Modulo comparison over a half-range window -- the same shape CombatPipe
+    /// uses for its sequence byte, widened to 16 bits.
+    /// </summary>
+    public static bool SeqIsNewer(ushort candidate, ushort last) =>
+        (ushort)(candidate - last) is > 0 and < 0x8000;
+}

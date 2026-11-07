@@ -1,0 +1,330 @@
+// Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
+// GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
+// content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
+// WO-163: the native half's pipe ops (wo163.h).
+#include "wo163.h"
+#include "wo197.h"
+#include "wo200.h"
+#include "wo201.h"
+#include "wo202.h"
+#include "wo203.h"
+#include "engine.h"
+#include "hits.h"
+#include "log.h"
+#include "motion.h"
+#include "wo165.h"
+#include "wo166.h"
+#include "wo167.h"
+#include "wo172.h"
+#include "wo173.h"
+#include "wo176.h"
+#include "wo178.h"
+#include "wo179.h"
+#include "wo187.h"
+#include "wo189.h"
+#include "wo190.h"
+#include "wo194.h"
+#include "wo195.h"
+
+#include <windows.h>
+#include <atomic>
+#include <cstdio>
+#include <cstring>
+#include <string>
+
+namespace kcdmp::wo163 {
+
+namespace {
+
+std::atomic<uint32_t> c_asked{0}, c_answeredHostile{0}, c_answeredNot{0}, c_unanswered{0};
+
+uint32_t player_eid() {
+    void* e = engine::entity_by_id(0x7777);
+    return e ? engine::entity_id(e) : 0;
+}
+
+// An authored entity name: letters, digits, '_', '-', '.', never a control or Lua-shaped character.
+bool name_ok(const char* s, size_t n) {
+    if (n == 0 || n > 63) return false;
+    for (size_t i = 0; i < n; ++i) {
+        const char c = s[i];
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+} // namespace
+
+int status_text(char* out, int n) {
+    return std::snprintf(out, n, "skirmish_relation=%s asked=%u hostile=%u not_hostile=%u unanswered=%u",
+                         hits::skirmish_relation_armed() ? "armed" : "off", c_asked.load(), c_answeredHostile.load(), c_answeredNot.load(), c_unanswered.load());
+}
+
+// WO-210 H.3: every request of the family counted by op, the busiest told once a minute (WO163-OPS) -- a lone host's memory climb is spread
+// over the ops the agent asks most; the counts say which those are on a given machine
+std::atomic<uint32_t> c_byOp[256]{};
+std::atomic<uint64_t> g_opsToldAtMs{0};
+void tell_ops() {
+    const uint64_t now = GetTickCount64();
+    uint64_t was = g_opsToldAtMs.load();
+    if (now - was < 60000 || !g_opsToldAtMs.compare_exchange_strong(was, now)) return;
+    uint32_t top[12][2]{};
+    for (int op = 0; op < 256; ++op) {
+        const uint32_t c = c_byOp[op].exchange(0);
+        for (int i = 0; i < 12; ++i)
+            if (c > top[i][1]) { for (int j = 11; j > i; --j) { top[j][0] = top[j - 1][0]; top[j][1] = top[j - 1][1]; } top[i][0] = static_cast<uint32_t>(op); top[i][1] = c; break; }
+    }
+    char b[300]; int k = 0;
+    for (int i = 0; i < 12 && top[i][1] && k < static_cast<int>(sizeof b) - 16; ++i)
+        k += std::snprintf(b + k, sizeof b - static_cast<size_t>(k), "%s%u:%u", k ? " " : "", top[i][0], top[i][1]);
+    logf("WO163-OPS the last minute's requests by op (op:count): %s", k ? b : "none");
+}
+
+uint8_t handle(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t* outLen) {
+    *outLen = 0;
+    if (!len) return kRBadRequest;
+    c_byOp[body[0]].fetch_add(1, std::memory_order_relaxed);
+    tell_ops();
+    switch (body[0]) {
+        case kOpSkirmishHostile: {
+            if (len < 2 || cap < 2) return kRBadRequest;
+            const size_t n = body[1];
+            if (len != 2 + n || !name_ok(reinterpret_cast<const char*>(body + 2), n)) return kRBadRequest;
+            const std::string name(reinterpret_cast<const char*>(body + 2), n);
+            c_asked.fetch_add(1);
+            // every pointer is looked up here, in this frame, and used here
+            const uint32_t veid = hits::eid_of_name(name.c_str());
+            if (!veid) { c_unanswered.fetch_add(1); logf("WO163-RELATION host vs npc=%s NOT answered: no such entity", name.c_str()); return kRNoActor; }
+            void* hostSoul = hits::soul_of_eid(player_eid());
+            void* victimSoul = hits::soul_of_eid(veid);
+            if (!hostSoul || !victimSoul) {
+                c_unanswered.fetch_add(1);
+                logf("WO163-RELATION host vs npc=%s NOT answered: no soul (host %s, npc %s)", name.c_str(), hostSoul ? "yes" : "no", victimSoul ? "yes" : "no");
+                return kRNoSoul;
+            }
+            bool answered = false, hostile = false;
+            const char* why = "";
+            if (!hits::skirmish_hostile(hostSoul, victimSoul, &answered, &hostile, &why) || !answered) {
+                c_unanswered.fetch_add(1);
+                logf("WO163-RELATION host vs npc=%s NOT answered: %s", name.c_str(), why);
+                return kRFailed;
+            }
+            (hostile ? c_answeredHostile : c_answeredNot).fetch_add(1);
+            logf("WO163-RELATION host vs npc=%s -> %s (the engine's own skirmish relation test, read-only)", name.c_str(),
+                 hostile ? "hostile opponents in one skirmish" : "not hostile opponents in one skirmish");
+            out[0] = 1; out[1] = hostile ? 1 : 0;
+            *outLen = 2;
+            return kROk;
+        }
+        case kOpModelRead: {
+            if (len < 2 || cap < 190) return kRBadRequest;
+            const size_t n0 = body[1];
+            if (len != 2 + n0 || (n0 && !name_ok(reinterpret_cast<const char*>(body + 2), n0))) return kRBadRequest;
+            uint32_t eid = 0;
+            if (n0 == 0) eid = player_eid();
+            else { const std::string nm(reinterpret_cast<const char*>(body + 2), n0); eid = hits::eid_of_name(nm.c_str()); }
+            motion::ModelRead m{};
+            if (!eid || !motion::read_model(eid, &m)) return kRNoActor;
+            const unsigned v = m.valid;
+            const int n = std::snprintf(reinterpret_cast<char*>(out), cap,
+                "ca=%u pca=%u model=%u state=%d(0x%X)%s gz=%d%s bz=%d%s bh=%d%s bm=%d%s pb=%u%s az=%d%s at=%d%s as=%.3f%s ah=%d%s cm=%u%s opp=0x%X%s",
+                m.hasCa, m.isPlayerCa, m.hasModel, m.state, static_cast<unsigned>(m.state), (v & motion::kMvState) ? "" : "!",
+                m.guardZone, (v & motion::kMvGuardZone) ? "" : "!", m.blockZone, (v & motion::kMvBlockZone) ? "" : "!",
+                m.blockHand, (v & motion::kMvBlockHand) ? "" : "!", m.blockMode, (v & motion::kMvBlockMode) ? "" : "!",
+                m.perfectBlock, (v & motion::kMvPerfect) ? "" : "!", m.atkZone, (v & motion::kMvAtkZone) ? "" : "!",
+                m.atkType, (v & motion::kMvAtkType) ? "" : "!", m.atkStrength, (v & motion::kMvAtkStrength) ? "" : "!",
+                m.atkHand, (v & motion::kMvAtkHand) ? "" : "!", m.combatMode, (v & motion::kMvCombatMode) ? "" : "!",
+                m.opponentEid, m.opponentIsPlayer ? "(me)" : "");
+            *outLen = (n > 0 && static_cast<size_t>(n) < cap) ? static_cast<size_t>(n) : 0;
+            return kROk;
+        }
+        case kOpSkirmishPair: {
+            if (len < 4 || cap < 1) return kRBadRequest;
+            const bool on = body[1] != 0;
+            const uint8_t ovr = body[2];
+            const size_t n0 = body[3];
+            if (len != 4 + n0 || (on && n0 == 0) || (n0 && !name_ok(reinterpret_cast<const char*>(body + 4), n0))) return kRBadRequest;
+            uint32_t eid = 0;
+            if (n0) { const std::string nm(reinterpret_cast<const char*>(body + 4), n0); eid = hits::eid_of_name(nm.c_str()); }
+            if (on && !eid) return kRNoActor;
+            const uint32_t peid = player_eid();
+            void* hostSoul = peid ? hits::soul_of_eid(peid) : nullptr;
+            void* npcSoul = eid ? hits::soul_of_eid(eid) : nullptr;
+            if (!hostSoul || (on && !npcSoul)) return kRNoSoul;
+            if (on && hits::scene_owned_eid(eid, "wo163-pair")) { out[0] = 0; *outLen = 1; return kRFailed; }   // WO-174
+            uint64_t rv = 0;
+            const bool done = on ? hits::skirmish_add(hostSoul, npcSoul, ovr, &rv) : hits::skirmish_remove(hostSoul, &rv);
+            logf("WO163-PAIR host %s npc=0x%X override=%u -> %s", on ? "joins the skirmish of" : "leaves its skirmish; was against", eid, ovr, done ? "done" : "FAILED");
+            out[0] = done ? 1 : 0;
+            *outLen = 1;
+            return done ? kROk : kRFailed;
+        }
+        case kOpReplay: {   // WO-165
+            if (len < 10 || cap < 120) return kRBadRequest;
+            wo165::Request rq{};
+            rq.flags = body[1];
+            rq.fields.type = static_cast<int8_t>(body[2]);
+            rq.fields.zone = static_cast<int8_t>(body[3]);
+            rq.fields.hand = static_cast<int8_t>(body[4]);
+            std::memcpy(&rq.fields.strength, body + 5, 4);
+            if (!(rq.fields.strength >= 0.0f && rq.fields.strength <= 4.0f)) return kRBadRequest;   // NaN refused too
+            const size_t an = body[9];
+            if (len < 10 + an + 1 || !name_ok(reinterpret_cast<const char*>(body + 10), an)) return kRBadRequest;
+            const size_t vn = body[10 + an];
+            if (len != 11 + an + vn || (vn && !name_ok(reinterpret_cast<const char*>(body + 11 + an), vn))) return kRBadRequest;
+            const std::string an_s(reinterpret_cast<const char*>(body + 10), an);
+            rq.attackerEid = hits::eid_of_name(an_s.c_str());
+            if (!rq.attackerEid) return kRNoActor;
+            if (vn) {
+                const std::string vn_s(reinterpret_cast<const char*>(body + 11 + an), vn);
+                rq.victimEid = hits::eid_of_name(vn_s.c_str());
+                if (!rq.victimEid) return kRNoActor;
+            }
+            const wo165::Result r = wo165::replay(rq);
+            int n = 0;
+            if (r.reason != wo165::kOk)
+                n = std::snprintf(reinterpret_cast<char*>(out), cap, "refused=%s", wo165::reason_name(r.reason));
+            else
+                n = std::snprintf(reinterpret_cast<char*>(out), cap, "seq=%u engine=%s returned=%d core=%s blk=%u pb=%u dmgflag=%u broken=%u zm=%u vstate=0x%X opp_me=%u",
+                                  r.seq, wo165::outcome_name(r.outcome), r.returned ? 1 : 0, r.seen ? "ran" : "not-run", r.flags[0], r.flags[3], r.flags[2],
+                                  r.recBroken, r.recZoneMismatch, static_cast<unsigned>(r.victimModel.state), r.victimModel.opponentIsPlayer);
+            *outLen = (n > 0 && static_cast<size_t>(n) < cap) ? static_cast<size_t>(n) : 0;
+            return r.reason == wo165::kOk ? kROk : r.reason == wo165::kFault ? kRFailed : kRNoActor;
+        }
+        case kOpReplayDamage: {   // WO-165
+            if (len != 5 || cap < 10) return kRBadRequest;
+            uint32_t seq = 0;
+            std::memcpy(&seq, body + 1, 4);
+            const wo165::Damage d = wo165::damage_of(seq);
+            out[0] = d.state;
+            std::memcpy(out + 1, &d.health, 4);
+            std::memcpy(out + 5, &d.stamina, 4);
+            out[9] = d.victimLive ? 1 : 0;
+            *outLen = 10;
+            return kROk;
+        }
+        case kOpHostLock: {   // WO-165 C1
+            if (len != 2 || cap < 1) return kRBadRequest;
+            wo165::set_host_lock(body[1] != 0);
+            out[0] = wo165::host_lock() ? 1 : 0;
+            *outLen = 1;
+            return kROk;
+        }
+        case kOpReplayStatus: {   // WO-165
+            const int n = wo165::status_text(reinterpret_cast<char*>(out), static_cast<int>(cap));
+            *outLen = (n > 0 && static_cast<size_t>(n) < cap) ? static_cast<size_t>(n) : 0;
+            return kROk;
+        }
+        case kOpStatus: {
+            const int n = status_text(reinterpret_cast<char*>(out), static_cast<int>(cap));
+            *outLen = (n > 0 && static_cast<size_t>(n) < cap) ? static_cast<size_t>(n) : 0;
+            return kROk;
+        }
+        case kcdmp::wo166::kOpStrike:   // WO-166 C3
+        case kcdmp::wo166::kOpStatus:
+        case kcdmp::wo166::kOpConfig:
+            return kcdmp::wo166::handle(body[0], body, len, out, cap, outLen);
+        case kcdmp::wo167::kOpSwingSeen:   // WO-167 C3
+        case kcdmp::wo167::kOpStatus:
+        case kcdmp::wo167::kOpConfig:
+            return kcdmp::wo167::handle(body[0], body, len, out, cap, outLen);
+        case kcdmp::wo172::kOpDead:   // WO-172 C1
+        case kcdmp::wo172::kOpStatus:
+        case kcdmp::wo172::kOpConfig:
+            return kcdmp::wo172::handle(body[0], body, len, out, cap, outLen);
+        case kcdmp::wo173::kOpRealHit:   // WO-173 C1 / C2
+        case kcdmp::wo173::kOpStatus:
+        case kcdmp::wo173::kOpConfig:
+        case kcdmp::wo173::kOpDownPoll:
+            return kcdmp::wo173::handle(body[0], body, len, out, cap, outLen);
+        case kcdmp::wo176::kOpStatus:   // WO-176 A1
+        case kcdmp::wo176::kOpConfig:
+            return kcdmp::wo176::handle(body[0], body, len, out, cap, outLen);
+        case kcdmp::wo178::kOpOffer:   // WO-178 C1 / Part 0
+        case kcdmp::wo178::kOpStatus:
+        case kcdmp::wo178::kOpConfig:
+        case kcdmp::wo178::kOpSaveManual:
+        case kcdmp::wo178::kOpTrace:
+        case kcdmp::wo178::kOpSaveState:    // WO-184: the engine's own save state
+        case kcdmp::wo178::kOpSaveCancel:   // WO-184: the engine's own cancel of a pending save
+            return kcdmp::wo178::handle(body[0], body, len, out, cap, outLen);
+        case kcdmp::wo179::kOpStatus:   // WO-179: the scene watch
+        case kcdmp::wo179::kOpConfig:
+        case kcdmp::wo179::kOpPoll:
+        case kcdmp::wo179::kOpFade:
+            return kcdmp::wo179::handle(body[0], body, len, out, cap, outLen);
+        case kcdmp::wo187::kOpOpponent:   // WO-187: the copies' opponents, the switches, the guard hold, positions
+        case kcdmp::wo187::kOpStatus:
+        case kcdmp::wo187::kOpConfig:
+        case kcdmp::wo187::kOpGuardHold:
+        case kcdmp::wo187::kOpPositions:
+        case kcdmp::wo187::kOpMoveShown:
+            return kcdmp::wo187::handle(body[0], body, len, out, cap, outLen);
+        case kcdmp::wo189::kOpStatus:   // WO-189: readiness, the cutscene player, copies' FastForward, game profiles, concept reads
+        case kcdmp::wo189::kOpConfig:
+        case kcdmp::wo189::kOpReady:
+        case kcdmp::wo189::kOpCutscene:
+        case kcdmp::wo189::kOpCutsceneRelease:
+        case kcdmp::wo189::kOpStopFF:
+        case kcdmp::wo189::kOpProfile:
+        case kcdmp::wo189::kOpConcept:
+            return kcdmp::wo189::handle(body[0], body, len, out, cap, outLen);
+        case kcdmp::wo190::kOpStatus:   // WO-190: the animation trace, the idle watch, a body's weapon, the clinch refusals
+        case kcdmp::wo190::kOpConfig:
+        case kcdmp::wo190::kOpWeapon:
+        case kcdmp::wo190::kOpClinchRefused:
+            return kcdmp::wo190::handle(body[0], body, len, out, cap, outLen);
+        case kcdmp::wo195::kOpStatus:   // WO-195: dead copies are released at once and never held again
+        case kcdmp::wo195::kOpConfig:
+        case kcdmp::wo195::kOpRelease:
+        case kcdmp::wo195::kOpCheck:
+            return kcdmp::wo195::handle(body[0], body, len, out, cap, outLen);
+        case kcdmp::wo194::kOpStatus:   // WO-194: shared in-game cutscenes (the enqueue events, the copy's start, the hold, the clock, the end)
+        case kcdmp::wo194::kOpConfig:
+        case kcdmp::wo194::kOpPoll:
+        case kcdmp::wo194::kOpStart:
+        case kcdmp::wo194::kOpHold:
+        case kcdmp::wo194::kOpSeq:
+        case kcdmp::wo194::kOpStopFF:
+            return kcdmp::wo194::handle(body[0], body, len, out, cap, outLen);
+        case kcdmp::wo197::kOpStatus:   // WO-197: the recoil / clinch polls, the paired play, StartSyncGuard on a pair, EnsureGuardAction
+        case kcdmp::wo197::kOpConfig:
+        case kcdmp::wo197::kOpPair:
+        case kcdmp::wo197::kOpSyncGuard:
+        case kcdmp::wo197::kOpEnsureGuard:
+            return kcdmp::wo197::handle(body[0], body, len, out, cap, outLen);
+        case kcdmp::wo200::kOpStatus:   // WO-200: the two gates (the out-port tap, the node gate), the host's replay, the clock read, research
+        case kcdmp::wo200::kOpConfig:
+        case kcdmp::wo200::kOpPoll:
+        case kcdmp::wo200::kOpReplay:
+        case kcdmp::wo200::kOpReadNode:
+        case kcdmp::wo200::kOpResearch:
+        case kcdmp::wo200::kOpQuietNodes:   // WO-207 D.2: the joiner's NPC triggers, quiet like its clocks
+            return kcdmp::wo200::handle(body[0], body + 1, len - 1, out, cap, outLen) == 0 ? kROk : kRBadRequest;
+        case kcdmp::wo201::kOpStatus:   // WO-201: B1's scene no-position (the save path's own FastForward cancel on the joiner's copies)
+        case kcdmp::wo201::kOpConfig:
+        case kcdmp::wo201::kOpCombatEnd:
+        case kcdmp::wo201::kOpDude2:
+        case kcdmp::wo201::kOpDude2Check:
+        case kcdmp::wo201::kOpDude2Census:
+        case kcdmp::wo201::kOpNear:
+        case kcdmp::wo201::kOpSpeechPoll:
+        case kcdmp::wo201::kOpSpeechPlay:
+        case kcdmp::wo201::kOpVotePoll:
+        case kcdmp::wo201::kOpRangedPoll:
+            return kcdmp::wo201::handle(body[0], body, len, out, cap, outLen);
+        case kcdmp::wo202::kOpStatus:   // WO-202: the switch word, the quest-fail tracer's poll
+        case kcdmp::wo202::kOpConfig:
+        case kcdmp::wo202::kOpFailPoll:
+            return kcdmp::wo202::handle(body[0], body, len, out, cap, outLen);
+        case kcdmp::wo178::kOpHeldResult:   // WO-178 C4: a held blow lives in WO-173's path
+            return kcdmp::wo173::handle(body[0], body, len, out, cap, outLen);
+        default:
+            if (kcdmp::wo203::has_op(body[0]))   // WO-203: every area's ops (wo203.h owns the numbers 90..114)
+                return kcdmp::wo203::handle(body[0], body, len, out, cap, outLen);
+            return kRBadRequest;
+    }
+}
+
+} // namespace kcdmp::wo163

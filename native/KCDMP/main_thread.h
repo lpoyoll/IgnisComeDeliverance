@@ -1,0 +1,66 @@
+﻿// Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
+// GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
+// content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
+#pragma once
+// Marshalling onto the game's main thread.
+//
+// Everything that touches game state must run here. Calling into the combat or
+// entity systems from the injected thread is a data race against the game's own
+// update, and the failure mode is corruption that surfaces nowhere near the
+// cause. The earlier one-shot probes did exactly that knowingly; this replaces
+// it.
+//
+// The tick also happens to be what the plugin needs anyway: a per-frame point
+// to apply inbound network state and sample outbound state.
+
+#include <functional>
+
+namespace kcdmp::main_thread {
+
+// Patch WHGame.dll's IAT entry for C_ModulesManager::Update. Safe to call
+// twice; the second call is a no-op.
+bool install();
+
+// Restore the original IAT entry. Called on unload.
+void uninstall();
+
+// Queue work for the next frame. Thread-safe, returns immediately.
+void post(std::function<void()> work);
+
+// Run work on every tick, for the lifetime of the process. Used by the
+// outbound sampler, which needs a per-frame heartbeat rather than a one-shot.
+// The name labels the task in the MAIN-COST line (mp_main_cost: every 10 s what this
+// DLL's frame hook costs the frame, per task -- the game's profiler books all of it to
+// the hook's caller, CCryAction::PreSystemUpdate) and its fault site (WO-151: a task
+// that keeps faulting is switched off on its own, "main::task/<name>").
+void post_repeating(std::function<void()> work);
+void post_repeating(const char* name, std::function<void()> work);
+
+// WO-151: mp_main_cost -- the per-task frame-cost meter (off by default).
+void set_cost_meter(bool on);
+bool cost_meter();
+
+// Queue work and block until it has run. Returns false when timeout_ms elapses
+// before the game thread starts it. Work already running is allowed to finish
+// so lambdas capturing caller state cannot outlive that state.
+bool run_sync(std::function<void()> work, unsigned timeout_ms = 5000);
+// WO-110 R12: as above, and reports whether the task FAULTED on the game
+// thread (SEH or C++ exception, swallowed so the frame survives). A true
+// return with *faulted == true means "it ran, do not trust its output".
+bool run_sync(std::function<void()> work, unsigned timeout_ms, bool* faulted);
+
+// Frames observed since install. Zero after a second or two means the hook is
+// not on a live path, and everything queued will sit there forever.
+unsigned long long frame_count();
+
+// WO-138: the dt the game passed to the hooked C_ModulesManager::Update on the
+// latest frame (the game's own frame time: 0 while a PauseGame source holds the
+// game timer, divided while the Apse inventory slows it). Main thread.
+float last_dt();
+
+// WO-202 I.1: the game's main thread (the one the frame hook runs on), 0 before the first frame. The crash capture names it.
+unsigned long main_thread_id();
+// WO-210 H.3 (research only): a name KCDMP_TEST_TASK_BLOCK lists (prefix up to '::' or the whole name; "all"): the bisect's switch.
+bool test_task_blocked(const char* name);
+
+} // namespace kcdmp::main_thread

@@ -1,0 +1,71 @@
+@* Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
+   GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
+   content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
+   IgnisComeDeliverance: the start screen. Two plain choices -- host or join -- each with its steps in order, over the
+   launcher's existing, tested flows (the host modal, the Steam join modal, the setup checklist). The server list is
+   still there, under "Direct connect (LAN / VPN)". *@
+
+<div class="play-hub">
+    @if (!SetupReady)
+    {
+        <div class="hub-setup">
+            <span class="hub-setup-dot"></span>
+            <span>Finish setup before you play: the game, the mod and Steam need checking.</span>
+            <button class="kcd-btn primary" @onclick="OnCheckSetup">CHECK SETUP</button>
+        </div>
+    }
+
+    <div class="hub-cards">
+        <div class="hub-card @(SetupReady ? "" : "dim")">
+            <div class="hub-card-title">Host a game</div>
+            <div class="hub-card-sub">You play in your own world. Your friend joins you.</div>
+            <ol class="hub-steps">
+                <li>Press <b>Host</b>. A join code appears.</li>
+                <li>Send your friend the join code.</li>
+                <li>Press <b>Launch as host</b>. The game starts and connects by itself.</li>
+            </ol>
+            @if (RelayRunning)
+            {
+                <div class="hub-live">You are hosting. Your join code is in the host window.</div>
+            }
+            <button class="kcd-btn primary hub-go" disabled="@(!SetupReady)" @onclick="OnHost">
+                @(RelayRunning ? "OPEN HOST WINDOW" : "HOST")
+            </button>
+        </div>
+
+        <div class="hub-or">or</div>
+
+        <div class="hub-card @(SetupReady ? "" : "dim")">
+            <div class="hub-card-title">Join a friend</div>
+            <div class="hub-card-sub">You play in your friend's world, with your own character.</div>
+            <ol class="hub-steps">
+                <li>Ask your friend (the host) for their join code.</li>
+                <li>Press <b>Join</b>, paste the code, or pick them from your Steam friends.</li>
+                <li>Choose <b>Bring my character</b> or <b>Start fresh</b> when asked.</li>
+            </ol>
+            <button class="kcd-btn primary hub-go" disabled="@(!SetupReady)" @onclick="OnJoin">JOIN</button>
+        </div>
+    </div>
+
+    <div class="hub-notes">
+        Both players need Steam running and the <b>same build</b> of the mod. Your saves are backed up before every session
+        (<span class="hub-link" @onclick="OnRestoreSaves">restore a backup</span>).
+    </div>
+
+    <div class="hub-direct">
+        <span class="hub-link" @onclick="ToggleDirect">@(ShowDirect ? "▾" : "▸") Direct connect (LAN / VPN / an address)</span>
+    </div>
+</div>
+
+@code {
+    [Parameter] public bool SetupReady { get; set; }
+    [Parameter] public bool RelayRunning { get; set; }
+    [Parameter] public bool ShowDirect { get; set; }
+    [Parameter] public EventCallback<bool> ShowDirectChanged { get; set; }
+    [Parameter] public EventCallback OnHost { get; set; }
+    [Parameter] public EventCallback OnJoin { get; set; }
+    [Parameter] public EventCallback OnCheckSetup { get; set; }
+    [Parameter] public EventCallback OnRestoreSaves { get; set; }
+
+    private Task ToggleDirect() => ShowDirectChanged.InvokeAsync(!ShowDirect);
+}

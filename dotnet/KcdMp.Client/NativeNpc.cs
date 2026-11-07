@@ -1,0 +1,355 @@
+// Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
+// GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
+// content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
+using System.Buffers.Binary;
+using System.Diagnostics;
+using System.Text;
+using System.Threading.Channels;
+
+namespace KcdMp.Client;
+
+/// <summary>
+/// WO-118: why the native per-frame writer (KCDMP.dll npc_drive.h) refused a
+/// bind or stopped writing a puppet on its own. Mirrors
+/// <c>kcdmp::npcdrive::Reason</c> by number; APPEND-ONLY.
+/// </summary>
+public enum NativeNpcReason : byte
+{
+    Ok = 0,
+    Disarmed = 1,
+    ToggleOff = 2,
+    NoEntity = 3,
+    NameMismatch = 4,
+    WuidMismatch = 5,
+    NotLiving = 6,
+    Parented = 7,
+    BadRequest = 8,
+    EntityGone = 9,
+    Silence = 10,
+    Fault = 11,
+    Unbound = 12,
+    TableFull = 13,
+    PipeClosed = 14,
+}
+
+/// <summary>WO-118: the 0x89 heartbeat answer.</summary>
+public readonly record struct NativeNpcStatus(bool Armed, bool NativeOn, int Bound, int Writing,
+                                              uint FramesWritten, uint Writes, uint Drops, uint Samples);
+
+/// <summary>
+/// One inbound NPC sample, as the agent hands it to the DLL. WO-121:
+/// <see cref="State2"/> rides a peer's avatar sample (the v8 state block);
+/// the pipe marks it with flag <see cref="NativeNpcCodec.FlagState2"/>.
+/// </summary>
+public readonly record struct NativeNpcSample(byte Src, string Name, float X, float Y, float Z, float Rot,
+                                              byte Flags, ushort Seq, uint SenderMs, long ArrivalQpc,
+                                              KcdMp.Wire.BodyState2? State2 = null);
+
+/// <summary>
+/// WO-118: byte layouts of the agent -&gt; DLL frames 0x10-0x15 and the 0x89
+/// reply (native/KCDMP/pipe_server.h). Pure functions, unit-tested.
+/// </summary>
+public static class NativeNpcCodec
+{
+    /// <summary>The DLL accepts a 0x10 body up to this size (kNpcSamplesMaxLen).</summary>
+    public const int MaxSamplesPayload = 4096;
+    /// <summary>What the feed packs per frame, below the cap with room to spare.</summary>
+    public const int TargetSamplesPayload = 3800;
+    public const int MaxNameLen = 63;
+
+    public static string ReasonTag(byte r) => r switch
+    {
+        0 => "ok", 1 => "disarmed", 2 => "toggle-off", 3 => "no-entity", 4 => "name-mismatch",
+        5 => "wuid-mismatch", 6 => "not-living", 7 => "parented", 8 => "bad-request", 9 => "entity-gone",
+        10 => "silence", 11 => "fault", 12 => "unbound", 13 => "table-full", 14 => "pipe-closed",
+        200 => "not-connected", 201 => "no-answer", 17 => "task-faulted", 18 => "unknown-command",
+        _ => $"reason-{r}",
+    };
+
+    /// <summary>
+    /// WO-121: pipe-only sample flag -- a 12-byte BodyState2 follows the
+    /// arrival stamp. Never a wire NPC flag (the wire's top bit is unused and
+    /// the agent masks it off inbound NpcState before feeding), so a peer
+    /// cannot make the DLL expect bytes that are not there.
+    /// </summary>
+    public const byte FlagState2 = 0x80;
+
+    /// <summary>Bytes one sample takes inside a 0x10 body.</summary>
+    public static int SampleSize(string name) => 2 + Encoding.UTF8.GetByteCount(name) + 16 + 1 + 2 + 4 + 8;
+    public static int SampleSize(in NativeNpcSample s) => SampleSize(s.Name) + (s.State2.HasValue ? KcdMp.Wire.BodyState2.Len : 0);
+
+    /// <summary>0x10: [count:1]{[src][nameLen][name][x][y][z][rot][flags][seq:2][senderMs:4][arrivalQpc:8][state2:12 if flags&amp;0x80]}*count.</summary>
+    public static byte[] BuildSamples(IReadOnlyList<NativeNpcSample> samples)
+    {
+        if (samples.Count is 0 or > 255) throw new ArgumentOutOfRangeException(nameof(samples));
+        int len = 1;
+        foreach (var s in samples) len += SampleSize(s);
+        if (len > MaxSamplesPayload) throw new ArgumentException($"0x10 body {len} B exceeds {MaxSamplesPayload}");
+        var b = new byte[len];
+        b[0] = (byte)samples.Count;
+        int o = 1;
+        foreach (var s in samples)
+        {
+            var name = Encoding.UTF8.GetBytes(s.Name);
+            if (name.Length is 0 or > MaxNameLen) throw new ArgumentException("bad name length");
+            b[o++] = s.Src;
+            b[o++] = (byte)name.Length;
+            name.CopyTo(b, o); o += name.Length;
+            BinaryPrimitives.WriteSingleLittleEndian(b.AsSpan(o), s.X); o += 4;
+            BinaryPrimitives.WriteSingleLittleEndian(b.AsSpan(o), s.Y); o += 4;
+            BinaryPrimitives.WriteSingleLittleEndian(b.AsSpan(o), s.Z); o += 4;
+            BinaryPrimitives.WriteSingleLittleEndian(b.AsSpan(o), s.Rot); o += 4;
+            b[o++] = (byte)((s.Flags & ~FlagState2) | (s.State2.HasValue ? FlagState2 : 0));
+            BinaryPrimitives.WriteUInt16LittleEndian(b.AsSpan(o), s.Seq); o += 2;
+            BinaryPrimitives.WriteUInt32LittleEndian(b.AsSpan(o), s.SenderMs); o += 4;
+            BinaryPrimitives.WriteInt64LittleEndian(b.AsSpan(o), s.ArrivalQpc); o += 8;
+            if (s.State2 is KcdMp.Wire.BodyState2 st) { st.Write(b.AsSpan(o)); o += KcdMp.Wire.BodyState2.Len; }
+        }
+        return b;
+    }
+
+    /// <summary>0x11: [on:1][eid:4][wuid:8][ax:4f][ay:4f][az:4f][delayMs:2][nameLen:1][name].</summary>
+    public static byte[] BuildBind(bool on, uint eid, ulong wuid, float ax, float ay, float az, ushort delayMs, string name)
+    {
+        var n = Encoding.UTF8.GetBytes(name);
+        if (n.Length is 0 or > MaxNameLen) throw new ArgumentException("bad name length");
+        var b = new byte[28 + n.Length];
+        b[0] = on ? (byte)1 : (byte)0;
+        BinaryPrimitives.WriteUInt32LittleEndian(b.AsSpan(1), eid);
+        BinaryPrimitives.WriteUInt64LittleEndian(b.AsSpan(5), wuid);
+        BinaryPrimitives.WriteSingleLittleEndian(b.AsSpan(13), ax);
+        BinaryPrimitives.WriteSingleLittleEndian(b.AsSpan(17), ay);
+        BinaryPrimitives.WriteSingleLittleEndian(b.AsSpan(21), az);
+        BinaryPrimitives.WriteUInt16LittleEndian(b.AsSpan(25), delayMs);
+        b[27] = (byte)n.Length;
+        n.CopyTo(b, 28);
+        return b;
+    }
+
+    /// <summary>0x12: [ms:2][nameLen:1][name].</summary>
+    public static byte[] BuildHold(string name, ushort ms)
+    {
+        var n = Encoding.UTF8.GetBytes(name);
+        if (n.Length is 0 or > MaxNameLen) throw new ArgumentException("bad name length");
+        var b = new byte[3 + n.Length];
+        BinaryPrimitives.WriteUInt16LittleEndian(b, ms);
+        b[2] = (byte)n.Length;
+        n.CopyTo(b, 3);
+        return b;
+    }
+
+    /// <summary>0x15: [seconds:2][nameLen:1][name].</summary>
+    public static byte[] BuildTrace(string name, ushort seconds) => BuildHold(name, seconds);
+
+    /// <summary>0x89: [ok][seq][armed][nativeOn][bound:2][writing:2][frames:4][writes:4][drops:4][samples:4].</summary>
+    public static bool TryParseStatus(byte[]? body, out NativeNpcStatus st)
+    {
+        st = default;
+        if (body is null || body.Length < 24 || body[0] != 1) return false;
+        st = new NativeNpcStatus(body[2] != 0, body[3] != 0,
+            BinaryPrimitives.ReadUInt16LittleEndian(body.AsSpan(4)),
+            BinaryPrimitives.ReadUInt16LittleEndian(body.AsSpan(6)),
+            BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(8)),
+            BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(12)),
+            BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(16)),
+            BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(20)));
+        return true;
+    }
+
+    /// <summary>
+    /// Pack as many queued samples as fit one 0x10 body (<see cref="TargetSamplesPayload"/>,
+    /// at most 255). Returns how many were consumed from the front of <paramref name="pending"/>.
+    /// </summary>
+    public static int TakeBatch(List<NativeNpcSample> pending, List<NativeNpcSample> batch)
+    {
+        batch.Clear();
+        int len = 1;
+        foreach (var s in pending)
+        {
+            int sz = SampleSize(s);
+            if (batch.Count == 255 || (batch.Count > 0 && len + sz > TargetSamplesPayload)) break;
+            batch.Add(s);
+            len += sz;
+        }
+        return batch.Count;
+    }
+}
+
+/// <summary>
+/// WO-118 Phase 1: every inbound NPC sample goes to the DLL as well as to Lua.
+/// The relay reader enqueues without waiting; one background loop packs what
+/// accumulated into 0x10 frames (the pipe is one request/reply channel, so a
+/// frame per sample would queue behind every swing and scan). Arrival times
+/// are the agent's own QPC stamps -- the DLL reads the same clock -- so pipe
+/// queueing never shifts a sample on the sender-clock timeline.
+/// </summary>
+public sealed class NativeNpcFeed
+{
+    private readonly CombatPipe _pipe;
+    private readonly Channel<NativeNpcSample> _queue = Channel.CreateBounded<NativeNpcSample>(
+        new BoundedChannelOptions(8192) { FullMode = BoundedChannelFullMode.DropOldest, SingleReader = true, SingleWriter = false });
+    private Task? _loop;
+    private readonly CancellationTokenSource _cts = new();
+
+    /// <summary>Mirrors the mod's mp_npc_native_write (default on). Off: nothing is forwarded.</summary>
+    public volatile bool Enabled = true;
+
+    public long Enqueued, Sent, Batches, FailedBatches, DroppedNotConnected, Coalesced;
+
+    /// <summary>
+    /// WO-213 C.1: the pipe lane is "latest wins" too -- when samples piled up while the pipe was busy (over BacklogSamples), each body
+    /// keeps only its two newest (two: the DLL's ring still gets a segment to interpolate), in their arrival order. Off (the twin,
+    /// link_sched): every sample, oldest first, as before.
+    /// </summary>
+    public bool LatestWins = !KcdMp.Wire.W213Switch.TwinOff("link_sched");
+    public const int BacklogSamples = 64;
+    /// <summary>WO-213 C.1: the feed's rounds at most this often while it goes first at the pipe's gate (about one game frame's samples a round).</summary>
+    public const int BatchEveryMs = 33;
+
+    /// <summary>The rule on what one read of the queue took: the samples it dropped (0 when off or no backlog).</summary>
+    public static int Backlog(List<NativeNpcSample> pending, bool latestWins) =>
+        latestWins && pending.Count > BacklogSamples ? KeepNewestPerBody(pending) : 0;
+
+    public static int KeepNewestPerBody(List<NativeNpcSample> pending, int keep = 2)
+    {
+        var seen = new Dictionary<(byte, string), int>();
+        var kept = new List<NativeNpcSample>(pending.Count);
+        for (int i = pending.Count - 1; i >= 0; i--)
+        {
+            var k = (pending[i].Src, pending[i].Name);
+            int n = seen.TryGetValue(k, out int c) ? c : 0;
+            if (n >= keep) continue;
+            seen[k] = n + 1;
+            kept.Add(pending[i]);
+        }
+        kept.Reverse();
+        int dropped = pending.Count - kept.Count;
+        pending.Clear(); pending.AddRange(kept);
+        return dropped;
+    }
+
+    public NativeNpcFeed(CombatPipe pipe) { _pipe = pipe; }
+
+    public void Enqueue(in NativeNpcSample s)
+    {
+        if (!Enabled) return;
+        if (!_pipe.IsConnected) { Interlocked.Increment(ref DroppedNotConnected); return; }
+        if (Encoding.UTF8.GetByteCount(s.Name) is 0 or > NativeNpcCodec.MaxNameLen) return;
+        _loop ??= Task.Run(() => LoopAsync(_cts.Token));
+        if (_queue.Writer.TryWrite(s)) Interlocked.Increment(ref Enqueued);
+    }
+
+    private async Task LoopAsync(CancellationToken ct)
+    {
+        // WO-213 C.1: the samples go first at the pipe's gate (the DLL takes them on its reader thread, no frame's wait) -- behind the
+        // frame handlers' main-thread calls they waited seconds when a clock change set every host NPC's posture moving
+        CombatPipe.Priority.Value = LatestWins;
+        var pending = new List<NativeNpcSample>(512);
+        var batch = new List<NativeNpcSample>(128);
+        long lastBatchMs = 0;
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                if (!await _queue.Reader.WaitToReadAsync(ct)) return;
+                // WO-213 C.1: first at the gate, so at most one round a BatchEveryMs -- each sample keeps its own arrival stamp (the DLL's
+                // play-out measures from it); sent at once one batch at a time, the joiner's pipe carried ~30x the calls and its polls starved
+                if (LatestWins)
+                {
+                    long wait = BatchEveryMs - (Environment.TickCount64 - lastBatchMs);
+                    if (wait > 0) await Task.Delay((int)wait, ct);
+                    lastBatchMs = Environment.TickCount64;
+                }
+                while (_queue.Reader.TryRead(out var s)) pending.Add(s);
+                int coalesced = Backlog(pending, LatestWins);   // WO-213 C.1
+                if (coalesced > 0) Interlocked.Add(ref Coalesced, coalesced);
+                while (pending.Count > 0)
+                {
+                    int n = NativeNpcCodec.TakeBatch(pending, batch);
+                    if (n == 0) { pending.Clear(); break; }
+                    var payload = NativeNpcCodec.BuildSamples(batch);
+                    pending.RemoveRange(0, n);
+                    var r = await _pipe.NpcSamplesAsync(payload, ct);
+                    Interlocked.Increment(ref Batches);
+                    if (r.Ok) Interlocked.Add(ref Sent, n); else Interlocked.Increment(ref FailedBatches);
+                }
+            }
+            catch (OperationCanceledException) { return; }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[npcwrite] sample feed error: {ex.GetType().Name}: {ex.Message}");
+                pending.Clear();
+                await Task.Delay(100, ct).ContinueWith(_ => { });
+            }
+        }
+    }
+
+    public static long Now() => Stopwatch.GetTimestamp();
+}
+
+/// <summary>
+/// WO-118 follow-up: which NpcState samples go to Lua, for puppets the DLL
+/// writes. Always for an unbound puppet; for a bound one the latest sample at
+/// most every interval, and at once whenever its flags or its health (to the
+/// 0.1 Lua is sent) changed. A skipped sample waits as the pending latest and
+/// <see cref="TakeDue"/> hands it out when due -- at once when its puppet is no
+/// longer bound (Lua writes it again and must start from the latest).
+/// Single-threaded by design: GameBridge calls it from its frame processor only.
+/// </summary>
+public sealed class NpcLuaCoalescer(long intervalTicks)
+{
+    private sealed class State { public long LastPushAt; public byte LastFlags; public float LastHp; public string? Pending; }
+    private readonly Dictionary<string, State> _st = new(StringComparer.Ordinal);
+
+    public long Pushed { get; private set; }
+    public long Coalesced { get; private set; }
+    public int Tracked => _st.Count;
+
+    public void Clear() => _st.Clear();
+
+    /// <summary>True when <paramref name="lua"/> should be sent now.</summary>
+    public bool Offer(string npc, bool bound, byte flags, float hp, long now, string lua)
+    {
+        if (!bound)
+        {
+            _st.Remove(npc);   // anything pending is older than this sample
+            Pushed++;
+            return true;
+        }
+        float hp1 = MathF.Round(hp, 1);
+        if (!_st.TryGetValue(npc, out var st))
+        {
+            _st[npc] = new State { LastPushAt = now, LastFlags = flags, LastHp = hp1 };
+            Pushed++;
+            return true;
+        }
+        if (flags != st.LastFlags || hp1 != st.LastHp || now - st.LastPushAt >= intervalTicks)
+        {
+            st.LastPushAt = now; st.LastFlags = flags; st.LastHp = hp1; st.Pending = null;
+            Pushed++;
+            return true;
+        }
+        st.Pending = lua;
+        Coalesced++;
+        return false;
+    }
+
+    /// <summary>The pending pushes due at <paramref name="now"/>, oldest decision first; null when none.</summary>
+    public List<string>? TakeDue(Func<string, bool> isBound, long now)
+    {
+        List<string>? due = null, gone = null;
+        foreach (var (npc, st) in _st)
+        {
+            bool bound = isBound(npc);
+            if (st.Pending is string lua && (!bound || now - st.LastPushAt >= intervalTicks))
+            {
+                (due ??= new()).Add(lua);
+                st.Pending = null; st.LastPushAt = now;
+                Pushed++;
+            }
+            if (!bound) (gone ??= new()).Add(npc);
+        }
+        if (gone is not null) foreach (var n in gone) _st.Remove(n);
+        return due;
+    }
+}

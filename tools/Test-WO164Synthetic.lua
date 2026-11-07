@@ -1,0 +1,415 @@
+-- Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
+-- GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
+-- content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
+-- WO-164 synthetic test (the game-side half), against the real kdcmp.lua under MoonSharp.
+--
+--   (S) the sweep: a host copy only, the release + the agent's event with its hold, the 20 s cooldown, the switch
+--   (K) after a skip: every copy within 300 m queued nearest first, 4 per tick
+--   (F) the focus pre-warm: the copy this player faces within 4 m, not one behind him
+--   (D) one talk attempt at a time: a press under 3 s after the same copy's talk ended is not passed on
+--   (P) a copy freed for a talk drops its own unfinished requests first (RestrictDialog on, then off)
+--   (R) a request open 4 s: cancelled, swept, asked once more through the same action -- never twice; "Try again" after
+--   (L) the flee limiter: none while the host's NPC flees, 20 s of rest after 3 re-asserts in 10 s
+--   (E) a joiner's own random events off in a session, back after it
+--   (U) unstuck: step 1 resets this player's seat, a second press within 10 s asks for step 2
+--   (M) the mark snapshot: at most 40 lines, game facts only, one end line
+--
+-- Driven by Test-WO164Synthetic.ps1 through the WO-77 MoonSharp driver. Live evidence: docs/WO-164-findings.md.
+
+NOW = 0
+os.clock = function() return NOW end
+LOG = {}; TIMERS = {}; ENTS = {}; ERRS = {}; TOASTS = {}; CMDS = {}; CCMDS = {}
+
+local function mkstub()
+    return setmetatable({}, { __index = function(_, k) return function(...) return nil end end })
+end
+System = mkstub()
+System.LogAlways = function(s) LOG[#LOG + 1] = tostring(s) end
+CVARS = { wh_pl_RandomEventsAutoSpawnEnabled = "1" }
+System.GetCVarValue = function(n) return CVARS[n] or "0" end
+System.GetEntityByName = function(n) return ENTS[n] end
+SPHERE = {}
+System.GetEntitiesInSphere = function() return SPHERE end
+System.GetTerrainElevation = function(p) return 0 end
+System.GetFrameTime = function() return 1 / 60 end
+System.ExecuteCommand = function(s)
+    CMDS[#CMDS + 1] = tostring(s)
+    local n, v = tostring(s):match("^(wh_pl_RandomEventsAutoSpawnEnabled) (%S+)$")
+    if n then CVARS[n] = v end
+end
+System.AddCCommand = function(name, body, help) CCMDS[name] = { body = tostring(body), help = tostring(help or "") } end
+Script = mkstub()
+Script.SetTimer = function(ms, f) TIMERS[#TIMERS + 1] = { ms = ms, f = f, at = NOW } end
+AI = mkstub(); Sound = mkstub(); Physics = mkstub(); Terrain = mkstub()
+UIAction = mkstub()
+UIAction.CallFunction = function(panel, inst, fn, text) TOASTS[#TOASTS + 1] = tostring(text) end
+Game = mkstub()
+Calendar = mkstub()
+Calendar.GetWorldTime = function() return 1000000 end
+XGenAIModule = mkstub()
+
+ORIG_TALKS = 0
+BasicAIActions = { OnTalk = function(self, user, slot) ORIG_TALKS = ORIG_TALKS + 1 end }
+RESTRICT = {}
+PLAYER_RESTRICTED = false
+player = { id = 1,
+    soul = {
+        RestrictDialog = function(self, on) RESTRICT[#RESTRICT + 1] = "player " .. tostring(on); PLAYER_RESTRICTED = on end,
+        IsDialogRestricted = function(self) return PLAYER_RESTRICTED end,
+        GetState = function() return 0 end,
+    },
+    human = { IsInDialog = function() return false end },
+    actor = { StandUp = function() end },
+}
+PX, PY = 0, 0
+DIRX, DIRY = 1, 0
+player.GetWorldPos = function() return { x = PX, y = PY, z = 0 } end
+player.GetDirectionVector = function() return { x = DIRX, y = DIRY, z = 0 } end
+player.GetName = function() return "Dude" end
+
+local rawpcall = pcall
+pcall = function(f, ...)
+    local r = { rawpcall(f, ...) }
+    if not r[1] then ERRS[#ERRS + 1] = tostring(r[2]) end
+    return unpack(r)
+end
+
+-- @@KDCMP@@
+
+-- WO-200 Act III: the sweeps and the geometric rider rule these scenarios pin stand down while WO-200's copy_neutral_always and
+-- rider_from_host are on (the default); they are tested here with those off (Test-WO200Synthetic.lua covers the replacements).
+if KCD2MP_W200Set then KCD2MP_W200Set("copy_neutral_always", "off"); KCD2MP_W200Set("rider_from_host", "off") end
+
+local RESULTS = {}
+local function check(name, ok, detail)
+    RESULTS[#RESULTS + 1] = (ok and "PASS  " or "FAIL  ") .. name .. (detail and ("  [" .. tostring(detail) .. "]") or "")
+end
+local function lastLog(needle, fromLog)
+    for i = #LOG, (fromLog or 0) + 1, -1 do if LOG[i]:find(needle, 1, true) then return LOG[i] end end
+    return nil
+end
+local function countLog(needle, fromLog)
+    local n = 0
+    for i = (fromLog or 0) + 1, #LOG do if LOG[i]:find(needle, 1, true) then n = n + 1 end end
+    return n
+end
+local function countEvt(name, argPrefix, fromLog)
+    local n = 0
+    for i = (fromLog or 0) + 1, #LOG do
+        local l = LOG[i]
+        if l:find("[KCD2-MP-EVT] v1 ", 1, true) and l:find(" " .. name .. " " .. (argPrefix or ""), 1, true) then n = n + 1 end
+    end
+    return n
+end
+local function cmdCount(prefix)
+    local n = 0
+    for _, c in ipairs(CMDS) do if c:sub(1, #prefix) == prefix then n = n + 1 end end
+    return n
+end
+local function noErrs(label) check(label .. ": no swallowed Lua errors", #ERRS == 0, ERRS[1]) end
+
+local function copy(name, x, y)
+    local e = { id = #ENTS + 100, GetName = function() return name end, actor = { IsDead = function() return false end },
+                human = { IsInDialog = function() return false end, IsWeaponDrawn = function() return false end },
+                soul = { RestrictDialog = function(self, on) RESTRICT[#RESTRICT + 1] = name .. " " .. tostring(on) end } }
+    e.GetWorldPos = function() return { x = x, y = y, z = 0 } end
+    ENTS[name] = e
+    KCD2MP.npcPuppets[name] = {}
+    return e
+end
+local function joiner(on)
+    KCD2MP.w137.joiner, KCD2MP.w137.active, KCD2MP.w137.host, KCD2MP.w137.sync, KCD2MP.w137.talkOn = on, on, false, true, true
+end
+local function frame(dt)
+    NOW = NOW + (dt or 0.3)
+    KCD2MP_W164Frame()
+end
+
+-- (S) the sweep -----------------------------------------------------------------------------------------------------------------
+do
+    ERRS = {}
+    joiner(true)
+    copy("ttac_blacksmith", 50, 0)
+    CMDS = {}
+    local mark = #LOG
+    check("S1: a host copy is swept: released (Unstance, Stance) and the agent told with its hold", KCD2MP_W164Sweep("ttac_blacksmith", "adaptive") == true
+        and cmdCount("wh_ai_NPCStateResetElement ttac_blacksmith Unstance") == 1 and cmdCount("wh_ai_NPCStateResetElement ttac_blacksmith Stance") == 1
+        and countEvt("w164_sweep", "ttac_blacksmith adaptive 120", mark) == 1, CMDS[1])
+    check("S2: ... logged", lastLog("WO164-SWEEP-LUA npc=ttac_blacksmith trigger=adaptive released=true hold_s=120", mark) ~= nil)
+    check("S3: not again inside 20 s", KCD2MP_W164Sweep("ttac_blacksmith", "adaptive") == false)
+    NOW = NOW + 21
+    check("S4: ... and again after", KCD2MP_W164Sweep("ttac_blacksmith", "focus") == true)
+    check("S5: never a body that is not a host copy", KCD2MP_W164Sweep("ttac_stranger", "adaptive") == false)
+    KCD2MP_W164SetSweep("off")
+    NOW = NOW + 21
+    check("S6: mp_talk_sweep off: nothing", KCD2MP_W164Sweep("ttac_blacksmith", "adaptive") == false)
+    KCD2MP_W164SetSweep("on")
+    check("S7: the switches are registered", CCMDS["mp_talk_sweep"] ~= nil and CCMDS["mp_talk_guard"] ~= nil and CCMDS["mp_flee_limit"] ~= nil
+        and CCMDS["mp_joiner_events"] ~= nil and CCMDS["mp_w164_status"] ~= nil and CCMDS["mp_w164_sweep"].body == "KCD2MP_W164SweepCmd(%line)")
+    CMDS = {}
+    NOW = NOW + 21
+    check("S8: the console form takes the quoted %line", KCD2MP_W164SweepCmd('"ttac_blacksmith"') == true and cmdCount("wh_ai_NPCStateResetElement ttac_blacksmith") == 2)
+    noErrs("S")
+end
+
+-- (K) / (F) WO-201 Act VI (WO-200 ledger row 9, retired): the after-skip sweep and the focus pre-warm are gone -- a host copy is kept
+-- neutral every tick (II.4) and has nothing torn to sweep; the talk's own steps (its retry, the host's conversation end) keep theirs
+do
+    ERRS = {}
+    check("K1: no after-skip sweep any more", KCD2MP_W164AfterSkip == nil)
+    copy("tf_front", 3, 0)
+    NOW = NOW + 30
+    local mark = #LOG
+    frame(0.6)
+    check("F1: a faced copy is not swept before the key press any more", countEvt("w164_sweep", nil, mark) == 0)
+    ENTS["tf_front"] = nil; KCD2MP.npcPuppets["tf_front"] = nil
+    noErrs("K")
+end
+
+-- (D) one attempt at a time, (P) the copy's own requests, (R) the retry ------------------------------------------------------------
+do
+    ERRS = {}
+    local e = copy("tvid_huntsman", 1, 0)
+    PX, PY = 0, 0
+    KCD2MP_W137Session(false, true, true)   -- installs the talk wraps
+    local presses = 0
+    local origWas = KCD2MP.w137.talkWraps and KCD2MP.w137.talkWraps.OnTalk
+    check("D0: the talk wraps are installed", origWas ~= nil)
+    RESTRICT = {}
+    local mark = #LOG
+    BasicAIActions.OnTalk(e, player, 0)
+    check("P1: nothing is restricted at the key press (live: a soul restricted in the same frame can drop the request that follows)", #RESTRICT == 0, RESTRICT[1])
+    check("P2: ... no pre-clear line", lastLog("WO164-TALK preclear", mark) == nil)
+    check("T0: the agent is told of the ask", countEvt("w164_talk", "ask tvid_huntsman OnTalk", mark) == 1)
+    KCD2MP_W137TalkRequest(90)
+    check("R0: the request's id is kept", KCD2MP.w137.talking["tvid_huntsman"].id == 90)
+    frame(3.0)
+    check("R1: not retried before 4 s", countEvt("w164_talk", "retry", mark) == 0)
+    RESTRICT = {}
+    frame(1.5)
+    check("R2: open 4 s: retried once -- the player's request cancelled (restrict on/off), the copy swept, the press asked again",
+        countEvt("w164_talk", "retry tvid_huntsman cancel=ok reissue=asked", mark) == 1 and RESTRICT[1] == "player true" and RESTRICT[2] == "player false"
+        and countEvt("w164_sweep", "tvid_huntsman retry 30", mark) == 1, RESTRICT[1])
+    check("R3: the old id no longer ends the talk (the engine's cancel line)", KCD2MP.w137.talking["tvid_huntsman"].id == nil and KCD2MP_W137TalkDropped(90) == false)
+    local tm = TIMERS[#TIMERS]
+    check("R4: the re-issue is the same game action, 300 ms later", tm ~= nil and tm.ms == 300)
+    if tm then tm.f() end
+    check("R5: ... and it ran", lastLog("WO164-TALK retry npc=tvid_huntsman reissue=ok", mark) ~= nil)
+    frame(6.0)
+    check("R6: never a second retry", countEvt("w164_talk", "retry", mark) == 1)
+    NOW = NOW + 30; KCD2MP_W137Session(false, true, true)
+    check("R7: still nothing: ended never-started, the agent told, the player told to try again",
+        countEvt("w164_talk", "end tvid_huntsman never-started", mark) == 1 and TOASTS[#TOASTS] == "Try again in a moment.", TOASTS[#TOASTS])
+    local m2 = #LOG
+    BasicAIActions.OnTalk(e, player, 0)
+    check("D1: a press under 3 s after: not passed on, told once", countEvt("w164_talk", "ask", m2) == 0 and TOASTS[#TOASTS] == "Wait a moment...", TOASTS[#TOASTS])
+    NOW = NOW + 3.5
+    BasicAIActions.OnTalk(e, player, 0)
+    check("D2: after 3 s: a new attempt", countEvt("w164_talk", "ask tvid_huntsman", m2) == 1)
+    KCD2MP_W137TalkEndAll("test")
+    KCD2MP_W164SetTalkGuard("off")
+    NOW = NOW + 0.5
+    BasicAIActions.OnTalk(e, player, 0)
+    check("D3: mp_talk_guard off: no window", countEvt("w164_talk", "ask tvid_huntsman", m2) == 2)
+    KCD2MP_W137TalkEndAll("test")
+    KCD2MP_W164SetTalkGuard("on")
+    ENTS["tvid_huntsman"] = nil; KCD2MP.npcPuppets["tvid_huntsman"] = nil
+    noErrs("D/P/R")
+end
+
+-- (L) the flee limiter -----------------------------------------------------------------------------------------------------------
+do
+    ERRS = {}
+    local mark = #LOG
+    check("L1: re-asserts pass at first", KCD2MP_W164ReassertBlocked("tbuk_man_3", NOW) == false)
+    KCD2MP_W164ReassertNote("tbuk_man_3", NOW)
+    check("L2: not within 2 s", KCD2MP_W164ReassertBlocked("tbuk_man_3", NOW + 1.0) == true)
+    KCD2MP_W164ReassertNote("tbuk_man_3", NOW + 2.1)
+    KCD2MP_W164ReassertNote("tbuk_man_3", NOW + 4.2)
+    check("L3: the third in 10 s: 20 s of rest, logged", KCD2MP_W164ReassertBlocked("tbuk_man_3", NOW + 10) == true
+        and lastLog("WO164-FLEE npc=tbuk_man_3 backoff 20 s", mark) ~= nil)
+    check("L4: ... over after 20 s", KCD2MP_W164ReassertBlocked("tbuk_man_3", NOW + 25) == false)
+    KCD2MP_W164Flee("tbuk_man_5", true)
+    check("L5: none while the host's NPC flees", KCD2MP_W164ReassertBlocked("tbuk_man_5", NOW) == true)
+    KCD2MP_W164Flee("tbuk_man_5", false)
+    check("L6: ... and again after", KCD2MP_W164ReassertBlocked("tbuk_man_5", NOW) == false)
+    KCD2MP_W164SetFleeLimit("off")
+    KCD2MP_W164Flee("tbuk_man_5", true)
+    check("L7: mp_flee_limit off: no limiter", KCD2MP_W164ReassertBlocked("tbuk_man_5", NOW) == false)
+    KCD2MP_W164SetFleeLimit("on"); KCD2MP_W164Flee("tbuk_man_5", false)
+    noErrs("L")
+end
+
+-- (E) random events ---------------------------------------------------------------------------------------------------------------
+do
+    ERRS = {}
+    local mark = #LOG
+    joiner(true)
+    KCD2MP.w164.reOff = nil
+    CVARS.wh_pl_RandomEventsAutoSpawnEnabled = "1"
+    frame(0.3)
+    check("E1: a joiner in a session: this game's own random events off", CVARS.wh_pl_RandomEventsAutoSpawnEnabled == "0"
+        and lastLog("WO164-EVENTS joiner: this game's own random events OFF", mark) ~= nil)
+    joiner(false)
+    frame(0.3)
+    check("E2: the session over: back to what it was", CVARS.wh_pl_RandomEventsAutoSpawnEnabled == "1" and lastLog("random events back", mark) ~= nil)
+    KCD2MP.w137.host, KCD2MP.w137.active = true, true
+    frame(0.3)
+    check("E3: never on the host", CVARS.wh_pl_RandomEventsAutoSpawnEnabled == "1")
+    KCD2MP.w137.host, KCD2MP.w137.active = false, false
+    KCD2MP_W164SetJoinerEvents("off"); joiner(true); frame(0.3)
+    check("E4: mp_joiner_events off: a joiner keeps its own", CVARS.wh_pl_RandomEventsAutoSpawnEnabled == "1")
+    joiner(false); frame(0.3); KCD2MP_W164SetJoinerEvents("on")
+    noErrs("E")
+end
+
+-- (U) unstuck ----------------------------------------------------------------------------------------------------------------------
+do
+    ERRS = {}
+    CMDS = {}
+    local mark = #LOG
+    NOW = NOW + 60
+    KCD2MP_W151Unstuck("")
+    check("U1: step 1 resets this player's seat (Unstance, Stance) and frees as before", cmdCount("wh_ai_NPCStateResetElement Dude Unstance") == 1
+        and cmdCount("wh_ai_NPCStateResetElement Dude Stance") == 1 and lastLog("WO164-UNSTUCK step=1 stood=asked moved=no", mark) ~= nil
+        and lastLog("WO151-UNSTUCK soft:", mark) ~= nil)
+    NOW = NOW + 5
+    KCD2MP_W151Unstuck("")
+    check("U2: again within 10 s: step 2 asks the agent to put him beside his partner", countEvt("w164_unstuck2", "", mark) == 1
+        and lastLog("WO164-UNSTUCK step=2", mark) ~= nil and lastLog("beside-partner", mark) ~= nil)
+    NOW = NOW + 5
+    KCD2MP_W151Unstuck("")
+    check("U3: a third press starts again at step 1", countEvt("w164_unstuck2", "", mark) == 1)
+    noErrs("U")
+end
+
+-- (M) the mark snapshot ------------------------------------------------------------------------------------------------------------
+do
+    ERRS = {}
+    joiner(true)
+    copy("tm_near", 5, 5)
+    KCD2MP.w137.talking["tm_near"] = { since = NOW - 3, id = 7 }
+    SPHERE = { { soul = {}, GetName = function() return "dummyWanderer_horseRider_1" end }, { GetName = function() return "dummyWanderer_camera_1" end }, { soul = {}, GetName = function() return "ttac_man_2" end } }
+    KCD2MP_ShowNativeToast("This person can't talk to you right now.")
+    local mark = #LOG
+    local n = KCD2MP_W164MarkSnap("ab12cd34ef", "local")
+    local lines = countLog("MP-MARK-SNAP mark=ab12cd34ef lua ", mark)
+    check("M1: a block of at most 40 lines plus its end line", n >= 6 and n <= 40 and lines == n + 1, n)
+    check("M2: it carries the talk, the copy nearby, the event actor, the toast", lastLog("talk npc=tm_near", mark) ~= nil and lastLog("copy npc=tm_near", mark) ~= nil
+        and lastLog("event_actor dummyWanderer_horseRider_1 owner=this-game", mark) ~= nil and lastLog("toast", mark) ~= nil)
+    local bad = 0
+    for i = mark + 1, #LOG do if LOG[i]:find(":\\", 1, true) or LOG[i]:find("@", 1, true) then bad = bad + 1 end end
+    check("M3: no path, no address", bad == 0)
+    check("M4: the id is cleaned", (function() local m2 = #LOG; KCD2MP_W164MarkSnap("x/../y z", "peer0"); return lastLog("mark=xyz lua", m2) ~= nil end)())
+    KCD2MP.w137.talking["tm_near"] = nil; ENTS["tm_near"] = nil; KCD2MP.npcPuppets["tm_near"] = nil
+    KCD2MP_W164Status()
+    check("M5: the status line", lastLog("WO164-STATUS sweep=true talk_guard=true") ~= nil)
+    KCD2MP_W164Notice("Back with your host")
+    check("N1: a notice is the game's own HUD line", TOASTS[#TOASTS] == "Back with your host" and lastLog("WO164-NOTICE Back with your host") ~= nil)
+    noErrs("M")
+end
+
+-- (H) R2, retired (WO-201 Act VI, WO-200 ledger row 7): no geometry makes a rider any more -- only the host's word ------------------
+do
+    ERRS = {}
+    joiner(true)
+    local horse = copy("dw_horse_8", 10, 0); horse.class = "Horse"
+    local rider = copy("dw_rider_3", 10, 0); rider.class = "NPC"
+    local mounted = nil
+    rider.human.ForceMount = function(self, id) mounted = id end
+    rider.human.IsMounted = function() return mounted ~= nil end
+    rider.human.ForceDismount = function() mounted = nil end
+    local hp, rp = KCD2MP.npcPuppets["dw_horse_8"], KCD2MP.npcPuppets["dw_rider_3"]
+    hp.tx, hp.ty, hp.tz = 10, 0, 0
+    rp.tx, rp.ty, rp.tz = 10.3, 0.2, 1.2
+    for _ = 1, 4 do KCD2MP_W164RiderHeld("dw_rider_3", rp, rider) end
+    check("H1: a stream sitting on a horse's makes no rider by itself (the host's word decides)", mounted == nil)
+    check("H2: the switch is gone", CCMDS["mp_rider_unit"] == nil)
+    for _, n in ipairs({ "dw_horse_8", "dw_rider_3" }) do ENTS[n] = nil; KCD2MP.npcPuppets[n] = nil end
+    noErrs("H")
+end
+
+-- (C) ESC: a quest NPC that follows the joiner ---------------------------------------------------------------------------------------
+do
+    ERRS = {}
+    local dog = { id = 777, class = "Dog", soul = {}, GetName = function() return "hledaniPsa_ignaz" end, GetWorldPos = function() return { x = 3, y = 0, z = 0 } end }
+    local mine = copy("tc_copy", 1, 0)
+    SPHERE = { dog, mine }
+    local mark = #LOG
+    check("C1 (joiner): the nearest of this game's own (not a host copy) within 8 m is the follower; the agent is told",
+        KCD2MP_W164EscortFind() == "hledaniPsa_ignaz" and countEvt("w164_escort", "hledaniPsa_ignaz 1", mark) == 1)
+    KCD2MP_W164EscortEnd("quest-step")
+    check("C2 (joiner): its end is told", countEvt("w164_escort", "hledaniPsa_ignaz 0", mark) == 1)
+    local moved = nil
+    dog.SetWorldPos = function(self, p) moved = p end
+    ENTS["hledaniPsa_ignaz"] = dog
+    ENTS["kcd2mp_1"] = { GetWorldPos = function() return { x = 20, y = 0, z = 0 } end }
+    CMDS = {}
+    check("C3 (host): paused and followed", KCD2MP_W164EscortFollow("hledaniPsa_ignaz", 1, true) == true and cmdCount("wh_ai_PauseNPC hledaniPsa_ignaz") == 1)
+    KCD2MP_W164EscortTick()
+    check("C4 (host): 2 m behind the figure, on its own side", moved ~= nil and math.abs(moved.x - 18) < 0.01, moved and moved.x)
+    KCD2MP_W164EscortFollow(nil, 1, false)
+    check("C5 (host): the end gives its brain back", cmdCount("wh_ai_ResumeNPC hledaniPsa_ignaz") == 1 and next(KCD2MP.w164.escort) == nil)
+    ENTS["hledaniPsa_ignaz"] = nil; ENTS["kcd2mp_1"] = nil; ENTS["tc_copy"] = nil; KCD2MP.npcPuppets["tc_copy"] = nil
+    SPHERE = {}
+    noErrs("C")
+end
+
+-- (Z) SL: the rest shown on the sleep screen ---------------------------------------------------------------------------------------
+do
+    ERRS = {}
+    local st = { health = 60, exhaust = 30, hunger = 50 }
+    local soulWas = player.soul
+    player.soul = { GetState = function(self, n) return st[n] end, SetState = function(self, n, v) st[n] = v end,
+                    RestrictDialog = soulWas.RestrictDialog, IsDialogRestricted = soulWas.IsDialogRestricted }
+    local t = 1000000
+    Calendar.GetWorldTime = function() return t end
+    local mark = #LOG
+    KCD2MP.w157.gameRests = nil
+    KCD2MP_W157RestLine("start", 2, 4.0)
+    check("Z1: a real sleep of 4 h: the rest given at its start (the screen shows it)", math.abs(st.exhaust - (30 + 12.45 * 4)) < 0.01
+        and lastLog("WO164-REST pre-applied", mark) ~= nil, st.exhaust)
+    t = t + 4 * 3600
+    local e1 = st.exhaust
+    KCD2MP_W157RestLine("end")
+    check("Z2: ... and not again at its end", st.exhaust == e1 and lastLog("WO157-REST rested", mark) == nil)
+    st.exhaust = 30
+    KCD2MP_W157RestLine("start", 1, 4.0)
+    check("Z3: a wait (id 1) never rests", st.exhaust == 30)
+    player.soul = soulWas
+    Calendar.GetWorldTime = function() return 1000000 end
+    noErrs("Z")
+end
+
+-- (B) the host's NPC fights: its copy is never holstered; T5 reacts to the copy's own line; the fallback never takes a copy for an own NPC
+do
+    ERRS = {}
+    local mark = #LOG
+    KCD2MP_W164HostCombat("tbuk_man_3")
+    check("B1: the host's NPC fights: no holster for 10 s", KCD2MP_W164ReassertBlocked("tbuk_man_3", NOW + 1, false) == true)
+    check("B2: ... a draw is never held back by it", KCD2MP_W164ReassertBlocked("tbuk_man_3", NOW + 1, true) == false)
+    check("B3: ... and 10 s after its last combat report, a holster passes again", KCD2MP_W164ReassertBlocked("tbuk_man_3", NOW + 11, false) == false)
+    joiner(true)
+    local e = copy("tb_talker", 1, 0)
+    local interrupted = false
+    e.human.InterruptDialogs = function() interrupted = true end
+    KCD2MP.w137.talking["tb_talker"] = { since = NOW, id = 5 }
+    check("B4 (T5): the copy's own line while this player's request is open: interrupted", KCD2MP_W164Preempted("tb_talker") == "interrupted" and interrupted
+        and lastLog("WO164-TALK preempted npc=tb_talker own_line=interrupted:true", mark) ~= nil)
+    KCD2MP.w137.talking["tb_talker"].started = true
+    interrupted = false
+    check("B5 (T5): never once the conversation started", KCD2MP_W164Preempted("tb_talker") == "not-waiting" and not interrupted)
+    KCD2MP.w137.talking["tb_talker"] = nil
+    local own = { id = 4242, GetName = function() return "tb_villager" end }
+    ENTS["tb_villager"] = own
+    local m2 = #LOG
+    NOW = NOW + 5
+    BasicAIActions.OnTalk(own, player, 0)
+    KCD2MP_W137TalkRequest(777)
+    check("B6: a talk to this game's own NPC never resumes the copy beside it (the request fallback)", KCD2MP.w137.talking["tb_talker"] == nil
+        and countEvt("w164_talk", "ask", m2) == 0)
+    ENTS["tb_villager"] = nil; ENTS["tb_talker"] = nil; KCD2MP.npcPuppets["tb_talker"] = nil
+    noErrs("B")
+end
+
+OUT = table.concat(RESULTS, "\n")

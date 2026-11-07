@@ -1,0 +1,407 @@
+# Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
+# GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
+# content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
+<#
+.SYNOPSIS
+    One command, one Setup.exe.
+
+.DESCRIPTION
+    Runs tools\Publish-Release.ps1 to assemble release\KCDMP, then compiles
+    installer\KCDMP.iss with Inno Setup's command-line compiler into
+    release\IgnisComeDeliverance-Setup-<version>.exe (WO-134: the new name; KCDMP-Setup-<version>.exe before).
+
+    The version comes from the VERSION file at the repo root and from nowhere
+    else: it is stamped into the Setup filename, the installer's Add/Remove
+    Programs entry, and the exe's own version resource.
+
+.PARAMETER SkipPublish
+    Compile the installer against whatever release\KCDMP already contains.
+    Only useful when iterating on the .iss -- a full publish is minutes.
+
+.PARAMETER SoakWaiver
+    WO-153: the maintainer's explicit decision to build without the frame-rate soak
+    having passed for this code. The reason is mandatory text (who decided, why); it
+    is printed, and written to release\SOAK-WAIVED-<version>.txt beside the installer
+    with the git commit. Without this switch the soak gate below stands as before.
+
+.PARAMETER ReleaseCandidate
+    WO-157: a release candidate for the maintainer's own two-player session, never a public
+    release. Skips ONLY the frame-rate soak check (the soak runs only before a public release);
+    every other gate stands. "not soak-tested: release candidate, not for public release" is
+    written into the build log (release\BUILD-<version>.log) and into the installer's own
+    verify file (install-verify.txt). Without this switch the soak is demanded as before.
+
+    Code signing (WO-157) is not a switch: when the Azure Artifact Signing settings are present
+    (tools\CodeSigning.ps1, docs\CODE-SIGNING.md) every shipped exe and DLL, then the Setup and
+    its uninstaller, are signed with a timestamp and checked; when absent the build is unsigned
+    and the build log says so.
+
+.PARAMETER SaveRoundTripWaiver
+    WO-179 0.2: the live save round trip (tools\Test-WO175SaveRoundTrip.py) must PASS for a build. A "skipped"
+    result (no Modding Tools game answered) fails the build unless this waiver is given: mandatory text (who
+    decided, why), printed and written to release\SAVE-ROUNDTRIP-WAIVED-<version>.txt with the git commit --
+    the same shape as -SoakWaiver. A FAIL or REFUSED result is never waived.
+
+.PARAMETER Push
+    WO-179 0.1: after the installer is built, push the pending commits to the remote's main -- only through the
+    publishing gate (tools\Check-Publishing.ps1: every added line, file name and commit message against the
+    denylist outside the repository; it fails closed). The gate also runs before the build, push or not.
+
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File tools\Build-Installer.ps1
+#>
+param(
+    [switch]$SkipPublish,
+    [string]$Version,
+    [string]$SoakWaiver,
+    [switch]$ReleaseCandidate,
+    [string]$SaveRoundTripWaiver,
+    [switch]$Push
+)
+
+$ErrorActionPreference = "Stop"
+$root = Split-Path $PSScriptRoot -Parent
+
+if (-not $Version) {
+    $versionFile = Join-Path $root "VERSION"
+    if (-not (Test-Path $versionFile)) { throw "VERSION file not found at $versionFile" }
+    $Version = (Get-Content $versionFile -TotalCount 1).Trim()
+}
+if ($Version -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') {
+    throw "VERSION must be numeric dotted (Inno stamps it into a Win32 version resource), got: '$Version'"
+}
+
+function Get-Iscc {
+    $onPath = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+    if ($onPath) { return $onPath.Source }
+    foreach ($candidate in @(
+        "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+        "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+    )) {
+        if (Test-Path $candidate) { return $candidate }
+    }
+    throw "Inno Setup 6 not found. Install it with: winget install --id JRSoftware.InnoSetup"
+}
+
+$iscc = Get-Iscc
+
+# WO-157: the build log. Everything this build prints goes to release\BUILD-<version>.log too.
+$relDir = Join-Path $root "release"
+$null = New-Item -ItemType Directory -Force -Path $relDir
+$buildLog = Join-Path $relDir "BUILD-$Version.log"
+Start-Transcript -Path $buildLog -Force | Out-Null
+trap { try { Stop-Transcript | Out-Null } catch {}; break }
+Write-Host "Build of $Version at $(Get-Date -Format s), commit $(& git -C $root rev-parse HEAD 2>$null)"
+Write-Host "Inno Setup compiler: $iscc"
+
+# WO-211 0.2: the build id (the short commit and the build time) -- written into the git-ignored BUILD_ID before anything is built, so
+# every assembly, the DLL and this installer's name carry the same one (the version stays the maintainer's)
+$buildId = (& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "Write-BuildId.ps1") -Repo $root | Select-Object -Last 1)
+if ($LASTEXITCODE -ne 0 -or $buildId -notmatch '^[0-9A-Za-z.-]{1,40}$') { throw "Write-BuildId failed: '$buildId'" }
+Write-Host "Build id: $buildId"
+
+# WO-157: code signing, when its settings are present (never committed: environment or the git-ignored
+# tools\signing.local.json). A half-configured signing stops the build here.
+. (Join-Path $PSScriptRoot "CodeSigning.ps1")
+$signing = Get-KcdmpSigningConfig
+if ($signing) {
+    $signTool = Find-KcdmpSignTool $signing
+    if (-not (Test-Path $signing.Dlib)) { throw "Azure.CodeSigning.Dlib.dll not found: $($signing.Dlib)" }
+    Write-Host "Code signing: ON (Azure Artifact Signing, account $($signing.Account), profile $($signing.Profile)); signtool $signTool"
+} else {
+    Write-Host "Code signing: OFF -- no signing settings found (docs\CODE-SIGNING.md). This build is UNSIGNED." -ForegroundColor Yellow
+}
+
+# WO-179 0.1: the publishing gate -- nothing private in what a push of this code would publish (every added line,
+# file name and commit message of the pending commits against the denylist outside the repository; fails closed).
+Write-Host "Publishing gate (tools\Check-Publishing.ps1) ..."
+& powershell -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "Check-Publishing.ps1") -RepoDir $root
+if ($LASTEXITCODE -ne 0) { throw "the publishing gate FAILED. Not shipping." }
+
+# WO-151 Phase 0.3: no installer before the frame-rate soak has passed for exactly this
+# code (tools/perf/README.md). 0.42.7 was built with a frame-rate collapse listed as a
+# known issue; the soak record carries the git trees of the code it ran, and this stops
+# a build whose DLL, Lua, agent, relay or protocol differ from them.
+$soak = Join-Path $root "tools\perf\soak.py"
+if (-not (Test-Path $soak)) { throw "tools\perf\soak.py missing -- the frame-rate soak gate cannot run" }
+$rcNote = "not soak-tested: release candidate, not for public release"
+if ($ReleaseCandidate -and $SoakWaiver) { throw "-ReleaseCandidate and -SoakWaiver are two different records: use one" }
+if ($ReleaseCandidate) {
+    # WO-157: the soak runs only before a public release. This build is for the maintainer's
+    # two-player session; it says so in the build log, beside the installer and in install-verify.txt.
+    $commit = (& git -C $root rev-parse HEAD 2>$null)
+    Write-Host ("WARNING: " + $rcNote) -ForegroundColor Yellow
+    @($rcNote, "version : $Version", "commit  : $commit", "when    : $(Get-Date -Format s)",
+      "Every other gate ran. Before a public release: the soak (tools\perf\soak.py) and a build without -ReleaseCandidate.") |
+        Set-Content -Encoding utf8 (Join-Path $relDir "RELEASE-CANDIDATE-$Version.txt")
+} elseif ($SoakWaiver) {
+    # WO-153: waived by the maintainer, on the record -- never silently.
+    $commit = (& git -C $root rev-parse HEAD 2>$null)
+    Write-Host ("WARNING: building WITHOUT the frame-rate soak -- waived: " + $SoakWaiver) -ForegroundColor Yellow
+    @("The frame-rate soak (tools\perf\soak.py) was NOT run or not passing for this build; the maintainer waived it.",
+      "version : $Version", "commit  : $commit", "when    : $(Get-Date -Format s)", "waiver  : $SoakWaiver",
+      "No frame-rate comparison against the game without the mod exists for this code.") |
+        Set-Content -Encoding utf8 (Join-Path $relDir "SOAK-WAIVED-$Version.txt")
+} else {
+    & python $soak check
+    if ($LASTEXITCODE -ne 0) { throw "the frame-rate soak has not passed for this code (tools\perf\soak.py check). Not shipping." }
+}
+
+$payload = Join-Path $root "release\KCDMP"
+
+# Rebuild kdcmp.pak from its sources before packaging it. The pak is a build
+# artifact that happens to be tracked in git, so without this a release can
+# quietly ship a pak that does not match the Lua and XML next to it in the
+# repo. -NoInstall: this only rebuilds, it does not touch any game folder.
+& powershell -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "Build-And-Install-Mod.ps1") -NoInstall
+if ($LASTEXITCODE -ne 0) { throw "Build-And-Install-Mod.ps1 failed (is the game running?)" }
+
+if (-not $SkipPublish) {
+    # WO-101: the relay round-trip gate. 0.23.1 shipped a Position packet
+    # shape the relay silently dropped; 111 unit tests passed because none of
+    # them opened a socket to the relay. This hosts the real relay in-process
+    # and proves every multi-length packet crosses it intact, in both lengths.
+    # It is NOT optional: a packet-shape change that fails here does not ship.
+    if (-not $env:DOTNET_ROOT) {
+        $env:DOTNET_ROOT = "$env:USERPROFILE\.dotnet-sdk8"
+        $env:PATH = "$env:DOTNET_ROOT;$env:PATH"
+    }
+    # WO-203 II.5: the relay message table gate. 0.62.0 lost 463 W164 frames at
+    # the relay: the type had a row, but the row's limit was older than the
+    # senders, and the drop reason could not tell "unknown" from "too long".
+    # Every message type the protocol defines must have a relay rule, every
+    # rule must cross the real relay at its limits, and every W164 builder's
+    # worst case must fit its row. Named here so the build log says so.
+    Write-Host "Relay message table gate (WO-203 II.5, tools\Test-RelayTable.ps1) ..."
+    & powershell -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "Test-RelayTable.ps1")
+    if ($LASTEXITCODE -ne 0) { throw "the relay message table gate FAILED -- a message type has no relay rule, a rule does not cross the real relay, or a W164 text does not fit its row (tools\Test-RelayTable.ps1). Not shipping." }
+
+    Write-Host "Relay round-trip gate (dotnet\KcdMp.Relay.Tests) ..."
+    & dotnet test (Join-Path $root "dotnet\KcdMp.Relay.Tests\KcdMp.Relay.Tests.csproj") -c Release --nologo -v q
+    if ($LASTEXITCODE -ne 0) { throw "relay round-trip gate FAILED -- a packet does not cross the real relay. Not shipping." }
+
+    # WO-102 Phase 7: the agent's unit tests (codecs, cadence stats, the
+    # request/resync payloads) and the mod's synthetic authority suite run
+    # here too. KcdMp.Client.Tests is NOT in KcdMp.sln, so a plain solution
+    # build never compiles it -- it has to be named. A failure does not ship.
+    Write-Host "Agent unit tests (dotnet\KcdMp.Client.Tests) ..."
+    & dotnet test (Join-Path $root "dotnet\KcdMp.Client.Tests\KcdMp.Client.Tests.csproj") -c Release --nologo -v q
+    if ($LASTEXITCODE -ne 0) { throw "agent unit tests FAILED. Not shipping." }
+
+    # WO-150: the first-run setup code Setup and the launcher share (manifest
+    # reading, link checks, the checklist, redaction, the fake-tool runs).
+    Write-Host "Setup unit tests (dotnet\KcdMp.Setup.Tests) ..."
+    & dotnet test (Join-Path $root "dotnet\KcdMp.Setup.Tests\KcdMp.Setup.Tests.csproj") -c Release --nologo -v q
+    if ($LASTEXITCODE -ne 0) { throw "setup unit tests FAILED. Not shipping." }
+
+    # WO-171 L: the tester's log bundle (collapsed noise, zstd, parts that fit a Discord upload).
+    Write-Host "Log bundle tests (dotnet\KcdMp.LogPack.Tests) ..."
+    & dotnet test (Join-Path $root "dotnet\KcdMp.LogPack.Tests\KcdMp.LogPack.Tests.csproj") -c Release --nologo -v q
+    if ($LASTEXITCODE -ne 0) { throw "log bundle tests FAILED. Not shipping." }
+
+    # WO-110 R10 (docs/WO-109-audit.md): EVERY synthetic suite gates the
+    # release, not four of them. Before this, WO-108's own suite, WO-86,
+    # WO-99, NpcSmooth, GhostInterp, WO-106's static check and WO-90 (which
+    # was failing on a harness mock gap for two releases) never ran here.
+    # The list is a glob so a new Test-*Synthetic.ps1 is gated the moment it
+    # is added; nothing has to remember to register it.
+    $suites = Get-ChildItem (Join-Path $PSScriptRoot "Test-*Synthetic.ps1") | Sort-Object Name
+    if ($suites.Count -lt 14) { throw "release gate: expected at least 14 Test-*Synthetic.ps1 suites, found $($suites.Count) -- the tools folder is incomplete" }
+    foreach ($suite in $suites) {
+        Write-Host "Synthetic suite $($suite.Name) ..."
+        & powershell -ExecutionPolicy Bypass -File $suite.FullName
+        if ($LASTEXITCODE -ne 0) { throw "$($suite.Name) FAILED. Not shipping." }
+    }
+    # The two static checks on kdcmp.lua: the console placeholder rules (WO-106
+    # case, WO-110 quoting -- R2 shipped for two releases with the case check
+    # alone) and the Lua 5.1 200-local cliff (WO-110 Phase 0.2; MoonSharp does
+    # not enforce it, so no suite above can see it).
+    # WO-151: the third, on the native DLL: no raw __try, no build_argument(.
+    foreach ($static in @("Test-WO106ConsolePlaceholder.ps1", "Test-WO110LuaLocals.ps1", "Test-NativeGuards.ps1", "Test-WO157Static.ps1")) {
+        Write-Host "Static check $static ..."
+        & powershell -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot $static)
+        if ($LASTEXITCODE -ne 0) { throw "$static FAILED. Not shipping." }
+    }
+
+    # WO-175 S5: the save round trip. Synthetic: Test-WO175Synthetic.ps1 (the glob above), the agent's Wo175 tests (the agent
+    # suite above) and the save repair tool's own tests here; live: a game with a throwaway playline4 save -- skipped with a
+    # logged reason when no game runs, never silently.
+    Write-Host "Save repair tool tests (tools\savegame) ..."
+    & python (Join-Path $PSScriptRoot "savegame\test_whs_repair.py")
+    if ($LASTEXITCODE -ne 0) { throw "tools\savegame\test_whs_repair.py FAILED. Not shipping." }
+    & python (Join-Path $PSScriptRoot "savegame\test_whs_dump.py")
+    if ($LASTEXITCODE -ne 0) { throw "tools\savegame\test_whs_dump.py FAILED. Not shipping." }
+    Write-Host "Save round trip, live part (WO-175 S5) ..."
+    & python (Join-Path $PSScriptRoot "Test-WO175SaveRoundTrip.py")
+    $rt = $LASTEXITCODE
+    # WO-179 0.2: exit 3 = SKIPPED (no game answered). A skip is not a pass: it fails the build unless waived on the record.
+    if ($rt -eq 3) {
+        if (-not $SaveRoundTripWaiver) { throw "the live save round trip was SKIPPED (no Modding Tools game with a playline4 save answered) -- a skip fails a release build; run it with the game up, or pass -SaveRoundTripWaiver `"<who, why>`". Not shipping." }
+        $commit = (& git -C $root rev-parse HEAD 2>$null)
+        Write-Host ("WARNING: building WITHOUT the live save round trip -- waived: " + $SaveRoundTripWaiver) -ForegroundColor Yellow
+        @("The live save round trip (tools\Test-WO175SaveRoundTrip.py) was SKIPPED for this build; the maintainer waived it.",
+          "version : $Version", "commit  : $commit", "when    : $(Get-Date -Format s)", "waiver  : $SaveRoundTripWaiver") |
+            Set-Content -Encoding utf8 (Join-Path $relDir "SAVE-ROUNDTRIP-WAIVED-$Version.txt")
+    } elseif ($rt -ne 0) { throw "the live save round trip FAILED. Not shipping." }
+
+    & powershell -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "Publish-Release.ps1")
+    if ($LASTEXITCODE -ne 0) { throw "Publish-Release.ps1 failed" }
+
+    # WO-129: the engine-free native tests (gait class bands against the
+    # engine's round(x)-1 mapper, the lock-free gait table). Publish-Release
+    # has just built native\ (Build-Native.ps1 builds this target too).
+    $nativeTests = Join-Path $root "native\build\tests\KCDMP_NativeTests.exe"
+    if (-not (Test-Path $nativeTests)) { throw "native tests missing: $nativeTests (Build-Native.ps1 should have built them)" }
+    Write-Host "Native unit tests (native\tests) ..."
+    & $nativeTests
+    if ($LASTEXITCODE -ne 0) { throw "native unit tests FAILED. Not shipping." }
+
+    # WO-157: sign the payload before anything runs it or hashes it (the smoke below runs the signed
+    # files; the install manifest further down describes the signed bytes).
+    if ($signing) {
+        $signMeta = New-KcdmpSigningMetadata $signing
+        try { Invoke-KcdmpSignPayload -Dir $payload -Config $signing -SignTool $signTool -Metadata $signMeta }
+        finally { Remove-Item $signMeta -Force -ErrorAction SilentlyContinue }
+    }
+
+    # WO-110 R10: execute the MERGED payload. Publish-Release flat-copies four
+    # self-contained publishes over each other (later projects overwrite
+    # shared DLLs) and no gate had ever started the result. This starts the
+    # published relay and the published agent from a byte-identical copy of
+    # the payload (a copy, so the run's own kcdmp-client.json / agent.log /
+    # relay.log never land in the folder the installer is about to embed),
+    # completes one Handshake + Ping/Pong round trip through the published
+    # protocol assembly on both sides, and fails the build otherwise.
+    & (Join-Path $PSScriptRoot "Test-PayloadSmoke.ps1") -Payload $payload
+    if ($LASTEXITCODE -ne 0) { throw "payload smoke FAILED -- the published agent and relay did not complete a round trip. Not shipping." }
+}
+
+# The .iss embeds this folder wholesale, so an empty or missing one would
+# compile happily into an installer that installs nothing.
+if (-not (Test-Path (Join-Path $payload "KCDMP_launcher.exe"))) {
+    throw "release payload incomplete: $payload\KCDMP_launcher.exe not found (run without -SkipPublish)"
+}
+# WO-150: Setup runs this before it installs anything; without it the installer cannot decide.
+if (-not (Test-Path (Join-Path $payload "KcdMpSetup.exe"))) {
+    throw "release payload incomplete: $payload\KcdMpSetup.exe not found (run without -SkipPublish)"
+}
+
+# WO-150: the staged mod. Setup always installs a copy of the two mod files
+# into <app>\mod\kdcmp; when the Modding Tools are not set up yet it places
+# nothing in the game folder, and the launcher's checklist places this copy
+# once the workspace is linked. Taken from the same bytes the MOD entries
+# below describe, after the pak rebuild (kdcmp.pak is not byte-deterministic).
+$staged = Join-Path $payload "mod\kdcmp"
+if (Test-Path $staged) { Remove-Item $staged -Recurse -Force }
+New-Item -ItemType Directory -Force -Path (Join-Path $staged "Data") | Out-Null
+Copy-Item (Join-Path $root "kdcmp\mod.manifest") $staged -Force
+Copy-Item (Join-Path $root "kdcmp\Data\kdcmp.pak") (Join-Path $staged "Data") -Force
+
+# WO-150: the installer's detection (the probe: the shipping wrapper + this
+# payload's helper, 26 checks) and its four cases end to end (a Setup compiled
+# from this KCDMP.iss, on fake Steam libraries, isolated from any real install;
+# it also compiles the unpatched script). Scratch under the git-ignored release\.
+$helper = Join-Path $payload "KcdMpSetup.exe"
+& powershell -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "Test-InstallerDetect.ps1") `
+    -WorkDir (Join-Path $root "release\wo150-detect-fixtures") -HelperExe $helper
+if ($LASTEXITCODE -ne 0) { throw "Test-InstallerDetect.ps1 FAILED. Not shipping." }
+& powershell -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "wo150\Test-SetupCases.ps1") `
+    -WorkDir (Join-Path $root "release\wo150-setup-cases") -HelperExe $helper
+if ($LASTEXITCODE -ne 0) { throw "tools\wo150\Test-SetupCases.ps1 FAILED. Not shipping." }
+
+# WO-175 (input policy rule 6): nothing that can inject or capture keyboard / mouse input ships. Every file of the
+# payload (the staged mod included) is scanned; our own files get no exemption, Microsoft's .NET Desktop runtime files are
+# listed by name as reviewed exemptions. Any hit stops the build.
+Write-Host "No-input-tooling gate (WO-175) ..."
+& python (Join-Path $PSScriptRoot "Test-NoInputTooling.py") $payload
+if ($LASTEXITCODE -ne 0) { throw "no-input-tooling gate FAILED: a shipped file contains input injection or capture. Not shipping." }
+
+# WO-192: nothing that ships takes a screenshot (WO-172's mark screenshot left image files on testers' PCs that they never took).
+# Every file of the payload (the staged mod's pak included) is scanned for the game's screenshot commands and the OS capture APIs.
+Write-Host "No-screenshot gate (WO-192) ..."
+& python (Join-Path $PSScriptRoot "Test-NoScreenshots.py") $payload
+if ($LASTEXITCODE -ne 0) { throw "no-screenshot gate FAILED: a shipped file takes a screenshot. Not shipping." }
+
+# WO-203 (the keylogger rule): nothing that ships can record, read or report what a person types or clicks. Every binary's import
+# and delay-load tables and every script (the staged mod's pak entries included) of the payload; the self-test first proves the
+# gate still catches what it must. Any hit, or a failed self-test, stops the build.
+Write-Host "No-input-capture gate (WO-203) ..."
+$nicOut = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "Check-NoInputCapture.ps1") -SelfTest -Scripts $payload   # -Scripts walks a folder for binaries too
+$nicExit = $LASTEXITCODE
+$nicOut | Where-Object { $_ -match '^(HIT|EXEMPT|SELFTEST|checked:|RESULT:)|^\s+- ' } | ForEach-Object { Write-Host $_ }
+if ($nicExit -ne 0) { throw "no-input-capture gate FAILED: a shipped file can read what a person types or clicks (or the gate's self-test failed). Not shipping." }
+
+# WO-206 B: the relay's fault mode is a test bench tool; nothing shipped may turn it on (config, payload, launcher).
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "Test-RelayFaultsGate.ps1") -Payload $payload
+if ($LASTEXITCODE -ne 0) { throw "the relay fault-mode gate FAILED -- a shipped file can turn the test-only fault mode on, or its tests failed (tools\Test-RelayFaultsGate.ps1). Not shipping." }
+
+# WO-32 follow-up, rewritten in WO-74: write a manifest of everything this
+# Setup carries so the installer can prove, after installing, that every file
+# actually landed -- and that nothing ELSE is sitting in the install directory
+# pretending to belong there.
+#
+# Motivated by two real incidents:
+#   * Setup 0.11.8 ran while agent/relay processes were alive, silently left
+#     KcdMpClient.dll and KcdMpServer.dll on an old build, and the
+#     newly-shipped NPC sync was inert with no error anywhere (WO-32).
+#   * A relay that could not cold-start because the install directory held a
+#     Microsoft.Extensions.Configuration.* assembly from a foreign publish
+#     -- a file no release ever shipped, so no overwrite could ever fix it
+#     and the size-only whitelist could not see it (WO-69, WO-74).
+#
+# Format (v2, WO-74) -- <kind>|<relative path>|<size>|<sha256>:
+#   APP  a file in the install directory, relative to it
+#   MOD  a file in <ModdingTools>\Mods\kdcmp, relative to that folder
+#
+# APP is a CLOSED set: the installer deletes any .dll/.exe/.pdb/.deps.json/
+# .runtimeconfig.json in the install directory that is not listed here. MOD
+# entries exist because the mod half lands in the game folder, outside the
+# install directory, and was previously verified by nothing at all -- an
+# install that deployed no pak still reported PASS.
+#
+# tools\New-InstallManifest.ps1 owns the format; both delivery routes call it.
+# It runs AFTER the pak rebuild and AFTER publish, and BEFORE ISCC, so it
+# describes exactly the bytes this Setup is about to embed. That order is
+# load-bearing: kdcmp.pak is NOT byte-deterministic (same size, different
+# sha256 on a rebuild from identical sources -- observed 2026-08-28), so a
+# manifest written before a later rebuild describes a pak that no longer
+# exists and fails verification on a perfectly good artifact.
+& (Join-Path $PSScriptRoot "New-InstallManifest.ps1") `
+    -AppDir $payload `
+    -ModFiles @{ "mod.manifest"    = (Join-Path $root "kdcmp\mod.manifest")
+                 "Data\kdcmp.pak"  = (Join-Path $root "kdcmp\Data\kdcmp.pak") } `
+    -OutFile (Join-Path $payload "install-manifest.txt")
+
+$iss = Join-Path $root "installer\KCDMP.iss"
+Write-Host "Compiling $iss (version $Version) ..."
+$isccArgs = @("/DAppVersion=$Version", "/DAppBuildId=$buildId")   # WO-211 0.2: the build id names the installer
+if ($ReleaseCandidate) { $isccArgs += "/DReleaseCandidate=1" }
+$signMeta = $null
+if ($signing) {
+    # Inno signs the Setup and the uninstaller it embeds with the same command ($f = the file).
+    $signMeta = New-KcdmpSigningMetadata $signing
+    $isccArgs += "/DKcdmpSign=1"
+    $isccArgs += ("/Skcdmpsign=" + (Get-KcdmpSignCommand $signing $signTool $signMeta -ForInno) + ' $f')
+}
+try { & $iscc @isccArgs $iss }
+finally { if ($signMeta) { Remove-Item $signMeta -Force -ErrorAction SilentlyContinue } }
+if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+
+$setup = Join-Path $root "release\IgnisComeDeliverance-Setup-$Version-$buildId.exe"
+if (-not (Test-Path $setup)) { throw "ISCC reported success but $setup is missing" }
+
+if ($signing) { Assert-KcdmpSigned -Files @($setup) }
+
+$mb = [math]::Round((Get-Item $setup).Length / 1MB, 1)
+Write-Host ""
+Write-Host "Installer: $setup ($mb MB)"
+Write-Host "build id : $buildId"
+Write-Host ("sha256   : " + (Get-FileHash $setup -Algorithm SHA256).Hash.ToLowerInvariant())
+Write-Host ("signed   : " + $(if ($signing) { "yes (Azure Artifact Signing)" } else { "NO -- unsigned build" }))
+if ($ReleaseCandidate) { Write-Host ("WARNING: " + $rcNote) -ForegroundColor Yellow }
+if ($Push) {
+    # WO-179 0.1: the push step goes through the publishing gate, never around it
+    & powershell -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "Check-Publishing.ps1") -RepoDir $root -Push
+    if ($LASTEXITCODE -ne 0) { Stop-Transcript | Out-Null; throw "the publishing gate refused the push (the installer above is built)" }
+}
+Stop-Transcript | Out-Null

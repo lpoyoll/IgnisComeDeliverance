@@ -1,0 +1,100 @@
+@* Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
+   GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
+   content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them. *@
+@inherits ModalBase
+@using KCDMP_launcher.Components.Shared
+
+@if (IsVisible)
+{
+    <div class="modal-overlay @(isClosing ? "closing" : "")">
+        <div class="modal-box" @onclick:stopPropagation="true">
+
+            <div class="modal-frame-top modal-frame-bg"></div>
+
+            <div class="modal-content" style="text-align: center;">
+                <div class="modal-title">REPORT A BUG</div>
+
+                <p>
+                    Found something broken? Tell us on GitHub, or drop a message
+                    in Discord -- whichever you'd rather use.
+                </p>
+                <p>
+                    Please attach the log bundle: COLLECT LOGS puts a small file on
+                    your Desktop with everything we need (game log, agent log,
+                    launcher log). It is made to fit a Discord message; a very
+                    long session comes as a few numbered parts instead.
+                </p>
+                <label style="display: block; margin: 6px 0;">
+                    <input type="checkbox" @bind="includeEarlier" disabled="@collecting" />
+                    include earlier launches (only if the problem was in an earlier run of the game)
+                </label>
+
+                <div class="modal-actions">
+                    <button class="kcd-btn primary" @onclick="OpenGitHubIssues">GITHUB ISSUES</button>
+                    <button class="kcd-btn primary" @onclick="OpenDiscord">DISCORD</button>
+                    <button class="kcd-btn primary" @onclick="CollectLogs" disabled="@collecting">COLLECT LOGS</button>
+                </div>
+                @if (!string.IsNullOrEmpty(collectResult))
+                {
+                    <p style="margin-top: 10px;">@collectResult</p>
+                }
+                <div class="modal-actions" style="margin-top: 10px;">
+                    <button class="kcd-btn" @onclick="CloseModalAsync">CLOSE</button>
+                </div>
+            </div>
+
+            <div class="modal-frame-bottom modal-frame-bg"></div>
+        </div>
+    </div>
+}
+
+@code {
+    // Hardcoded rather than a setting: these are the project's own repo and
+    // community, not something a server operator or player should point
+    // elsewhere -- unlike MasterServerUrl or RelayPath, there is only ever
+    // one right value.
+    private const string GitHubIssuesUrl = "https://github.com/DeepFriedDepp/kcd2-multiplayer_Reworked/issues";
+    private const string DiscordInviteUrl = "https://discord.gg/m4U95xUZ5";
+
+    // WO-39, item K: supplied by Home, which owns the settings these paths
+    // come from. Empty is fine -- LogBundle skips what it cannot find.
+    [Parameter] public string GameRoot { get; set; } = "";
+    [Parameter] public string AgentDirectory { get; set; } = "";
+    [Parameter] public string RelayDirectory { get; set; } = "";
+
+    private string collectResult = "";
+    private bool includeEarlier;
+    private bool collecting;
+
+    private void OpenGitHubIssues() => UrlLauncher.Open(GitHubIssuesUrl);
+    private void OpenDiscord() => UrlLauncher.Open(DiscordInviteUrl);
+
+    // WO-171 L: packing can take a minute on a long session (zstd at a high level), so it runs off the UI thread.
+    private async Task CollectLogs()
+    {
+        if (collecting) return;
+        collecting = true;
+        collectResult = "Collecting... a long session can take a minute.";
+        StateHasChanged();
+        try
+        {
+            var r = await Task.Run(() => LogBundle.CollectPacked(GameRoot, AgentDirectory, RelayDirectory, includeEarlier));
+            string names = string.Join(", ", r.Files.Select(System.IO.Path.GetFileName));
+            string mb = (r.PackedBytes / 1048576.0).ToString("F1", System.Globalization.CultureInfo.InvariantCulture);
+            if (r.UsedZipFallback)
+                collectResult = $"Saved to your Desktop: {names} ({mb} MB). The small format could not be made ({r.FallbackReason}), so this is a plain zip and may be too big for Discord.";
+            else if (r.Files.Count > 1)
+                collectResult = $"Saved to your Desktop in {r.Files.Count} parts ({mb} MB in all): {names}. Send all the parts.";
+            else
+                collectResult = $"Saved to your Desktop: {names} ({mb} MB).";
+        }
+        catch (Exception ex)
+        {
+            collectResult = $"Could not collect logs: {ex.Message}";
+        }
+        finally
+        {
+            collecting = false;
+        }
+    }
+}

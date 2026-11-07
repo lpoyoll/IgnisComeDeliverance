@@ -1,0 +1,7 @@
+traces/
+logs/
+synthpeer/bin/
+synthpeer/obj/
+__pycache__/
+data124/
+data125/

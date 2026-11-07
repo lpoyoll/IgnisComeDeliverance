@@ -1,0 +1,1621 @@
+﻿// Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
+// GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
+// content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
+#include "crash_capture.h"
+#include "pipe_server.h"
+#include "wo208.h"
+#include "wo209.h"
+#include "wo214.h"
+#include "mannequin_read.h"
+#include "local_state.h"
+#include "npc_scan.h"
+#include "main_thread.h"
+#include "rttr_abi.h"
+#include "combat_swing.h"
+#include "lua_closure.h"
+#include "script_context.h"
+#include "concept_read.h"
+#include "respawn.h"
+#include "respawn_actions.h"
+#include "npc_drive.h"
+#include "motion.h"
+#include "hits.h"
+#include "npc_trace.h"
+#include "join_native.h"
+#include "savelist.h"
+#include "leash.h"
+#include "wo131.h"
+#include "wo187.h"
+#include "wo132.h"
+#include "wo166.h"
+#include "wo137.h"
+#include "weather.h"
+#include "wo138.h"
+#include "wo139.h"
+#include "wo140.h"
+#include "wo141.h"
+#include "wo143.h"
+#include "wo210_hit.h"
+#include "fault_guard.h"
+#include "wo147.h"
+#include "wo151.h"
+#include "wo163.h"
+#include "wo203.h"
+#include "wo213.h"
+#include "wo201.h"
+#include "buffs.h"
+#include "instance.h"
+#include "wo206.h"
+#include "log.h"
+
+#include <windows.h>
+#include <array>
+#include <atomic>
+#include <condition_variable>
+#include <cstring>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace kcdmp::pipe {
+
+namespace {
+
+// WO-206 A.2: \\.\pipe\kcdmp for players; \\.\pipe\kcdmp-<id> for a test-bench copy (instance.h).
+const char* pipe_name() { return instance::pipe_name().c_str(); }
+
+std::atomic<bool>   g_running{false};
+std::atomic<bool>   g_connected{false};
+HANDLE              g_pipe = INVALID_HANDLE_VALUE;
+uint8_t             g_seq = 0;
+
+// The pipe is duplex and both directions are in use at once: the serve loop
+// parks in a read while the game thread pushes hits out. On a *synchronous*
+// handle the I/O manager serialises every request against the file object, so
+// that write would queue behind the parked read and never issue -- the read is
+// waiting on the agent, which is waiting on the write. That deadlock is what
+// silently swallowed every outbound LocalHit. Hence FILE_FLAG_OVERLAPPED on the
+// handle and an explicit OVERLAPPED per operation here; a lock is still needed,
+// but only to keep two writers from interleaving their frames.
+struct Op {
+    OVERLAPPED ov{};
+    Op()  { ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr); }
+    ~Op() { if (ov.hEvent) CloseHandle(ov.hEvent); }
+    Op(const Op&) = delete;
+    Op& operator=(const Op&) = delete;
+};
+
+bool write_all(HANDLE h, const void* data, DWORD len) {
+    const auto* p = static_cast<const BYTE*>(data);
+    Op op;
+    if (!op.ov.hEvent) return false;
+    DWORD done = 0;
+    while (done < len) {
+        DWORD n = 0;
+        ResetEvent(op.ov.hEvent);
+        if (!WriteFile(h, p + done, len - done, &n, &op.ov)) {
+            if (GetLastError() != ERROR_IO_PENDING) return false;
+            if (!GetOverlappedResult(h, &op.ov, &n, TRUE)) return false;
+        }
+        if (n == 0) return false;
+        done += n;
+    }
+    return true;
+}
+
+bool read_all(HANDLE h, void* data, DWORD len) {
+    auto* p = static_cast<BYTE*>(data);
+    Op op;
+    if (!op.ov.hEvent) return false;
+    DWORD done = 0;
+    while (done < len) {
+        DWORD n = 0;
+        ResetEvent(op.ov.hEvent);
+        if (!ReadFile(h, p + done, len - done, &n, &op.ov)) {
+            if (GetLastError() != ERROR_IO_PENDING) return false;
+            if (!GetOverlappedResult(h, &op.ov, &n, TRUE)) return false;
+        }
+        if (n == 0) return false;
+        done += n;
+    }
+    return true;
+}
+
+// Head and body go out as one write so a frame cannot be split across two I/O
+// operations. Byte-mode pipes do not require it, but it removes the question.
+bool send_frame(HANDLE h, uint8_t type, const void* payload, uint16_t len) {
+    BYTE frame[3 + 1024];
+    if (len > sizeof(frame) - 3) return false;
+    frame[0] = type;
+    frame[1] = static_cast<BYTE>(len & 0xFF);
+    frame[2] = static_cast<BYTE>((len >> 8) & 0xFF);
+    if (len) std::memcpy(frame + 3, payload, len);
+    return write_all(h, frame, 3u + len);
+}
+
+// Two threads write to this pipe -- the serve loop's replies and the game
+// thread's hits -- so the lock keeps their frames from interleaving. It does
+// nothing about read/write concurrency; see the note on Op above for that.
+CRITICAL_SECTION g_write_lock;
+bool             g_write_lock_ready = false;
+
+void send_local_hit(const unsigned char guid[16], void* soul, float health_delta, float stamina_delta, bool died) {
+    // WO-147: the sampler hands over the soul it measured (the old per-hit soul-list walk is gone), and a
+    // stamina drop is kept only for the player's own blow (an NPC's swings and blocks cost it stamina too).
+    const bool byPlayer = soul && hits::hit_by_player(soul, 1.5);
+    if (!byPlayer) stamina_delta = 0.0f;
+    if (health_delta <= 0.0f && stamina_delta <= 0.0f) return;   // a stamina drop nobody's blow explains
+    // Log the detection before the connectivity check, so a missing agent looks
+    // different from a missed hit.
+    logf("PIPE: LocalHit %.2f st %.2f%s%s guid=%02X%02X%02X%02X-...%s",
+         health_delta, stamina_delta, died ? " (fatal)" : "", byPlayer ? " by the player" : "",
+         guid[3], guid[2], guid[1], guid[0],
+         g_connected ? "" : "  [no agent attached, not sent]");
+    if (!g_connected || g_pipe == INVALID_HANDLE_VALUE) return;
+    // WO-86: the `died` bit the sampler has computed since WO-4 used to stop
+    // right here -- the frame carried guid+stamina+health and nothing else, so
+    // the agent could never tell a killing blow from a chip and no client ever
+    // put an NPC death on the wire. Appended as a trailing byte: an agent that
+    // predates it reads the first 24 bytes exactly as before.
+    // WO-121: byte 25 -- the local player landed this hit (the combat-hit
+    // chokepoint saw it within 1.5 s): the NPC's authority books the peer's
+    // avatar as the attacker. An older agent reads 25 bytes and stops.
+    unsigned char body[16 + 4 + 4 + 1 + 1];
+    std::memcpy(body, guid, 16);
+    std::memcpy(body + 16, &stamina_delta, 4);
+    std::memcpy(body + 20, &health_delta, 4);
+    body[24] = died ? 1 : 0;
+    body[25] = byPlayer ? 1 : 0;
+    EnterCriticalSection(&g_write_lock);
+    const bool sent = send_frame(g_pipe, kLocalHit, body, sizeof(body));
+    const DWORD err = sent ? 0 : GetLastError();
+    LeaveCriticalSection(&g_write_lock);
+    // A failed write used to be indistinguishable from a delivered one, which is
+    // how a deadlocked send looked like a working one for so long.
+    if (!sent) logf("PIPE: LocalHit write failed: %lu", err);
+}
+
+// WO-113: unsolicited respawn frames, written from the game thread under the
+// same write lock as LocalHit. A missing agent is logged by respawn.cpp's own
+// lines; here only a failed write is.
+void send_unsolicited(uint8_t type, const void* body, uint16_t len, const char* what) {
+    if (!g_connected || g_pipe == INVALID_HANDLE_VALUE) return;
+    EnterCriticalSection(&g_write_lock);
+    const bool sent = send_frame(g_pipe, type, body, len);
+    const DWORD err = sent ? 0 : GetLastError();
+    LeaveCriticalSection(&g_write_lock);
+    if (!sent) logf("PIPE: %s write failed: %lu", what, err);
+}
+
+void send_local_downed(bool on, respawn::Kind kind) {
+    const BYTE body[2] = { static_cast<BYTE>(on ? 1 : 0), static_cast<BYTE>(kind) };
+    logf("PIPE: LocalDowned on=%d kind=%u%s", on ? 1 : 0, static_cast<unsigned>(kind),
+         g_connected ? "" : "  [no agent attached, not sent]");
+    send_unsolicited(kLocalDowned, body, sizeof(body), "LocalDowned");
+}
+
+void send_local_respawned(float x, float y, float z, respawn::Kind reason) {
+    BYTE body[13]{};
+    std::memcpy(body + 0, &x, 4);
+    std::memcpy(body + 4, &y, 4);
+    std::memcpy(body + 8, &z, 4);
+    body[12] = static_cast<BYTE>(reason);
+    logf("PIPE: LocalRespawned (%.1f, %.1f, %.1f) reason=%u%s", x, y, z, static_cast<unsigned>(reason),
+         g_connected ? "" : "  [no agent attached, not sent]");
+    send_unsolicited(kLocalRespawned, body, sizeof(body), "LocalRespawned");
+}
+
+void send_local_grave(bool add, uint64_t id, float x, float y, float z) {
+    BYTE body[21]{};
+    body[0] = add ? 1 : 0;
+    std::memcpy(body + 1, &id, 8);
+    std::memcpy(body + 9, &x, 4);
+    std::memcpy(body + 13, &y, 4);
+    std::memcpy(body + 17, &z, 4);
+    logf("PIPE: LocalGrave %s id=0x%016llX%s", add ? "add" : "remove", static_cast<unsigned long long>(id),
+         g_connected ? "" : "  [no agent attached, not sent]");
+    send_unsolicited(kLocalGrave, body, sizeof(body), "LocalGrave");
+}
+
+// WO-118: the native writer dropped a puppet on its own (main thread).
+void send_npc_dropped(uint8_t reason, const char* name) {
+    BYTE body[2 + 63]{};
+    const size_t n = name ? std::strlen(name) : 0;
+    if (n == 0 || n > 63) return;
+    body[0] = reason;
+    body[1] = static_cast<BYTE>(n);
+    std::memcpy(body + 2, name, n);
+    send_unsolicited(kNpcDropped, body, static_cast<uint16_t>(2 + n), "NpcDropped");
+}
+
+// WO-121: one committed action (main thread, motion::tick).
+void send_local_action(uint8_t kind, uint8_t phase, int8_t ic, int8_t zone, int8_t type, uint8_t flags,
+                       const uint8_t guid[16], uint32_t eid, const char* name, const uint8_t* altGuid) {
+    BYTE body[27 + 63 + 16]{};
+    const size_t n = name ? std::strlen(name) : 0;
+    if (n > 63) return;
+    body[0] = kind; body[1] = phase; body[2] = static_cast<BYTE>(ic); body[3] = static_cast<BYTE>(zone);
+    body[4] = static_cast<BYTE>(type); body[5] = flags;
+    std::memcpy(body + 6, guid, 16);
+    std::memcpy(body + 22, &eid, 4);
+    body[26] = static_cast<BYTE>(n);
+    if (n) std::memcpy(body + 27, name, n);
+    size_t len = 27 + n;
+    if (altGuid) { std::memcpy(body + len, altGuid, 16); len += 16; }   // WO-163 (A1): the optional legacy-offset tail
+    send_unsolicited(kLocalAction, body, static_cast<uint16_t>(len), "LocalAction");
+}
+
+// WO-121: the local player's hit on a peer's avatar (main thread, hits::tick).
+void send_pvp_hit(uint32_t victimEid, float st, float hp, uint8_t flags, uint8_t material) {
+    BYTE body[14]{};
+    std::memcpy(body, &victimEid, 4);
+    std::memcpy(body + 4, &st, 4);
+    std::memcpy(body + 8, &hp, 4);
+    body[12] = flags; body[13] = material;
+    send_unsolicited(kPvpHitOut, body, sizeof(body), "PvpHit");
+}
+
+// WO-210 E.2: the local player's blow on a copy, filtered here (main thread, wo210_hit's tick): the LocalHit frame with no numbers and
+// byte 26 "judge it there" -- an agent that predates it reads 26 bytes and drops it as a hit that carries nothing.
+void send_wo210_hit(const void* body, uint16_t len) { send_unsolicited(kLocalHit, body, len, "LocalHit(E.2)"); }
+
+// WO-132: an NPC's hit on an avatar (main thread, hits::tick).
+void send_npc_avatar_hit(uint32_t victimEid, float st, float hp, uint32_t attackerEid, uint8_t flags, const char* name) {
+    BYTE body[18 + 63]{};
+    const size_t n = name ? std::strlen(name) : 0;
+    if (n > 63) return;
+    std::memcpy(body, &victimEid, 4);
+    std::memcpy(body + 4, &st, 4);
+    std::memcpy(body + 8, &hp, 4);
+    std::memcpy(body + 12, &attackerEid, 4);
+    body[16] = flags;
+    body[17] = static_cast<BYTE>(n);
+    if (n) std::memcpy(body + 18, name, n);
+    send_unsolicited(kNpcAvatarHit, body, static_cast<uint16_t>(18 + n), "NpcAvatarHit");
+}
+
+// WO-132: a watched NPC's combat state (main thread, wo132::tick).
+void send_npc_combat(const uint8_t* body, uint16_t len) { send_unsolicited(kNpcCombatOut, body, len, "NpcCombat"); }
+// WO-137: one quest State change (wo137.h).
+void send_quest_change(const uint8_t* body, uint16_t len) { send_unsolicited(kQuestChange, body, len, "QuestChange"); }
+// WO-138: the native NPC rows (0xA0) and the world state (0xA1), main thread.
+void send_wo138_frame(uint8_t type, const uint8_t* body, uint16_t len) {
+    send_unsolicited(type, body, len, type == kNpcStreamOut ? "NpcStream" : type == kMenuOut ? "Menu" : "World");   // Menu: WO-184
+}
+// WO-139: a crime event from this machine (wo139.h), main thread.
+void send_wo139_frame(const uint8_t* body, uint16_t len) { send_unsolicited(kCrimeOut, body, len, "Crime"); }
+// WO-140: a held picker or a C_SkipTime edge (wo140.h), main thread.
+void send_wo140_frame(const uint8_t* body, uint16_t len) { send_unsolicited(kSleepOut, body, len, "Sleep"); }
+void send_wo141_frame(const uint8_t* body, uint16_t len) { send_unsolicited(kActivityOut, body, len, "Activity"); }
+void send_wo143_frame(const uint8_t* body, uint16_t len) { send_unsolicited(kActivity2Out, body, len, "Activity2"); }
+
+// WO-132: an engaged copy's local hit on the player was put back (main thread).
+// WO-208 B: a copy's blow judged here (main thread)
+void send_defence(uint32_t attackerEid, uint8_t outcome, float st, float hp) {
+    BYTE body[13]{};
+    std::memcpy(body, &attackerEid, 4);
+    body[4] = outcome;
+    std::memcpy(body + 5, &st, 4);
+    std::memcpy(body + 9, &hp, 4);
+    send_unsolicited(kDefenceOut, body, sizeof(body), "Defence");
+}
+
+void send_discarded(uint32_t attackerEid, float st, float hp) {
+    BYTE body[12]{};
+    std::memcpy(body, &attackerEid, 4);
+    std::memcpy(body + 4, &st, 4);
+    std::memcpy(body + 8, &hp, 4);
+    send_unsolicited(kDiscardedHit, body, sizeof(body), "DiscardedHit");
+}
+
+// WO-118 Phase 5: a trace CSV was written (main thread).
+void send_trace_done(uint32_t rows, const char* path) {
+    BYTE body[4 + 1 + 255]{};
+    size_t n = path ? std::strlen(path) : 0;
+    if (n > 255) n = 255;
+    std::memcpy(body, &rows, 4);
+    body[4] = static_cast<BYTE>(n);
+    if (n) std::memcpy(body + 5, path, n);
+    send_unsolicited(kNpcTraceDone, body, static_cast<uint16_t>(5 + n), "NpcTraceDone");
+}
+
+void on_grave_add(uint64_t id, float x, float y, float z) { send_local_grave(true, id, x, y, z); }
+void on_grave_remove(uint64_t id) { send_local_grave(false, id, 0, 0, 0); }
+
+void send_grave_list(HANDLE h, bool ok, uint8_t seq, const actions::GraveInfo* g, int n) {
+    BYTE body[3 + kMaxGraveList * 20]{};
+    body[0] = ok ? 1 : 0;
+    body[1] = seq;
+    if (n < 0) n = 0;
+    if (n > kMaxGraveList) n = kMaxGraveList;
+    body[2] = static_cast<BYTE>(n);
+    for (int i = 0; i < n; ++i) {
+        BYTE* p = body + 3 + i * 20;
+        std::memcpy(p + 0, &g[i].id, 8);
+        std::memcpy(p + 8, &g[i].x, 4);
+        std::memcpy(p + 12, &g[i].y, 4);
+        std::memcpy(p + 16, &g[i].z, 4);
+    }
+    EnterCriticalSection(&g_write_lock);
+    send_frame(h, kGraveList, body, static_cast<uint16_t>(3 + n * 20));
+    LeaveCriticalSection(&g_write_lock);
+}
+
+// WO-20 Phase 2 diagnostic reply. Not on the write-lock'd send path used by
+// the async LocalHit thread -- this only ever runs from inside serve()'s own
+// synchronous request/reply loop, same as send_result below.
+void send_closure_info(HANDLE h, const kcdmp::luaintrospect::ClosureInfo& info) {
+    BYTE body[1024];
+    size_t o = 0;
+    body[o++] = info.ok ? 1 : 0;
+    std::memcpy(body + o, &info.nativeAddr, 8); o += 8;
+    std::memcpy(body + o, &info.rva, 4); o += 4;
+
+    auto put_str = [&](const std::string& s) {
+        const uint8_t n = static_cast<uint8_t>(s.size() > 255 ? 255 : s.size());
+        body[o++] = n;
+        std::memcpy(body + o, s.data(), n); o += n;
+    };
+    put_str(info.moduleName);
+    put_str(info.name);
+    put_str(info.prologueHex);
+
+    EnterCriticalSection(&g_write_lock);
+    send_frame(h, kClosureInfo, body, static_cast<uint16_t>(o));
+    LeaveCriticalSection(&g_write_lock);
+}
+
+// WO-100 Phase 4 item 3: the Result frame grows a third byte, a specific
+// reason code (0 on success). Additive -- a pre-WO-100 agent reads body[0]
+// and body[1] and never looks at body[2].
+// WO-100.5 Phase 2. seq goes at body[1], exactly where the Result frame
+// carries it, so the agent's sequence matching needs no special case.
+void send_body_state(HANDLE h, bool ok, uint8_t seq,
+                     const kcdmp::mannequin::BodyState& b) {
+    // WO-100.5 Phase 3 appends the accepted-input block. Additive: an agent
+    // that only knows the 8-byte form reads the first eight bytes and stops.
+    BYTE body[13] = {
+        static_cast<BYTE>(ok ? 1 : 0), seq,
+        b.pace, b.dir, b.stance,
+        static_cast<BYTE>(b.animSpeedCenti & 0xFF),
+        static_cast<BYTE>((b.animSpeedCenti >> 8) & 0xFF),
+        b.unknownTags,
+        static_cast<BYTE>(b.haveCombat ? 1 : 0),
+        static_cast<BYTE>(b.reqInputClass),
+        static_cast<BYTE>(b.reqAtkZone),
+        static_cast<BYTE>(b.atkType),
+        b.reqPrepared,
+    };
+    EnterCriticalSection(&g_write_lock);
+    send_frame(h, kBodyState, body, sizeof(body));
+    LeaveCriticalSection(&g_write_lock);
+}
+
+// WO-102 Phase 1. Fixed 40 bytes whatever the verdict; seq at body[1] as
+// every reply frame carries it. The body block reuses 0x85's byte order.
+void send_local_state(HANDLE h, bool ok, uint8_t seq, const kcdmp::localstate::LocalState& s,
+                      const kcdmp::motion::State2* st2 = nullptr) {
+    BYTE body[kLocalStateLenV8]{};
+    body[0] = ok ? 1 : 0;
+    body[1] = seq;
+    body[2] = s.refuse;
+    std::memcpy(body + 3, &s.frame, 8);
+    std::memcpy(body + 11, &s.x, 4);
+    std::memcpy(body + 15, &s.y, 4);
+    std::memcpy(body + 19, &s.z, 4);
+    std::memcpy(body + 23, &s.rotZ, 4);
+    body[27] = s.flags;
+    body[28] = s.haveBody ? 1 : 0;
+    const kcdmp::mannequin::BodyState& b = s.body;
+    body[29] = b.pace; body[30] = b.dir; body[31] = b.stance;
+    body[32] = static_cast<BYTE>(b.animSpeedCenti & 0xFF);
+    body[33] = static_cast<BYTE>((b.animSpeedCenti >> 8) & 0xFF);
+    body[34] = b.unknownTags;
+    body[35] = b.haveCombat ? 1 : 0;
+    body[36] = static_cast<BYTE>(b.reqInputClass);
+    body[37] = static_cast<BYTE>(b.reqAtkZone);
+    body[38] = static_cast<BYTE>(b.atkType);
+    body[39] = b.reqPrepared;
+    // WO-121: the v8 state block read in the same frame.
+    body[40] = st2 ? 1 : 0;
+    if (st2) std::memcpy(body + 41, st2, sizeof(*st2));
+    EnterCriticalSection(&g_write_lock);
+    send_frame(h, kLocalState, body, sizeof(body));
+    LeaveCriticalSection(&g_write_lock);
+}
+
+// WO-102.5 Phase 2. Variable length, so this does NOT go through
+// send_frame's fixed 1024-byte stack buffer -- a scan reply can run past
+// that (npc_scan.h's kMaxReplyBytes budget is 8000). Built directly and
+// written under the same write lock every other send_* uses.
+void send_npc_scan_result(HANDLE h, bool ok, uint8_t seq, const kcdmp::npcscan::ScanResult& r) {
+    std::vector<BYTE> frame;
+    frame.reserve(3 + 18 + (ok ? r.entries.size() * 80 : 0));
+    frame.resize(3);   // header filled in below once the payload length is known
+    auto put = [&](const void* p, size_t n) {
+        const BYTE* b = static_cast<const BYTE*>(p);
+        frame.insert(frame.end(), b, b + n);
+    };
+    BYTE okB = ok ? 1 : 0, truncB = r.truncated ? 1 : 0;
+    put(&okB, 1); put(&seq, 1); put(&r.refuse, 1); put(&truncB, 1);
+    put(&r.totalWalked, 4); put(&r.nameRejects, 4);
+    put(&r.droppedCount, 4);   // WO-103 Phase 1: how many more matched past the truncation point
+    const uint16_t count = static_cast<uint16_t>(r.entries.size());
+    put(&count, 2);
+    for (const auto& e : r.entries) {
+        const BYTE nameLen = static_cast<BYTE>(std::strlen(e.name));
+        put(&nameLen, 1);
+        put(e.name, nameLen);
+        put(&e.x, 4); put(&e.y, 4); put(&e.z, 4); put(&e.yaw, 4);
+        put(&e.isHorse, 1);
+    }
+    const size_t payloadLen = frame.size() - 3;
+    frame[0] = kNpcScanResult;
+    frame[1] = static_cast<BYTE>(payloadLen & 0xFF);
+    frame[2] = static_cast<BYTE>((payloadLen >> 8) & 0xFF);
+    EnterCriticalSection(&g_write_lock);
+    write_all(h, frame.data(), static_cast<DWORD>(frame.size()));
+    LeaveCriticalSection(&g_write_lock);
+}
+
+// WO-127: 0x8F, one page of a leash sample (layout in pipe_server.h).
+void send_leash_page(HANDLE h, bool ok, uint8_t seq, const kcdmp::leash::Result& r, uint16_t total, uint16_t offset) {
+    std::vector<BYTE> frame;
+    frame.reserve(3 + 40 + r.entries.size() * 64);
+    frame.resize(3);
+    auto put = [&](const void* p, size_t n) { const BYTE* b = static_cast<const BYTE*>(p); frame.insert(frame.end(), b, b + n); };
+    BYTE okB = ok ? 1 : 0, n = static_cast<BYTE>(r.anchors);
+    put(&okB, 1); put(&seq, 1); put(&r.refuse, 1); put(&n, 1);
+    for (int i = 0; i < r.anchors; ++i) put(&r.town[i], 1);
+    for (int i = 0; i < r.anchors; ++i) put(&r.interior[i], 1);
+    put(&r.walked, 4); put(&r.frames, 4); put(&r.sampleUs, 4);
+    const uint16_t count = static_cast<uint16_t>(r.entries.size());
+    put(&total, 2); put(&offset, 2); put(&count, 2);
+    for (const auto& e : r.entries) {
+        put(&e.wuid, 8); put(&e.x, 4); put(&e.y, 4); put(&e.z, 4);
+        put(&e.flags, 2); put(&e.brainState, 1); put(&e.brainMask, 1);
+        put(&e.speedCms, 2); put(&e.streamAgeMs, 2);
+        const BYTE nl = static_cast<BYTE>(std::strlen(e.name));
+        put(&nl, 1); put(e.name, nl);
+    }
+    const size_t payloadLen = frame.size() - 3;
+    frame[0] = kLeashReply;
+    frame[1] = static_cast<BYTE>(payloadLen & 0xFF);
+    frame[2] = static_cast<BYTE>((payloadLen >> 8) & 0xFF);
+    EnterCriticalSection(&g_write_lock);
+    write_all(h, frame.data(), static_cast<DWORD>(frame.size()));
+    LeaveCriticalSection(&g_write_lock);
+}
+
+void send_result(HANDLE h, bool ok, uint8_t seq, uint8_t reason = 0) {
+    BYTE body[3] = { static_cast<BYTE>(ok ? 1 : 0), seq, reason };
+    EnterCriticalSection(&g_write_lock);
+    send_frame(h, kResult, body, 3);
+    LeaveCriticalSection(&g_write_lock);
+}
+
+// WO-118: 0x89, the heartbeat's answer. Atomics only -- no main-thread hop.
+void send_npc_status(HANDLE h, uint8_t seq) {
+    const npcdrive::Status st = npcdrive::status();
+    BYTE body[24]{};
+    body[0] = 1; body[1] = seq; body[2] = st.armed; body[3] = st.nativeOn;
+    std::memcpy(body + 4, &st.bound, 2);
+    std::memcpy(body + 6, &st.writing, 2);
+    std::memcpy(body + 8, &st.framesWritten, 4);
+    std::memcpy(body + 12, &st.writes, 4);
+    std::memcpy(body + 16, &st.drops, 4);
+    std::memcpy(body + 20, &st.samples, 4);
+    EnterCriticalSection(&g_write_lock);
+    send_frame(h, kNpcStatusReply, body, sizeof(body));
+    LeaveCriticalSection(&g_write_lock);
+}
+
+// WO-76 (docs/WO-75-audit-findings.md s1/s2; PR #1 merge message): run_sync
+// deliberately waits UNBOUNDED once a queued task has started -- returning
+// early there would invalidate references the caller's own lambda captured,
+// the exact use-after-free PR #1 already fixed for run_sync's internal
+// state. That is the right call for run_sync itself, but it means one hung
+// frame (the game's main thread wedged) freezes this pipe's entire serve()
+// loop forever: no timeout, no log line, the next request never read.
+//
+// Fixed here instead, one level up, with the identical shape PR #1 used --
+// state with process lifetime behind a shared_ptr, so giving up on it can
+// never dangle anything. The task is posted to the main thread with that
+// state (WO-210 H.3: no longer through a helper thread per request); serve()
+// waits on ITS OWN bounded timeout against the shared state. If that
+// elapses, serve() logs it, replies failure, and goes back to reading the
+// pipe; the posted task finishes whenever (or if) the game recovers --
+// harmlessly, since nothing on the pipe thread still references it by then.
+KCDMP_FAULT_CALL(g_sitePipeTask, "pipe::main-thread task");
+
+template <typename T>
+struct PipeSyncState {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool done = false;
+    bool ran = false;
+    bool faulted = false;   // WO-110 R12: the task ran and faulted; `value` is default-constructed garbage
+    T value{};
+};
+
+// WO-110 R12: SHORTER than the agent's 5 s reply deadline (CombatPipe.cs
+// ReplyDeadline). Both were 5 s, so when the game thread stalled the agent
+// timed out first and the DLL's late failure reply then sat in the pipe as
+// the answer to the NEXT command. Now the DLL gives up first and the agent
+// receives an explicit Timeout/failure inside its own window.
+constexpr unsigned kPipeSyncTimeoutMs = 3500;
+constexpr uint8_t  kReasonTaskFaulted    = 17;   // mirrors PipeReason.TaskFaulted
+constexpr uint8_t  kReasonUnknownCommand = 18;   // mirrors PipeReason.UnknownCommand
+
+// `work` must capture everything it needs BY VALUE: it can end up running
+// well after this function has returned to its caller. Returns run_sync's
+// own result (false = the frame never picked the task up) through outValue
+// and the return value; a false return with no "timed out" log from the
+// caller's usual pattern means THIS wait gave up, not run_sync's -- see the
+// distinct log line below.
+// `faultedOut` (WO-110 R12): set when the task ran but raised; the caller must
+// then reply failure with kReasonTaskFaulted instead of `outValue`'s defaults
+// -- an empty ScanResult with refuse=kOk would make the agent untrack every
+// NPC, a default BodyState would report a body at rest.
+template <typename T>
+bool run_sync_bounded(const std::function<void(T&)>& work, const char* what, T& outValue, bool* faultedOut = nullptr) {
+    auto state = std::make_shared<PipeSyncState<T>>();
+    // WO-210 H.3: the task is posted to the main thread directly; serve() waits on the shared state, bounded. It used to be a detached
+    // helper thread per request (its run_sync waited for the frame) -- one OS thread created and torn down for every pipe request, ~50 a
+    // second on a host alone, and the host alone climbed ~50-85 MB/s with it. The guarantee is the same: nothing here references the
+    // caller's frame (work is copied, state is shared), so a wait given up on can never dangle, and a task the frame runs late still lands.
+    std::function<void(T&)> task = work;
+    main_thread::post([state, task] {
+        bool faulted = false;
+        try {
+            faulted = !fault::guarded(g_sitePipeTask, [&] { task(state->value); });
+        } catch (...) {
+            logf("PIPE: a task raised a C++ exception on the main thread -- swallowed");
+            faulted = true;
+        }
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->ran = true;
+        state->faulted = faulted;
+        state->done = true;
+        state->cv.notify_all();
+    });
+
+    std::unique_lock<std::mutex> lock(state->mutex);
+    if (!state->cv.wait_for(lock, std::chrono::milliseconds(kPipeSyncTimeoutMs),
+                             [&] { return state->done; })) {
+        logf("PIPE: %s is still waiting on the main thread past %ums -- the frame loop "
+             "may be hung. Replying failure now; the call will still land if a frame resumes.",
+             what, kPipeSyncTimeoutMs);
+        return false;
+    }
+    if (faultedOut) *faultedOut = state->faulted;
+    if (state->faulted) logf("PIPE: %s FAULTED on the main thread -- replying failure, result discarded", what);
+    outValue = state->value;
+    return state->ran && !state->faulted;
+}
+
+// One connected agent, until it disconnects.
+void serve(HANDLE h) {
+    g_connected = true;
+    logf("PIPE: agent connected");
+
+    while (g_running) {
+        BYTE head[3];
+        if (!read_all(h, head, 3)) break;
+        const uint8_t  type = head[0];
+        const uint16_t len  = static_cast<uint16_t>(head[1] | (head[2] << 8));
+
+        // Bound the payload before allocating: the pipe is local, but a
+        // malformed length should not turn into a huge allocation. WO-118:
+        // the sample batch alone may run to kNpcSamplesMaxLen.
+        if (len > 1024 && !(type == kNpcSamples && len <= kNpcSamplesMaxLen)) {
+            logf("PIPE: payload of %u bytes is out of range; dropping the connection", len);
+            break;
+        }
+        BYTE body[kNpcSamplesMaxLen];
+        if (len && !read_all(h, body, len)) break;
+
+        const uint8_t seq = g_seq++;
+        kcdmp::crash::note_pipe(type, len ? body[0] : 0, len);   // WO-202 I.1: the crash report's last requests
+
+        switch (type) {
+            case kPing:
+                send_frame(h, kPong, nullptr, 0);
+                break;
+
+            case kApplyDamage: {
+                if (len != kApplyDamageLen) {
+                    logf("PIPE: ApplyDamage wrong length %u", len);
+                    send_result(h, false, seq);
+                    break;
+                }
+                std::array<unsigned char, 16> guid;
+                std::memcpy(guid.data(), body, 16);
+                float stamina, health;
+                std::memcpy(&stamina, body + 16, 4);
+                std::memcpy(&health,  body + 20, 4);
+                const bool suppress = (body[24] & kFlagSuppressHitReaction) != 0;
+                const bool nonLethal = (body[24] & kFlagNonLethal) != 0;   // WO-147
+
+                // Onto the game's thread, and wait so the agent gets a truthful
+                // result rather than an optimistic one.
+                bool ok = false;
+                bool faultedFlag = false;
+                const bool ran = run_sync_bounded<bool>(
+                    [guid, stamina, health, suppress, nonLethal](bool& result) {
+                        if (nonLethal) {
+                            // WO-147: the field's fist-fight opponent died on the joiner's copy from the host's
+                            // own non-fatal blow (9.35 on a copy the follow had just set to the host's 4.8).
+                            // The host decides deaths: this damage stops 1 hp short.
+                            void* s = rttr::find_soul_by_guid(guid.data());
+                            void* cs = s && kcdmp::buffs::as_c_soul(s) ? kcdmp::buffs::as_c_soul(s) : s;
+                            float cur = -1.0f, hp = health;
+                            if (cs) rttr::soul_state(cs, "health", &cur);
+                            if (cur >= 0.0f && cur - hp < 1.0f) hp = cur > 1.0f ? cur - 1.0f : 0.0f;
+                            result = s && rttr::apply_damage_soul(s, stamina, hp, nullptr);
+                            if (result) rttr::note_remote_damage(guid.data(), hp);
+                            if (hp != health) logf("PIPE: ApplyDamage non-lethal: %.2f of %.2f applied (health %.2f) -- the host decides deaths", hp, health, cur);
+                            return;
+                        }
+                        result = rttr::apply_damage(guid.data(), stamina, health, suppress);
+                        if (result) rttr::note_remote_damage(guid.data(), health);
+                        // WO-132: a forwarded hit on the local player (player_henry's
+                        // soul id) is never put back by a discard watch.
+                        static const unsigned char kHenry[16] = {0xfb, 0xcf, 0x2d, 0x4c, 0xa1, 0xde, 0x63, 0x62, 0x72, 0xd7, 0xb3, 0x9f, 0x4d, 0xb2, 0xd8, 0xb5};
+                        if (result && std::memcmp(guid.data(), kHenry, 16) == 0) kcdmp::hits::note_player_damage(stamina, health);
+                    }, "ApplyDamage", ok, &faultedFlag);
+                if (!ran) logf("PIPE: ApplyDamage timed out waiting for a frame");
+                logf("PIPE: ApplyDamage stamina=%.2f health=%.2f -> %s",
+                     stamina, health, ok ? "applied" : "soul not loaded / failed");
+                send_result(h, ran && ok, seq, (ran && ok) ? 0 : (faultedFlag ? kReasonTaskFaulted : 0));
+                break;
+            }
+
+            case kApplyDeath: {
+                if (len != kApplyDeathLen) {
+                    logf("PIPE: ApplyDeath wrong length %u", len);
+                    send_result(h, false, seq);
+                    break;
+                }
+                std::array<unsigned char, 16> guid;
+                std::memcpy(guid.data(), body, 16);
+                bool ok = false;
+                bool faultedFlag = false;
+                const bool ran = run_sync_bounded<bool>(
+                    [guid](bool& result) { result = rttr::apply_death(guid.data()); },
+                    "ApplyDeath", ok, &faultedFlag);
+                if (!ran) logf("PIPE: ApplyDeath timed out waiting for a frame");
+                logf("PIPE: ApplyDeath -> %s", ok ? "dead" : "soul not loaded / failed");
+                send_result(h, ran && ok, seq, (ran && ok) ? 0 : (faultedFlag ? kReasonTaskFaulted : 0));
+                break;
+            }
+
+            case kSetFactionHostile: {
+                if (len != kSetFactionHostileLen) {
+                    logf("PIPE: SetFactionHostile wrong length %u", len);
+                    send_result(h, false, seq);
+                    break;
+                }
+                std::array<unsigned char, 16> guid;
+                std::memcpy(guid.data(), body, 16);
+                const bool hostile = body[16] != 0;
+                bool ok = false;
+                bool faultedFlag = false;
+                const bool ran = run_sync_bounded<bool>(
+                    [guid, hostile](bool& result) { result = rttr::set_ghost_faction_hostile(guid.data(), hostile); },
+                    "SetFactionHostile", ok, &faultedFlag);
+                if (!ran) logf("PIPE: SetFactionHostile timed out waiting for a frame");
+                logf("PIPE: SetFactionHostile hostile=%s -> %s",
+                     hostile ? "true" : "false", ok ? "applied" : "ghost not loaded / failed");
+                send_result(h, ran && ok, seq, (ran && ok) ? 0 : (faultedFlag ? kReasonTaskFaulted : 0));
+                break;
+            }
+
+            case kGhostSwing: {
+                if (len < kGhostSwingMinLen || len > kGhostSwingMaxLen) {
+                    logf("PIPE: GhostSwing wrong length %u", len);
+                    send_result(h, false, seq);
+                    break;
+                }
+                uint32_t entityId = 0;
+                std::memcpy(&entityId, body, 4);
+                const size_t specLen = len - 4;
+                std::string spec(reinterpret_cast<const char*>(body + 4), specLen);
+
+                rttr::SwingResult res = rttr::SwingResult::Ok;
+                const bool ran = run_sync_bounded<rttr::SwingResult>(
+                    [entityId, spec](rttr::SwingResult& result) {
+                        if (kcdmp::wo209::row_attack(entityId, spec.c_str())) { result = rttr::SwingResult::Ok; return; }   // WO-209 B: the copy's own attack
+                        // WO-208 A.1: one owner -- WO-214 D.1/D.2 (reaction_rows): the host's hit and death reactions play on an owned copy too
+                        if (kcdmp::wo214rules::owner_refuses_row(kcdmp::wo208::probe_owned(entityId), kcdmp::wo214::on(kcdmp::wo214rules::kBitReactionRows), spec.c_str())) {
+                            result = kcdmp::wo214::on(kcdmp::wo214rules::kBitReactionRows) ? rttr::SwingResult::OwnerOwns : rttr::SwingResult::QueueFaulted;
+                            return;
+                        }
+                        if (kcdmp::wo208::probe_owned(entityId)) kcdmp::wo214::note_owned_reaction(kcdmp::wo214rules::death_row(spec.c_str()));
+                        result = rttr::ghost_swing(entityId, spec.c_str());
+                        if (result == rttr::SwingResult::Ok) kcdmp::wo187::note_move(entityId);   // WO-187 C2: the move's scope is watched
+                    },
+                    "GhostSwing", res);
+                // A task that never ran is NOT the same failure as one that
+                // ran and was refused -- WO-100 Phase 4 item 3. Report it as
+                // its own code rather than folding it into the last one.
+                if (!ran) {
+                    logf("PIPE: GhostSwing timed out waiting for a frame");
+                    res = rttr::SwingResult::Timeout;
+                }
+                const bool ok = (res == rttr::SwingResult::Ok);
+                if (!ok) logf("PIPE: GhostSwing entity=%u -> %s", entityId, rttr::swing_result_name(res));
+                send_result(h, ok, seq, static_cast<uint8_t>(res));
+                break;
+            }
+
+            case kGhostIsolate: {
+                if (len != kGhostIsolateLen) {
+                    logf("PIPE: GhostIsolate wrong length %u", len);
+                    send_result(h, false, seq);
+                    break;
+                }
+                std::array<unsigned char, 16> guid;
+                std::memcpy(guid.data(), body, 16);
+                const bool on = body[16] != 0;
+                bool ok = false;
+                bool faultedFlag = false;
+                const bool ran = run_sync_bounded<bool>(
+                    [guid, on](bool& result) {
+                        result = sctx::apply_isolation(guid.data(), on);
+                        kcdmp::motion::identity(guid.data(), on);   // WO-154 2: its reaction contexts from spawn
+                    },
+                    "GhostIsolate", ok, &faultedFlag);
+                if (!ran) logf("PIPE: GhostIsolate timed out waiting for a frame");
+                logf("PIPE: GhostIsolate on=%s -> %s", on ? "true" : "false",
+                     ok ? "all contexts in state" : "not fully applied (see SCTX lines)");
+                send_result(h, ran && ok, seq, (ran && ok) ? 0 : (faultedFlag ? kReasonTaskFaulted : 0));
+                break;
+            }
+
+            // WO-97: read-only probe of the quest concept tree. Runs on the
+            // game's main thread like every other engine touch here, and
+            // reports only through the native log -- the payload that matters
+            // (root module names, node vs null) is many lines of text, not a
+            // wire field. Result byte says whether the probe ran, not what it
+            // found.
+            // WO-100.5 Phase 2: the continuous body-state read. Read-only,
+            // and deliberately silent -- the agent calls this at the position
+            // stream's cadence, so a log line per sample would be a flood.
+            // The ok byte carries every refusal; the agent counts them.
+            case kReadBodyState: {
+                kcdmp::mannequin::BodyState bs{};
+                if (len != kReadBodyStateLen) {
+                    logf("PIPE: ReadBodyState wrong length %u", len);
+                    send_body_state(h, false, seq, bs);
+                    break;
+                }
+                uint32_t entityId = 0;
+                std::memcpy(&entityId, body, 4);
+                const bool wantPlayer = (entityId == 0);
+                // WO-110 R12: the lambda used to capture the stack `bs` by
+                // reference; after a bounded-wait timeout it could run later and
+                // write into a dead frame. The result now lives in the shared
+                // state (process lifetime), captured by value only.
+                struct BodyStateOut { bool ok = false; kcdmp::mannequin::BodyState bs{}; };
+                BodyStateOut r{};
+                bool faulted = false;
+                const bool ran = run_sync_bounded<BodyStateOut>(
+                    [wantPlayer, entityId](BodyStateOut& out) {
+                        out.ok = kcdmp::mannequin::read_body_state(wantPlayer, entityId, &out.bs);
+                    }, "ReadBodyState", r, &faulted);
+                if (faulted) r.bs = kcdmp::mannequin::BodyState{};
+                send_body_state(h, ran && r.ok, seq, r.bs);
+                break;
+            }
+
+            // WO-102 Phase 1: position + yaw + riding + body state from one
+            // frame. Read-only and quiet, like 0x09: the refuse byte carries
+            // every gate, the native log gets one line per verdict change.
+            case kReadLocalState: {
+                kcdmp::localstate::LocalState ls{};
+                if (len != kReadLocalStateLen) {
+                    logf("PIPE: ReadLocalState wrong length %u", len);
+                    ls.refuse = kcdmp::localstate::kModuleMissing;
+                    send_local_state(h, false, seq, ls);
+                    break;
+                }
+                uint32_t entityId = 0;
+                std::memcpy(&entityId, body, 4);
+                if (entityId != 0) {
+                    logf("PIPE: ReadLocalState entityId=%u refused -- only the player (0) is supported", entityId);
+                    ls.refuse = kcdmp::localstate::kNoPlayerActor;
+                    send_local_state(h, false, seq, ls);
+                    break;
+                }
+                // WO-110 R12: by-value capture; result in the shared state (see ReadBodyState).
+                struct LocalStateOut { bool ok = false; bool ok2 = false; kcdmp::localstate::LocalState ls{}; kcdmp::motion::State2 st2{}; };
+                LocalStateOut r{};
+                // WO-213 D.4: this frame's read, made by the frame hook while the agent asks -- answered here, without waiting a frame
+                if (kcdmp::wo213::local_take(&r.ls, &r.ok, &r.st2, &r.ok2)) {
+                    send_local_state(h, r.ok, seq, r.ls, r.ok2 ? &r.st2 : nullptr);
+                    break;
+                }
+                bool faulted = false;
+                const bool ran = run_sync_bounded<LocalStateOut>(
+                    [](LocalStateOut& out) {
+                        out.ok = kcdmp::localstate::read_local_state(&out.ls);
+                        if (out.ok) out.ok2 = kcdmp::motion::read_local_state2(&out.st2, out.ls.rotZ);
+                    },
+                    "ReadLocalState", r, &faulted);
+                if (faulted) { r.ls = kcdmp::localstate::LocalState{}; r.ls.refuse = kcdmp::localstate::kReadFaulted; r.ok2 = false; }
+                send_local_state(h, ran && r.ok, seq, r.ls, r.ok2 ? &r.st2 : nullptr);
+                break;
+            }
+
+            // WO-102.5 Phase 2: the batched native NPC scan (npc_scan.h).
+            // Read-only and quiet like 0x0A: the reply's refuse/truncated
+            // bytes carry every gate, one native log line per verdict change.
+            case kScanNpcs: {
+                kcdmp::npcscan::ScanResult sr{};
+                if (len < kScanNpcsMinLen || len > kScanNpcsMaxLen) {
+                    logf("PIPE: ScanNpcs wrong length %u", len);
+                    sr.refuse = kcdmp::npcscan::kModuleMissing;
+                    send_npc_scan_result(h, false, seq, sr);
+                    break;
+                }
+                const uint8_t anchorCount = body[0];
+                if (anchorCount < 1 || anchorCount > kScanNpcsAnchorMax ||
+                    static_cast<int>(len) != 1 + 4 + anchorCount * 12) {
+                    logf("PIPE: ScanNpcs anchorCount=%u inconsistent with len=%u", anchorCount, len);
+                    sr.refuse = kcdmp::npcscan::kModuleMissing;
+                    send_npc_scan_result(h, false, seq, sr);
+                    break;
+                }
+                float radius = 0;
+                std::memcpy(&radius, body + 1, 4);
+                std::vector<kcdmp::npcscan::Anchor> anchors(anchorCount);
+                for (int i = 0; i < anchorCount; ++i) {
+                    std::memcpy(&anchors[i], body + 5 + i * 12, 12);
+                }
+                bool ok = false;
+                bool faulted = false;
+                const bool ran = run_sync_bounded<kcdmp::npcscan::ScanResult>(
+                    [anchors, radius](kcdmp::npcscan::ScanResult& result) {
+                        kcdmp::npcscan::scan(anchors.data(), static_cast<int>(anchors.size()), radius, &result);
+                    }, "ScanNpcs", sr, &faulted);
+                // WO-110 R12: a faulted or never-run scan must not reply an
+                // empty result with refuse=kOk -- the agent would push an empty
+                // set and the owner's rescan would untrack every NPC.
+                if (faulted || !ran) {
+                    sr = kcdmp::npcscan::ScanResult{};
+                    sr.refuse = kcdmp::npcscan::kReadFaulted;
+                }
+                ok = ran && !faulted && sr.refuse == kcdmp::npcscan::kOk;
+                if (!ran) logf("PIPE: ScanNpcs timed out waiting for a frame");
+                send_npc_scan_result(h, ok, seq, sr);
+                break;
+            }
+
+            // WO-113: session state and the respawn toggle. Atomic setters, so
+            // no main-thread hop is needed; the tick picks them up.
+            case kSetSession:
+            case kSetRespawn: {
+                if (len != 1) {
+                    logf("PIPE: %s wrong length %u", type == kSetSession ? "SetSession" : "SetRespawn", len);
+                    send_result(h, false, seq);
+                    break;
+                }
+                const bool on = body[0] != 0;
+                if (type == kSetSession) respawn::set_session(on, "agent");
+                else respawn::set_enabled(on, "agent");
+                send_result(h, true, seq);
+                break;
+            }
+
+            // WO-114 Phase 2: the partner for the wake choice. Locked setter.
+            case kSetPartner: {
+                if (len != kSetPartnerLen) {
+                    logf("PIPE: SetPartner wrong length %u", len);
+                    send_result(h, false, seq);
+                    break;
+                }
+                float x = 0, y = 0, z = 0, r = 0;
+                std::memcpy(&x, body + 1, 4);
+                std::memcpy(&y, body + 5, 4);
+                std::memcpy(&z, body + 9, 4);
+                std::memcpy(&r, body + 13, 4);
+                respawn::set_partner(body[0] != 0, x, y, z, r);
+                send_result(h, true, seq);
+                break;
+            }
+
+            case kMirrorGrave: {
+                if (len != kMirrorGraveLen) {
+                    logf("PIPE: MirrorGrave wrong length %u", len);
+                    send_result(h, false, seq);
+                    break;
+                }
+                const uint8_t op = body[0], owner = body[1];
+                uint64_t id = 0;
+                float x = 0, y = 0, z = 0;
+                std::memcpy(&id, body + 2, 8);
+                std::memcpy(&x, body + 10, 4);
+                std::memcpy(&y, body + 14, 4);
+                std::memcpy(&z, body + 18, 4);
+                bool ok = false;
+                bool faultedFlag = false;
+                const bool ran = run_sync_bounded<bool>(
+                    [op, owner, id, x, y, z](bool& result) {
+                        if (op == 1) result = actions::mirror_add(owner, id, x, y, z);
+                        else if (op == 0) result = actions::mirror_remove(owner, id);
+                        else if (op == 3) result = actions::partner_pin(owner, x, y, z, static_cast<unsigned>(id & 0xFFu));   // WO-164 C2: a partner's pin set / moved; WO-171: the picture code rides the unused id field
+                        else if (op == 4) result = actions::partner_pin_remove(owner);         // WO-164 C2: ... removed
+                        else { actions::mirror_clear(owner); result = true; }
+                    }, "MirrorGrave", ok, &faultedFlag);
+                if (op != 3 || !(ran && ok))   // WO-164: a pin is set every 2 s -- its own lines say what changed
+                logf("PIPE: MirrorGrave op=%u owner=%u id=0x%016llX -> %s", op, owner,
+                     static_cast<unsigned long long>(id), (ran && ok) ? "applied" : "refused");
+                send_result(h, ran && ok, seq, (ran && ok) ? 0 : (faultedFlag ? kReasonTaskFaulted : 0));
+                break;
+            }
+
+            case kListGraves: {
+                struct ListOut { int n = 0; actions::GraveInfo g[kMaxGraveList]{}; };
+                ListOut r{};
+                bool faulted = false;
+                const bool ran = run_sync_bounded<ListOut>(
+                    [](ListOut& out) { out.n = actions::graves_list(out.g, kMaxGraveList); },
+                    "ListGraves", r, &faulted);
+                send_grave_list(h, ran && !faulted, seq, r.g, (ran && !faulted) ? r.n : 0);
+                break;
+            }
+
+            // WO-118: the native per-frame writer (npc_drive.h). Samples,
+            // holds, config and status never wait for a frame; only a bind
+            // (engine reads) is marshalled onto the main thread.
+            case kNpcSamples: {
+                const uint8_t r = npcdrive::on_samples(body, len);
+                if (r != npcdrive::kOk) logf("PIPE: NpcSamples refused (%s, %u bytes)", npcdrive::reason_name(r), len);
+                send_result(h, r == npcdrive::kOk, seq, r);
+                break;
+            }
+            case kNpcHold: {
+                const uint8_t r = npcdrive::on_hold(body, len);
+                send_result(h, r == npcdrive::kOk, seq, r);
+                break;
+            }
+            case kNpcConfig: {
+                const uint8_t r = npcdrive::on_config(body, len);
+                send_result(h, r == npcdrive::kOk, seq, r);
+                break;
+            }
+            case kNpcStatus:
+                send_npc_status(h, seq);
+                break;
+            // ---- WO-121 -----------------------------------------------------
+            case kMotionConfig: {
+                const uint8_t r = kcdmp::motion::on_config(body, len);
+                send_result(h, r == 0, seq, r);
+                break;
+            }
+            case kAvatarEvent: {
+                const uint8_t r = kcdmp::motion::on_avatar_event(body, len);
+                send_result(h, r == 0, seq, r);
+                break;
+            }
+            case kHitsConfig: {
+                const uint8_t r = kcdmp::hits::on_config(body, len);
+                send_result(h, r == 0, seq, r);
+                break;
+            }
+            case kAttributedDamage: {
+                std::vector<uint8_t> copy(body, body + len);
+                kcdmp::hits::AttribResult ar{};
+                bool faulted = false;
+                const bool ran = run_sync_bounded<kcdmp::hits::AttribResult>(
+                    [copy](kcdmp::hits::AttribResult& out) { out = kcdmp::hits::apply_attributed(copy.data(), copy.size()); },
+                    "AttributedDamage", ar, &faulted);
+                if (!ran) { ar = kcdmp::hits::AttribResult{}; ar.reason = faulted ? 17 : 16; }
+                BYTE rb[3 + 16]{};
+                rb[0] = ar.ok ? 1 : 0; rb[1] = seq; rb[2] = ar.steps;
+                std::memcpy(rb + 3, &ar.attackerWuid, 8);
+                std::memcpy(rb + 11, &ar.victimWuid, 8);
+                EnterCriticalSection(&g_write_lock);
+                send_frame(h, kAttributedReply, rb, sizeof(rb));
+                LeaveCriticalSection(&g_write_lock);
+                logf("PIPE: AttributedDamage -> ok=%d steps=0x%X reason=%u", ar.ok ? 1 : 0, ar.steps, ar.reason);
+                break;
+            }
+            case kApplyPvpHit: {
+                std::vector<uint8_t> copy(body, body + len);
+                bool ok = false, faulted = false;
+                const bool ran = run_sync_bounded<bool>(
+                    [copy](bool& out) { out = kcdmp::hits::apply_pvp_hit(copy.data(), copy.size()); }, "ApplyPvpHit", ok, &faulted);
+                send_result(h, ran && ok, seq, faulted ? 17 : (ran ? 0 : 16));
+                break;
+            }
+            case kWo121Status: {
+                char text[900]{};
+                int n = kcdmp::motion::status_text(text, 520);
+                if (n < 0) n = 0;
+                if (n > 519) n = 519;
+                text[n++] = ' ';
+                int m = kcdmp::hits::status_text(text + n, static_cast<int>(sizeof(text)) - n);
+                if (m > 0) n += m;
+                if (n > static_cast<int>(sizeof(text)) - 1) n = static_cast<int>(sizeof(text)) - 1;
+                BYTE rb[2 + sizeof(text)]{};
+                rb[0] = 1; rb[1] = seq;
+                std::memcpy(rb + 2, text, n);
+                EnterCriticalSection(&g_write_lock);
+                send_frame(h, kWo121StatusReply, rb, static_cast<uint16_t>(2 + n));
+                LeaveCriticalSection(&g_write_lock);
+                break;
+            }
+            case kNpcBind: {
+                npcdrive::BindRequest req{};
+                if (!npcdrive::parse_bind(body, len, &req)) {
+                    logf("PIPE: NpcBind malformed (%u bytes)", len);
+                    send_result(h, false, seq, npcdrive::kBadRequest);
+                    break;
+                }
+                uint8_t r = npcdrive::kFault;
+                bool faulted = false;
+                const bool ran = run_sync_bounded<uint8_t>(
+                    [req](uint8_t& out) { out = npcdrive::bind_main(req); }, "NpcBind", r, &faulted);
+                if (!ran) r = faulted ? static_cast<uint8_t>(npcdrive::kFault) : static_cast<uint8_t>(npcdrive::kDisarmed);
+                send_result(h, ran && r == npcdrive::kOk, seq, r);
+                break;
+            }
+            case kNpcTrace: {
+                if (len < 4 || body[2] == 0 || static_cast<size_t>(3 + body[2]) != len || body[2] > 63) {
+                    send_result(h, false, seq, 2);
+                    break;
+                }
+                uint16_t secs = 0;
+                std::memcpy(&secs, body, 2);
+                char name[64]{};
+                std::memcpy(name, body + 3, body[2]);
+                const uint8_t r = npctrace::request(name, secs);
+                logf("PIPE: NpcTrace %s %us -> %s", name, secs, r == 0 ? "queued" : "refused");
+                send_result(h, r == 0, seq, r);
+                break;
+            }
+
+            case kConceptProbe: {
+                if (len > kConceptProbeMaxLen) {
+                    logf("PIPE: ConceptProbe path too long (%u > %d)", len, kConceptProbeMaxLen);
+                    send_result(h, false, seq);
+                    break;
+                }
+                std::string path(reinterpret_cast<const char*>(body), len);
+                bool ok = false;
+                bool faultedFlag = false;
+                const bool ran = run_sync_bounded<bool>(
+                    [path](bool& result) { result = conceptread::probe(path.c_str()); },
+                    "ConceptProbe", ok, &faultedFlag);
+                if (!ran) logf("PIPE: ConceptProbe timed out waiting for a frame");
+                logf("PIPE: ConceptProbe(\"%s\") -> %s", path.c_str(),
+                     ok ? "ran" : "failed (see CONCEPT lines)");
+                send_result(h, ran && ok, seq, (ran && ok) ? 0 : (faultedFlag ? kReasonTaskFaulted : 0));
+                break;
+            }
+
+            // WO-124: the joiner's placement beside the host (main thread).
+            case kJoinPlace: {
+                BYTE out[2 + 2 + 36 + 4]{};
+                out[1] = seq;
+                if (len != kJoinPlaceLen) {
+                    logf("PIPE: JoinPlace wrong length %u", len);
+                    EnterCriticalSection(&g_write_lock);
+                    send_frame(h, kJoinPlaceReply, out, sizeof(out));
+                    LeaveCriticalSection(&g_write_lock);
+                    break;
+                }
+                float x = 0, y = 0, z = 0, dist = 0;
+                std::memcpy(&x, body, 4); std::memcpy(&y, body + 4, 4); std::memcpy(&z, body + 8, 4); std::memcpy(&dist, body + 12, 4);
+                joinnative::PlaceReport r{};
+                bool faultedFlag = false;
+                const bool ran = run_sync_bounded<joinnative::PlaceReport>(
+                    [x, y, z, dist](joinnative::PlaceReport& res) { res = joinnative::place(x, y, z, dist); },
+                    "JoinPlace", r, &faultedFlag);
+                out[0] = (ran && r.ok) ? 1 : 0;
+                out[2] = r.snapped ? 1 : 0;
+                out[3] = r.fallHeld ? 1 : 0;
+                std::memcpy(out + 4, r.target, 12);
+                std::memcpy(out + 16, r.before, 12);
+                std::memcpy(out + 28, r.after, 12);
+                std::memcpy(out + 40, &r.residual, 4);
+                EnterCriticalSection(&g_write_lock);
+                send_frame(h, kJoinPlaceReply, out, sizeof(out));
+                LeaveCriticalSection(&g_write_lock);
+                break;
+            }
+
+            // WO-124: the joiner's post-load check that the death guard is on.
+            // Atomics / plain reads of the respawn module's state: no main-thread hop.
+            case kJoinGuard: {
+                BYTE out[5]{};
+                out[0] = 1; out[1] = seq;
+                out[2] = respawn::session_active() ? 1 : 0;
+                out[3] = respawn::enabled() ? 1 : 0;
+                out[4] = respawn::guard_applied() ? 1 : 0;
+                EnterCriticalSection(&g_write_lock);
+                send_frame(h, kJoinGuardReply, out, sizeof(out));
+                LeaveCriticalSection(&g_write_lock);
+                break;
+            }
+
+            // WO-124: rescan the save list / is a file listed / what Continue loads.
+            case kSaveList: {
+                BYTE out[2 + 1 + 2 + 2 + 1 + 1 + 2 + 1 + 64]{};
+                out[1] = seq;
+                char name[64]{};
+                const uint8_t nlen = len >= 3 ? body[2] : 0;
+                if (len < 3 || nlen > 63 || len != 3u + nlen) {
+                    logf("PIPE: SaveList wrong length %u", len);
+                    EnterCriticalSection(&g_write_lock);
+                    send_frame(h, kSaveListReply, out, 12);
+                    LeaveCriticalSection(&g_write_lock);
+                    break;
+                }
+                const uint8_t op = body[0];
+                const int pl = static_cast<int8_t>(body[1]);
+                std::memcpy(name, body + 3, nlen);
+                savelist::Report r{};
+                bool faultedFlag = false;
+                std::string nm(name);
+                const bool ran = run_sync_bounded<savelist::Report>(
+                    [op, pl, nm](savelist::Report& res) {
+                        res = savelist::query(op != 3, op == 2 ? -1 : pl, op == 2 ? nullptr : nm.c_str());
+                    }, "SaveList", r, &faultedFlag);
+                const bool ok = ran && r.ok;
+                logf("PIPE: SaveList op=%u playline%d/%s -> %s listed=%d idx=%d count=%d current=%d continue=playline%d/%s",
+                     op, pl, nlen ? name : "-", ok ? "ok" : (savelist::ready() ? "unreadable" : savelist::why_not()),
+                     r.listed ? 1 : 0, r.idx, r.count, r.current, r.contPlayline, r.contName[0] ? r.contName : "-");
+                out[0] = ok ? 1 : 0;
+                out[2] = r.listed ? 1 : 0;
+                const int16_t idx = static_cast<int16_t>(r.idx), cnt = static_cast<int16_t>(r.count), ci = static_cast<int16_t>(r.contIdx);
+                std::memcpy(out + 3, &idx, 2);
+                std::memcpy(out + 5, &cnt, 2);
+                out[7] = static_cast<BYTE>(static_cast<int8_t>(r.current));
+                out[8] = static_cast<BYTE>(static_cast<int8_t>(r.contPlayline));
+                std::memcpy(out + 9, &ci, 2);
+                const size_t cl = std::strlen(r.contName);
+                out[11] = static_cast<BYTE>(cl);
+                std::memcpy(out + 12, r.contName, cl);
+                EnterCriticalSection(&g_write_lock);
+                send_frame(h, kSaveListReply, out, static_cast<uint16_t>(12 + cl));
+                LeaveCriticalSection(&g_write_lock);
+                break;
+            }
+
+            case kResolveLuaClosure: {
+                if (len != kResolveLuaClosureLen) {
+                    logf("PIPE: ResolveLuaClosure wrong length %u", len);
+                    kcdmp::luaintrospect::ClosureInfo empty;
+                    send_closure_info(h, empty);
+                    break;
+                }
+                uint64_t closureAddr = 0;
+                std::memcpy(&closureAddr, body, 8);
+                kcdmp::luaintrospect::ClosureInfo info;
+                const bool ran = run_sync_bounded<kcdmp::luaintrospect::ClosureInfo>(
+                    [closureAddr](kcdmp::luaintrospect::ClosureInfo& result) {
+                        result = kcdmp::luaintrospect::resolve(closureAddr);
+                    }, "ResolveLuaClosure", info);
+                if (!ran) logf("PIPE: ResolveLuaClosure timed out waiting for a frame");
+                send_closure_info(h, ran ? info : kcdmp::luaintrospect::ClosureInfo{});
+                break;
+            }
+
+            // WO-127: the leash recorder (read-only; nothing runs unless the trace is on).
+            case kWo131: {
+                std::vector<uint8_t> copy(body, body + len);
+                struct R { uint8_t reason = kcdmp::wo131::kRFailed; uint8_t op = 0; uint8_t buf[256]{}; size_t n = 0; };
+                R r{};
+                bool faulted = false;
+                const bool ran = run_sync_bounded<R>(
+                    [copy](R& out) {
+                        out.op = copy.empty() ? 0 : copy[0];
+                        out.reason = kcdmp::wo131::handle(copy.data(), copy.size(), out.buf, sizeof(out.buf), &out.n);
+                    }, "Wo131", r, &faulted);
+                if (!ran) { r.reason = faulted ? kReasonTaskFaulted : kcdmp::wo131::kRFailed; r.n = 0; r.op = len ? body[0] : 0; }
+                BYTE rb[4 + 256]{};
+                rb[0] = (ran && r.reason == kcdmp::wo131::kROk) ? 1 : 0; rb[1] = seq; rb[2] = r.op; rb[3] = r.reason;
+                if (r.n) std::memcpy(rb + 4, r.buf, r.n);
+                EnterCriticalSection(&g_write_lock);
+                send_frame(h, kWo131Reply, rb, static_cast<uint16_t>(4 + r.n));
+                LeaveCriticalSection(&g_write_lock);
+                break;
+            }
+            case kWo132: {
+                std::vector<uint8_t> copy(body, body + len);
+                struct R { uint8_t reason = kcdmp::wo132::kRFailed; uint8_t op = 0; uint8_t buf[512]{}; size_t n = 0; };   // WO-136: the status carries wo136 too
+                R r{};
+                bool faulted = false;
+                const bool ran = run_sync_bounded<R>(
+                    [copy](R& out) {
+                        out.op = copy.empty() ? 0 : copy[0];
+                        out.reason = kcdmp::wo132::handle(copy.data(), copy.size(), out.buf, sizeof(out.buf), &out.n);
+                    }, "Wo132", r, &faulted);
+                if (!ran) { r.reason = faulted ? kReasonTaskFaulted : kcdmp::wo132::kRFailed; r.n = 0; r.op = len ? body[0] : 0; }
+                BYTE rb[4 + 512]{};
+                rb[0] = (ran && r.reason == kcdmp::wo132::kROk) ? 1 : 0; rb[1] = seq; rb[2] = r.op; rb[3] = r.reason;
+                if (r.n) std::memcpy(rb + 4, r.buf, r.n);
+                EnterCriticalSection(&g_write_lock);
+                send_frame(h, kWo132Reply, rb, static_cast<uint16_t>(4 + r.n));
+                LeaveCriticalSection(&g_write_lock);
+                break;
+            }
+            case kWo137: {
+                std::vector<uint8_t> copy(body, body + len);
+                struct R { uint8_t reason = kcdmp::wo137::kRFailed; uint8_t op = 0; uint8_t buf[1000]{}; size_t n = 0; };
+                R r{};
+                bool faulted = false;
+                const bool ran = run_sync_bounded<R>(
+                    [copy](R& out) {
+                        out.op = copy.empty() ? 0 : copy[0];
+                        out.reason = kcdmp::wo137::handle(copy.data(), copy.size(), out.buf, sizeof(out.buf), &out.n);
+                    }, "Wo137", r, &faulted);
+                if (!ran) { r.reason = faulted ? kReasonTaskFaulted : kcdmp::wo137::kRFailed; r.n = 0; r.op = len ? body[0] : 0; }
+                BYTE rb[4 + 1000]{};
+                rb[0] = (ran && r.reason == kcdmp::wo137::kROk) ? 1 : 0; rb[1] = seq; rb[2] = r.op; rb[3] = r.reason;
+                if (r.n) std::memcpy(rb + 4, r.buf, r.n);
+                EnterCriticalSection(&g_write_lock);
+                send_frame(h, kWo137Reply, rb, static_cast<uint16_t>(4 + r.n));
+                LeaveCriticalSection(&g_write_lock);
+                break;
+            }
+            case kWo138: {
+                std::vector<uint8_t> copy(body, body + len);
+                struct R { uint8_t reason = kcdmp::wo138::kRFailed; uint8_t op = 0; uint8_t buf[1000]{}; size_t n = 0; };
+                R r{};
+                bool faulted = false;
+                const bool ran = run_sync_bounded<R>(
+                    [copy](R& out) {
+                        out.op = copy.empty() ? 0 : copy[0];
+                        out.reason = kcdmp::wo138::handle(copy.data(), copy.size(), out.buf, sizeof(out.buf), &out.n);
+                    }, "Wo138", r, &faulted);
+                if (!ran) { r.reason = faulted ? kReasonTaskFaulted : kcdmp::wo138::kRFailed; r.n = 0; r.op = len ? body[0] : 0; }
+                BYTE rb[4 + 1000]{};
+                rb[0] = (ran && r.reason == kcdmp::wo138::kROk) ? 1 : 0; rb[1] = seq; rb[2] = r.op; rb[3] = r.reason;
+                if (r.n) std::memcpy(rb + 4, r.buf, r.n);
+                EnterCriticalSection(&g_write_lock);
+                send_frame(h, kWo138Reply, rb, static_cast<uint16_t>(4 + r.n));
+                LeaveCriticalSection(&g_write_lock);
+                break;
+            }
+            case kWo139: {
+                std::vector<uint8_t> copy(body, body + len);
+                struct R { uint8_t reason = kcdmp::wo139::kRFailed; uint8_t op = 0; uint8_t buf[300]{}; size_t n = 0; };
+                R r{};
+                bool faulted = false;
+                const bool ran = run_sync_bounded<R>(
+                    [copy](R& out) {
+                        out.op = copy.empty() ? 0 : copy[0];
+                        out.reason = kcdmp::wo139::handle(copy.data(), copy.size(), out.buf, sizeof(out.buf), &out.n);
+                    }, "Wo139", r, &faulted);
+                if (!ran) { r.reason = faulted ? kReasonTaskFaulted : kcdmp::wo139::kRFailed; r.n = 0; r.op = len ? body[0] : 0; }
+                BYTE rb[4 + 300]{};
+                rb[0] = (ran && r.reason == kcdmp::wo139::kROk) ? 1 : 0; rb[1] = seq; rb[2] = r.op; rb[3] = r.reason;
+                if (r.n) std::memcpy(rb + 4, r.buf, r.n);
+                EnterCriticalSection(&g_write_lock);
+                send_frame(h, kWo139Reply, rb, static_cast<uint16_t>(4 + r.n));
+                LeaveCriticalSection(&g_write_lock);
+                break;
+            }
+            case kWo140: {
+                std::vector<uint8_t> copy(body, body + len);
+                struct R { uint8_t reason = kcdmp::wo140::kRFailed; uint8_t op = 0; uint8_t buf[340]{}; size_t n = 0; };
+                R r{};
+                bool faulted = false;
+                const bool ran = run_sync_bounded<R>(
+                    [copy](R& out) {
+                        out.op = copy.empty() ? 0 : copy[0];
+                        out.reason = kcdmp::wo140::handle(copy.data(), copy.size(), out.buf, sizeof(out.buf), &out.n);
+                    }, "Wo140", r, &faulted);
+                if (!ran) { r.reason = faulted ? kReasonTaskFaulted : kcdmp::wo140::kRFailed; r.n = 0; r.op = len ? body[0] : 0; }
+                BYTE rb[4 + 340]{};
+                rb[0] = (ran && r.reason == kcdmp::wo140::kROk) ? 1 : 0; rb[1] = seq; rb[2] = r.op; rb[3] = r.reason;
+                if (r.n) std::memcpy(rb + 4, r.buf, r.n);
+                EnterCriticalSection(&g_write_lock);
+                send_frame(h, kWo140Reply, rb, static_cast<uint16_t>(4 + r.n));
+                LeaveCriticalSection(&g_write_lock);
+                break;
+            }
+            case kWo141: {
+                std::vector<uint8_t> copy(body, body + len);
+                struct R { uint8_t reason = kcdmp::wo141::kRFailed; uint8_t op = 0; uint8_t buf[420]{}; size_t n = 0; };
+                R r{};
+                bool faulted = false;
+                const bool ran = run_sync_bounded<R>(
+                    [copy](R& out) {
+                        out.op = copy.empty() ? 0 : copy[0];
+                        out.reason = kcdmp::wo141::handle(copy.data(), copy.size(), out.buf, sizeof(out.buf), &out.n);
+                    }, "Wo141", r, &faulted);
+                if (!ran) { r.reason = faulted ? kReasonTaskFaulted : kcdmp::wo141::kRFailed; r.n = 0; r.op = len ? body[0] : 0; }
+                BYTE rb[4 + 420]{};
+                rb[0] = (ran && r.reason == kcdmp::wo141::kROk) ? 1 : 0; rb[1] = seq; rb[2] = r.op; rb[3] = r.reason;
+                if (r.n) std::memcpy(rb + 4, r.buf, r.n);
+                EnterCriticalSection(&g_write_lock);
+                send_frame(h, kWo141Reply, rb, static_cast<uint16_t>(4 + r.n));
+                LeaveCriticalSection(&g_write_lock);
+                break;
+            }
+            case kWo143: {
+                std::vector<uint8_t> copy(body, body + len);
+                struct R { uint8_t reason = kcdmp::wo143::kRFailed; uint8_t op = 0; uint8_t buf[420]{}; size_t n = 0; };
+                R r{};
+                bool faulted = false;
+                const bool ran = run_sync_bounded<R>(
+                    [copy](R& out) {
+                        out.op = copy.empty() ? 0 : copy[0];
+                        out.reason = kcdmp::wo143::handle(copy.data(), copy.size(), out.buf, sizeof(out.buf), &out.n);
+                    }, "Wo143", r, &faulted);
+                if (!ran) { r.reason = faulted ? kReasonTaskFaulted : kcdmp::wo143::kRFailed; r.n = 0; r.op = len ? body[0] : 0; }
+                BYTE rb[4 + 420]{};
+                rb[0] = (ran && r.reason == kcdmp::wo143::kROk) ? 1 : 0; rb[1] = seq; rb[2] = r.op; rb[3] = r.reason;
+                if (r.n) std::memcpy(rb + 4, r.buf, r.n);
+                EnterCriticalSection(&g_write_lock);
+                send_frame(h, kWo143Reply, rb, static_cast<uint16_t>(4 + r.n));
+                LeaveCriticalSection(&g_write_lock);
+                break;
+            }
+            case kWo147: {   // WO-147
+                std::vector<uint8_t> copy(body, body + len);
+                struct R { uint8_t reason = kcdmp::wo147::kRFailed; uint8_t op = 0; uint8_t buf[200]{}; size_t n = 0; };
+                R r{};
+                bool faulted = false;
+                const bool ran = run_sync_bounded<R>(
+                    [copy](R& out) {
+                        out.op = copy.empty() ? 0 : copy[0];
+                        out.reason = kcdmp::wo147::handle(copy.data(), copy.size(), out.buf, sizeof(out.buf), &out.n);
+                    }, "Wo147", r, &faulted);
+                if (!ran) { r.reason = faulted ? kReasonTaskFaulted : kcdmp::wo147::kRFailed; r.n = 0; r.op = len ? body[0] : 0; }
+                BYTE rb[4 + 200]{};
+                rb[0] = (ran && r.reason == kcdmp::wo147::kROk) ? 1 : 0; rb[1] = seq; rb[2] = r.op; rb[3] = r.reason;
+                if (r.n) std::memcpy(rb + 4, r.buf, r.n);
+                EnterCriticalSection(&g_write_lock);
+                send_frame(h, kWo147Reply, rb, static_cast<uint16_t>(4 + r.n));
+                LeaveCriticalSection(&g_write_lock);
+                break;
+            }
+            case kWo151: {   // WO-151: the safeguards' switches, the guard's live check
+                std::vector<uint8_t> copy(body, body + len);
+                struct R { uint8_t reason = kcdmp::wo151::kRFailed; uint8_t op = 0; uint8_t buf[200]{}; size_t n = 0; };
+                R r{};
+                bool faulted = false;
+                const bool ran = run_sync_bounded<R>(
+                    [copy](R& out) {
+                        out.op = copy.empty() ? 0 : copy[0];
+                        out.reason = kcdmp::wo151::handle(copy.data(), copy.size(), out.buf, sizeof(out.buf), &out.n);
+                    }, "Wo151", r, &faulted);
+                if (!ran) { r.reason = faulted ? kReasonTaskFaulted : kcdmp::wo151::kRFailed; r.n = 0; r.op = len ? body[0] : 0; }
+                BYTE rb[4 + 200]{};
+                rb[0] = (ran && r.reason == kcdmp::wo151::kROk) ? 1 : 0; rb[1] = seq; rb[2] = r.op; rb[3] = r.reason;
+                if (r.n) std::memcpy(rb + 4, r.buf, r.n);
+                EnterCriticalSection(&g_write_lock);
+                send_frame(h, kWo151Reply, rb, static_cast<uint16_t>(4 + r.n));
+                LeaveCriticalSection(&g_write_lock);
+                break;
+            }
+            case kPinLabel: {   // WO-171: [owner:1][n:1][utf8 n<=31] -- a partner's name for its map pin's hover title
+                if (len < 2 || len != static_cast<uint32_t>(2 + body[1]) || body[1] > 31) {
+                    logf("PIPE: PinLabel wrong length %u", len);
+                    send_result(h, false, seq);
+                    break;
+                }
+                const uint8_t owner = body[0];
+                std::vector<uint8_t> text(body + 2, body + 2 + body[1]);
+                bool ok = false;
+                bool faultedFlag = false;
+                const bool ran = run_sync_bounded<bool>(
+                    [owner, text](bool& result) { result = actions::partner_label(owner, text.data(), text.size()); },
+                    "PinLabel", ok, &faultedFlag);
+                send_result(h, ran && ok, seq, (ran && ok) ? 0 : (faultedFlag ? kReasonTaskFaulted : 0));
+                break;
+            }
+
+            case kWo163: {   // WO-163: shared combat (the skirmish relation read; the probes' and the build's switches)
+                {   // WO-203B: an op that runs here, on the reader thread (the conversation camera's samples: no engine call, its own lock)
+                    BYTE ob[4 + 512]{};
+                    size_t on = 0;
+                    uint8_t oreason = kcdmp::wo163::kRFailed;
+                    if (len >= 1 && kcdmp::wo203::handle_off_main(body[0], body, len, ob + 4, 512, &on, &oreason)) {
+                        if (on > 512) on = 0;
+                        ob[0] = oreason == kcdmp::wo163::kROk ? 1 : 0; ob[1] = seq; ob[2] = body[0]; ob[3] = oreason;
+                        EnterCriticalSection(&g_write_lock);
+                        send_frame(h, kWo163Reply, ob, static_cast<uint16_t>(4 + on));
+                        LeaveCriticalSection(&g_write_lock);
+                        break;
+                    }
+                }
+                std::vector<uint8_t> copy(body, body + len);
+                struct R { uint8_t reason = kcdmp::wo163::kRFailed; uint8_t op = 0; uint8_t buf[512]{}; size_t n = 0; };   // WO-166: wo166's status (~330 chars) was cut at 200
+                R r{};
+                bool faulted = false;
+                const bool ran = run_sync_bounded<R>(
+                    [copy](R& out) {
+                        out.op = copy.empty() ? 0 : copy[0];
+                        out.reason = kcdmp::wo163::handle(copy.data(), copy.size(), out.buf, sizeof(out.buf), &out.n);
+                    }, "Wo163", r, &faulted);
+                if (!ran) { r.reason = faulted ? kReasonTaskFaulted : kcdmp::wo163::kRFailed; r.n = 0; r.op = len ? body[0] : 0; }
+                BYTE rb[4 + sizeof r.buf]{};
+                if (r.n > sizeof r.buf) r.n = 0;   // never past the buffer
+                rb[0] = (ran && r.reason == kcdmp::wo163::kROk) ? 1 : 0; rb[1] = seq; rb[2] = r.op; rb[3] = r.reason;
+                if (r.n) std::memcpy(rb + 4, r.buf, r.n);
+                EnterCriticalSection(&g_write_lock);
+                send_frame(h, kWo163Reply, rb, static_cast<uint16_t>(4 + r.n));
+                LeaveCriticalSection(&g_write_lock);
+                break;
+            }
+            case kLeashSample: {
+                kcdmp::leash::Result page{};
+                uint8_t n = len >= 5 ? body[4] : 0;
+                if (n < 1 || n > kcdmp::leash::kMaxAnchors || static_cast<int>(len) != 4 + 1 + n * 12 + 2) {
+                    logf("PIPE: LeashSample wrong length %u (anchors %u)", len, n);
+                    send_leash_page(h, false, seq, page, 0, 0);
+                    break;
+                }
+                float radius = 0; std::memcpy(&radius, body, 4);
+                kcdmp::leash::Anchor anchors[kcdmp::leash::kMaxAnchors];
+                for (int i = 0; i < n; ++i) std::memcpy(&anchors[i], body + 5 + i * 12, 12);
+                uint16_t offset = 0; std::memcpy(&offset, body + 5 + n * 12, 2);
+                bool ok = true;
+                if (offset == 0) {
+                    bool faulted = false, sampled = false;
+                    const bool ran = run_sync_bounded<bool>(
+                        [anchors, n, radius](bool& result) {
+                            kcdmp::leash::Result r{};
+                            result = kcdmp::leash::sample(anchors, n, radius, &r);
+                        }, "LeashSample", sampled, &faulted);
+                    ok = ran && !faulted && sampled;
+                    if (!ran) logf("PIPE: LeashSample timed out waiting for a frame");
+                }
+                uint16_t total = 0;
+                if (!ok || !kcdmp::leash::page(offset, kLeashPageBudget, &page, &total)) {
+                    page.entries.clear();
+                    send_leash_page(h, false, seq, page, 0, offset);
+                    break;
+                }
+                send_leash_page(h, true, seq, page, total, offset);
+                break;
+            }
+
+            default:
+                // WO-110 R12: answered, not ignored -- an agent newer than this
+                // DLL used to wait out its whole deadline for nothing.
+                logf("PIPE: unknown frame type 0x%02X (%u bytes) -- replying failure/unknown-command", type, len);
+                send_result(h, false, seq, kReasonUnknownCommand);
+                break;
+        }
+    }
+
+    g_connected = false;
+    logf("PIPE: agent disconnected");
+    // WO-118: no agent, no stream -- every native binding is dropped.
+    npcdrive::on_pipe_closed();
+    main_thread::post([] { kcdmp::wo132::on_pipe_closed(); });   // WO-132: engaged copies let go (main-thread state)
+    main_thread::post([] { kcdmp::motion::on_pipe_closed(); });  // WO-154 2: the avatars' identities go with the session
+    main_thread::post([] { kcdmp::wo201::on_pipe_closed(); });   // WO-201: its session parts stand down
+    main_thread::post([] { kcdmp::wo206::on_pipe_closed(); });   // WO-206: the digest sweep disarms, the probe stops
+    kcdmp::wo137::on_disconnect();   // WO-137: no agent -- no quest frames, no HUD proxy
+    kcdmp::wo138::on_pipe_closed();  // WO-138: no agent -- the native sender, the pause gate and the hold go off
+    kcdmp::wo166::on_pipe_closed();  // WO-166 C3: no agent -- the striking windows end (restored at the next tick)
+    kcdmp::weather::on_pipe_closed();  // WO-151: no agent -- the weather gate opens
+    kcdmp::wo139::on_pipe_closed();
+    kcdmp::wo140::on_pipe_closed();  // WO-140: no agent -- the sleep gate off  // WO-139: no agent -- the trespass detector off
+    kcdmp::main_thread::post([] { kcdmp::wo141::on_pipe_closed(); });   // WO-141: no agent -- no capture, no apply, every hold released
+    kcdmp::main_thread::post([] { kcdmp::wo143::on_pipe_closed(); });   // WO-143: no agent -- hands, gaits, one-shots and looks off, what this DLL set undone
+    // WO-113: no agent, no session -- the death guard stands down (vanilla).
+    respawn::set_session(false, "pipe closed");
+    // WO-114: no agent, no partner -- a death wakes by today's rule.
+    respawn::set_partner(false, 0, 0, 0, 0);
+}
+
+void listen_loop() {
+    while (g_running) {
+        HANDLE h = CreateNamedPipeA(
+            pipe_name(),
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            1,               // one agent per game
+            64 * 1024, 64 * 1024,
+            0, nullptr);
+        if (h == INVALID_HANDLE_VALUE) {
+            logf("PIPE: CreateNamedPipe failed: %lu", GetLastError());
+            Sleep(1000);
+            continue;
+        }
+        g_pipe = h;
+
+        // Waits until an agent connects, or until stop() breaks it by connecting
+        // to its own pipe. Overlapped now, so the wait is on the event rather
+        // than inside the call.
+        Op conn;
+        BOOL ok = FALSE;
+        if (conn.ov.hEvent) {
+            if (ConnectNamedPipe(h, &conn.ov)) {
+                ok = TRUE;
+            } else {
+                const DWORD err = GetLastError();
+                if (err == ERROR_PIPE_CONNECTED) {
+                    ok = TRUE;
+                } else if (err == ERROR_IO_PENDING) {
+                    DWORD ignored = 0;
+                    ok = GetOverlappedResult(h, &conn.ov, &ignored, TRUE);
+                } else {
+                    logf("PIPE: ConnectNamedPipe failed: %lu", err);
+                }
+            }
+        }
+        if (ok && g_running) {
+            serve(h);
+        }
+
+        DisconnectNamedPipe(h);
+        CloseHandle(h);
+        g_pipe = INVALID_HANDLE_VALUE;
+    }
+    logf("PIPE: listener stopped");
+}
+
+} // namespace
+
+bool start() {
+    if (!g_write_lock_ready) { InitializeCriticalSection(&g_write_lock); g_write_lock_ready = true; }
+    if (g_running.exchange(true)) return true;
+
+    // Outbound detection runs on the game thread every frame; the sampler
+    // rate-limits itself. Posting a self-requeueing task keeps it going without
+    // a second timer.
+    main_thread::post_repeating("rttr::sample_health", [] {
+        rttr::sample_health(&send_local_hit);
+    });
+
+    // WO-113: the respawn module's outbound events become pipe frames.
+    respawn::Events ev{};
+    ev.downed = &send_local_downed;
+    ev.respawned = &send_local_respawned;
+    ev.grave_add = &on_grave_add;
+    ev.grave_remove = &on_grave_remove;
+    respawn::set_events(ev);
+
+    // WO-121: committed actions and friendly-fire hits become unsolicited frames.
+    kcdmp::motion::set_action_callback(&send_local_action);
+    kcdmp::hits::set_pvp_callback(&send_pvp_hit);
+    // WO-132: NPC hits on avatars, watched NPCs' combat state, discarded copy hits.
+    kcdmp::hits::set_npc_hit_callback(&send_npc_avatar_hit);
+    kcdmp::hits::set_discard_callback(&send_discarded);
+    kcdmp::hits::set_defence_callback(&send_defence);   // WO-208 B
+    kcdmp::wo210hit::set_frame_callback(&send_wo210_hit);   // WO-210 E.2
+    kcdmp::wo132::set_combat_callback(&send_npc_combat);
+    // WO-137: quest State changes.
+    kcdmp::wo137::set_send_callback(&send_quest_change);
+    kcdmp::wo138::set_frame_callback(&send_wo138_frame);
+    kcdmp::wo139::set_frame_callback(&send_wo139_frame);
+    kcdmp::wo140::set_frame_callback(&send_wo140_frame);
+    kcdmp::wo141::set_frame_callback(&send_wo141_frame);
+    kcdmp::wo143::set_frame_callback(&send_wo143_frame);
+
+    // WO-118: the native writer's and the trace's unsolicited frames.
+    npcdrive::set_drop_callback(&send_npc_dropped);
+    npctrace::set_done_callback(&send_trace_done);
+
+    // The injected plugin has process lifetime. Detaching keeps DLL teardown
+    // free of a blocking join under the Windows loader lock.
+    std::thread(listen_loop).detach();
+    logf("PIPE: listening on %s", pipe_name());
+    return true;
+}
+
+void stop() {
+    if (!g_running.exchange(false)) return;
+    // Unblock ConnectNamedPipe by connecting to it once.
+    HANDLE poke = CreateFileA(pipe_name(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                              OPEN_EXISTING, 0, nullptr);
+    if (poke != INVALID_HANDLE_VALUE) CloseHandle(poke);
+}
+
+bool connected() { return g_connected; }
+
+} // namespace kcdmp::pipe

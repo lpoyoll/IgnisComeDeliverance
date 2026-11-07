@@ -1,0 +1,50 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="6.0.0" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
+    <PackageReference Include="xunit" Version="2.5.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.5.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+    <Using Include="KcdMp.Client" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\KcdMp.Client\KcdMp.Client.csproj" />
+  </ItemGroup>
+
+  <!-- WO-129: the launcher's agent-status rules, compiled here by link (the
+       launcher has no test project of its own; the file has no UI types). -->
+  <ItemGroup>
+    <Compile Include="..\..\KCDMP_launcher\Models\AgentStatusBanner.cs" Link="Launcher\AgentStatusBanner.cs" />
+    <!-- WO-154: the player's files (settings.json, custom_servers.json, favorites.json). -->
+    <Compile Include="..\..\KCDMP_launcher\Models\AppModels.cs" Link="Launcher\AppModels.cs" />
+    <Compile Include="..\..\KCDMP_launcher\Models\LauncherSettingsStore.cs" Link="Launcher\LauncherSettingsStore.cs" />
+    <Compile Include="..\..\KCDMP_launcher\Models\PlayerListFiles.cs" Link="Launcher\PlayerListFiles.cs" />
+    <!-- WO-154 (Phase 7): Windows blocking a file the mod needs, in plain words. -->
+    <Compile Include="..\..\KCDMP_launcher\Models\LaunchBlock.cs" Link="Launcher\LaunchBlock.cs" />
+    <!-- WO-154 (Phase 7): the relay's ports taken by an earlier launcher's relay. -->
+    <Compile Include="..\..\KCDMP_launcher\Models\RelayReuse.cs" Link="Launcher\RelayReuse.cs" />
+    <!-- WO-154 (Phase 4.3): CONNECT waits until it can work. -->
+    <Compile Include="..\..\KCDMP_launcher\Models\ConnectGate.cs" Link="Launcher\ConnectGate.cs" />
+    <!-- WO-154: the mod menu's choices in a bug report, filtered. -->
+    <Compile Include="..\..\KCDMP_launcher\Models\ModSettingsReport.cs" Link="Launcher\ModSettingsReport.cs" />
+    <!-- WO-159: the main menu's Start Game / Join Game (the model, the menu's choices, the joiner's words). -->
+    <Compile Include="..\..\KCDMP_launcher\Models\MenuTakeover.cs" Link="Launcher\MenuTakeover.cs" />
+    <!-- WO-175 S2: the rolling saves backups and their restore. -->
+    <Compile Include="..\..\KCDMP_launcher\Models\Wo175Backup.cs" Link="Launcher\Wo175Backup.cs" />
+  </ItemGroup>
+
+</Project>

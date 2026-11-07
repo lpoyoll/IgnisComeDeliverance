@@ -1,0 +1,1168 @@
+// Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
+// GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
+// content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
+// WO-125 live test tool (tools/wo118, never shipped): a synthetic HOST for the
+// continuity tests. The real game is the joiner; this plays a WO-125 host agent:
+//   * announces its session mode WITH its world's identity (JoinStatus state 8:
+//     the playthrough seed in the joinId slot, SessionSeedKnown|SessionHenryWorld);
+//   * serves joins (the WO-123 status sequence), replaying its branch as
+//     WorldSaved entries with the branch bit right before every WorldOffer;
+//   * refuses a join in a non-Henry world without "pausing";
+//   * takes commands from a control file, one per line, each run once in order:
+//       save <file> [name]        a host world save: WorldSaved (seq, the file's footer md5), the branch grows
+//                                 (parent = the head); the file is the world served from now on. name =
+//                                 e.g. autosave061 (the engine-style name the joiner logs), default autosave<seq>
+//       reload <file> [reseed]    the host loads a save: "reloading" to every peer, 3 s, then that file is the
+//                                 world and the branch head (a known md5 keeps its parents)
+//       world <file> <reseed>     the same, another playthrough (give a synthetic seed in hex)
+//       mode shared|separate      the session mode
+//       leave                     disconnect (the joiner must leave the world)
+//       pos <x> <y> <z>           (WO-114) the host's streamed position from now on
+//       leash warn|cancel         (WO-114) a Leash message to every joiner (0x58), with the current position
+//       leash countdown|hold <s>  ... seconds left
+//       leash pull [fast] [forced] ... a pull beside the host's position (fast = the fast-travel reason; forced = WO-147's
+//                                 forced bit, the host's hold cap ran out: the joiner ends a dialogue first)
+//       leash config on|off <warn> <pull>
+//       timeskip <worldTime>      (WO-114) a fast-travel time skip (TimeSkip start + done, kind fast-travel)
+//       story objective|fingerprint|approach <text>   (WO-133) a StoryBeatUp (0x37) of that kind
+//       itemdrop <cls> <amt> <hp> <x> <y> <z> [dropId]  (WO-134) an ItemDropUp (0x32): the host dropped this
+//       itemclaim <dropId>        (WO-134) an ItemClaimUp (0x34): the host picked that drop up
+//                                 (every ItemDropDown 0x33 / ItemClaimDown 0x35 received is logged)
+//       bodyset <name> <items|->  (WO-134) the host's body <name> holds these items (cls:amt:hp[:w],...): a joiner's
+//                                 BodyOpen is answered with them, its BodyTake comes out of them (ok) or not (gone)
+//       bodypush <name>           (WO-134) a BodyState "update" of that body to every joiner (the host looted it)
+//       witem <cls> <x> <y> <z>   (WO-134) a world item the host still has: a joiner's ItemTake of it is ok (once)
+//       witemtaken <cls> <x> <y> <z>  (WO-134) one the host already took: an ItemTake of it is gone
+//       itemgone <cls> <x> <y> <z>    (WO-134) an ItemGone to every joiner (the host picked it up)
+//       npc <name> <x> <y> <z> <yaw> <hp> <flags> [secs]  (WO-134) stream that NPC (NpcStateUp 0x26) every 200 ms for
+//                                 secs (default 30): flags 1 = dead (the joiner applies the host's death to its copy)
+//       ledger <rows|->           (WO-134) the host's chest ledger (container|cls|n|hp|worldT|restockDays;...),
+//                                 sent to the joiner at every Ready (and at once with ledgersend)
+//       npcmove <name> <vx> <vy> [vz]  (WO-136) a running npc stream moves at that velocity (m/s) from now on
+//       npcrow <name> <rowGuid>   (WO-136) the host's NPC committed that attack row (ActionKind.NpcAttack)
+//       npchit <name> <hp> <st> [fatal]  (WO-147) the host's own blow on its NPC (NpcDamageUp 0x30, as a host sends it)
+//       npccombat <name> on|off [host|avatar:N|none] [gz]  (WO-136) the host's NPC combat state (ActionKind.NpcCombat),
+//                                 repeated every 1 s while on (the WO-132 heartbeat)
+//       hstate k=v ...            (WO-135/136) the host avatar's state block: crouch=0|1 torch=0|1 combat=0|1
+//       appearance <guid,...>     (WO-136) the host's outfit (an Appearance 0x1A)
+//       quest change <flags> <old> <new> <port|-> <questLen> <path>   (WO-137) a QuestHost Change to every joiner,
+//                                 numbered by this host (its own seq, from 1)
+//       quest mode on|off <why>   (WO-137) the host's quest sync (QuestHost Mode)
+//       quest hold on|off <npc>   (WO-137) a QuestHost Hold (tok 0)
+//       quest result <tok> <verdict> <hostVal> <port|-> <path>   (WO-137) a QuestHost Result by hand
+//       quest checkpoint          (WO-137) a Checkpoint of every State this host has sent or applied
+//       quest auto on|off         (WO-137) answer QuestAsk like a real host (default on): a Request is judged
+//                                 against this host's own table (unknown = at the joiner's old value) and applied
+//                                 (its Change goes out, mirror-flagged, then Result applied) / already / refused;
+//                                 a Talk is answered with a Hold; a Resync with a Checkpoint
+//       quest set <path> <val> <port|->   (WO-137) this host's own value for a State (no message)
+//       questfile <file>          (WO-137) replay a host's recorded Change texts ("<seq> <flags> <old> <new> <port|->
+//                                 <questLen> <path>" per line, as avatarpeer --quest-rec writes them), renumbered, in order
+//       pause <hex>               (WO-138) a PauseUp (0x1C) with that state byte: 0 = running, else the reasons
+//                                 (01 menu, 02 inventory, 04 dialogue, 08 cutscene, 10 load, 20 skip-time, 40 frozen)
+//       npcquiet on|off           (WO-138) every running npc stream stops sending (the host's world stands still and its
+//                                 stream is really silent), or sends again; everything else keeps going
+//       linkquiet on|off          (WO-138) NOTHING goes out any more (position heartbeats too): the host's link is lost
+//                                 (every QuestAskDown 0x63 received is logged: QUESTASK ...)
+//       crime stop <tok> <guard> <crimes> <fine>   (WO-139) a CrimeHost Stop to every joiner: that guard stops him
+//       crime judged <tok> <text> | pursue <on|off> <guard> | mode <on|off> <why> | cleared <why> <st|-> |
+//             horses <name,name|-> | record <text>  (WO-139) the other CrimeHost kinds, verbatim
+//                                 (every CrimeAskDown 0x65 received is logged: CRIMEASK ...)
+//       sleep auto yes|no|busy|none   (WO-140) answer a joiner's SleepVote Ask like a host (default none: no answer)
+//       sleep ask sleep|wait <save>   (WO-140) this host asks every joiner (tok = id<<16 | n)
+//       sleep answer <tokHex> <ans> <askerId> | begin <tokHex> <hours> <save> | cancel <tokHex> <why>   (WO-140) by hand
+//                                 (every SleepVoteDown 0x69 received is logged: SLEEPVOTE ...)
+//       clock <worldTime>         (WO-140) this host's clock announce (TimeSkip sync, kind unknown)
+//       sleeptime <worldTime>     (WO-140) this host's own sleep: TimeSkip start + done, kind sleep
+//       activity npc <name> none|stance <id> <objGuidHex>|unstance <id> <locGuidHex> [stance <id> <objGuidHex>]
+//                                 (WO-141) an ActivityHost NPC row to every joiner (what the host's DLL reads)
+//       activity player none|stance <id> <objGuidHex>|unstance <id> <locGuidHex>
+//                                 (WO-141) this host's own body (its avatar on the joiner)
+//       activityfile <path>       (WO-141) replay a recorded ActivityHost stream (avatarpeer --record lines
+//                                 "<ms> 6B <hex>"), in order, with the recorded spacing
+//                                 (every ActivityPeerDown 0x6D received is logged: ACTIVITY ...)
+//       extra hands <npc> <left|-> <right|-> | gaits <npc> <maskHex> | shot <npc> <frag> <tags|-> <alignGuidHex> [flags]
+//             | look <npc> <kind 0..3> [target]
+//                                 (WO-143) one ActivityExtra row to every joiner (what the host's DLL reads);
+//                                 activityfile replays recorded ActivityExtra (6F) lines too, in the same order
+//       carry grab <dead|ko|object> <body> [x y z]   (WO-148) this host picked its body up: a Carry Grab to every
+//                                 joiner (x y z = where it lay, default the host's position); a Held every 2 s with the
+//                                 host's position until the put
+//       carry put <put|drop|throw|lost> <body> [x y z]  (WO-148) set it down there (default the host's position + 1 m north)
+//       carry held on|off         (WO-148) stop or resume the Held heartbeat
+//       carry refuse <joinerId> <body> <why>   (WO-148) the host's world says no to that joiner's carry
+//       carry auto on|off         (WO-148) answer a joiner's Grab like a host (default on): refused when this host
+//                                 carries that body itself, else nothing (the host shows it)
+//       walk <vx> <vy> <secs> [vz] [ms] (WO-148) the host walks: its position moves at that velocity, streamed every ms
+//                                 (default 100; WO-154: by the time that really passed, one walk at a time, no heartbeat repeat)
+//                                 (every CarryDown 0x71 received is logged: CARRY ...)
+//       setting ff|crime|ft 0|1    (WO-154) the host's session lever (SessionSetting), as a real host sends it
+//       vitals <hp> <st> [knockeddown|downed]   (WO-154) the host's own PlayerState (0x1F), at once and every 2 s
+//       phit <hp> <st> [joinerId=1]   (WO-155) the host's NPC blow on the joiner (PlayerHitUp 0x21)
+//       hverdict <hit|blocked|parried|missed> <hp> <st> <npc|-> [swing=0] [joinerId=1] [hitId=auto]   (WO-161) the host's verdict of an NPC's hit
+//                                 on the joiner (HitVerdictUp 0x72); a repeated hitId must be applied once; `-` names nobody (the NoAttacker fallback)
+//       ffhit <hp> <st> [unarmed] [joinerId=1]   (WO-155) the host's friendly-fire hit on the joiner (PlayerHitV8Up 0x44)
+//       death                     (WO-155) the host dies (PlayerDeathUp 0x23); pair it with vitals <hp> <st> downed
+//                                 (hstate downed=1|0: the Downed bit of the host's state block)
+//     [reseed] = a synthetic seed (hex) written into the save's body 0x01FB, re-signed: a second
+//     "playthrough" made from a copy. Files are COPIES of real host saves; never logged by path.
+//
+// usage: SynthPeer --join-host125 <file> --ctl <control file> [--port 7778] [--name synth-host]
+//                  [--duration 3600] [--host-pos x,y,z] [--reseed hex]
+using System.Buffers.Binary;
+using System.Diagnostics;
+using System.Globalization;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading.Channels;
+using KcdMp.Client;
+using KcdMp.Wire;
+
+static class Host125
+{
+    static string Arg(string[] a, string k, string d) { int i = Array.IndexOf(a, k); return i >= 0 && i + 1 < a.Length ? a[i + 1] : d; }
+    static readonly Stopwatch Clock = Stopwatch.StartNew();
+    static void Say(string s) => Console.WriteLine(FormattableString.Invariant($"SYNTH125 t={Clock.Elapsed.TotalSeconds:F2}s {s}"));
+
+    sealed class World
+    {
+        public byte[] Bytes = [];
+        public string Md5 = "";
+        public uint? Seed;
+        public bool Henry;
+        public string Player = "?";
+        public string Label = "";
+    }
+
+    static World Load(string path, string? reseed)
+    {
+        var b = File.ReadAllBytes(path);
+        if (reseed is { Length: > 0 } rs && rs != "keep")
+        {
+            uint seed = uint.Parse(rs, NumberStyles.HexNumber, CultureInfo.InvariantCulture);
+            var c = WhsSave.Inflate(b);
+            var n = WhsSave.PathGet(c.Raw, 0x01F4, 0x01FB) ?? throw new InvalidDataException("no seed chunk");
+            BinaryPrimitives.WriteUInt32LittleEndian(c.Raw.AsSpan(n.PayloadOff), seed);
+            b = WhsSave.Deflate(c.DescBytes, c.Raw, c.FooterTail);
+        }
+        var v = WhsSave.Verify(b);
+        if (!v.Ok) throw new InvalidDataException($"{Path.GetFileName(path)} does not verify: {v.Reason}");
+        var raw = WhsSave.Inflate(b).Raw;
+        var who = WhsSave.PlayerOf(raw);
+        var w = new World { Bytes = b, Md5 = v.Md5.ToLowerInvariant(), Seed = WhsSave.ReadSeed(raw), Henry = who.IsHenry, Player = who.Player, Label = Path.GetFileName(path) };
+        return w;
+    }
+
+    static (byte Src, uint JoinId, byte[] Body)? Split(byte[] p) =>
+        Protocol.TrySplitJoinDown(p, out byte src, out _, out uint jid, out var body) ? (src, jid, body.ToArray()) : null;
+
+    static string Tag(World w) => w.Seed is uint s ? WhsSave.SeedTag(s) : "-";
+    static uint _hitVerdictId;   // WO-161: the host's hit numbering (hverdict)
+
+    public static async Task<int> RunAsync(string[] a, string release)
+    {
+        string host = Arg(a, "--host", "127.0.0.1"); int port = int.Parse(Arg(a, "--port", "7778"), CultureInfo.InvariantCulture);
+        string name = Arg(a, "--name", "synth-host");
+        string ctl = Arg(a, "--ctl", "");
+        double duration = double.Parse(Arg(a, "--duration", "3600"), CultureInfo.InvariantCulture);
+        bool hostRiding = false;   // WO-151: ride <horse>|off -- the riding flag on every host position packet
+        var hp = Arg(a, "--host-pos", "0,0,0").Split(',').Select(v => float.Parse(v, CultureInfo.InvariantCulture)).ToArray();
+        byte leashSeq = 0;
+        // WO-134: the scripted host world
+        var bodies = new Dictionary<string, List<Wo134Rules.Item>>(StringComparer.Ordinal);
+        var witems = new List<(Guid Cls, float X, float Y, float Z, bool Taken)>();
+        var npcFlags = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(StringComparer.Ordinal);   // WO-135: a running npc stream's flags, changeable
+        var npcHp = new System.Collections.Concurrent.ConcurrentDictionary<string, float>(StringComparer.Ordinal);   // WO-147: ... and its hp (a dead row carries 0)
+        string? hostBuild = null;
+        BodyState2? hostSt2 = null;
+        float hyaw = 0;                                                  // WO-154: the host's heading (walk sets it; every position packet carries it)
+        float vitHp = -1, vitSt = 100; byte vitFlags = 0;                // WO-154: vitals <hp> <st> [knockeddown|downed] -- a PlayerState heartbeat (2 s)
+        var npcVel = new System.Collections.Concurrent.ConcurrentDictionary<string, (float Vx, float Vy, float Vz)>(StringComparer.Ordinal);   // WO-136: npcmove
+        var npcCombatOn = new System.Collections.Concurrent.ConcurrentDictionary<string, NpcCombatEvent>(StringComparer.Ordinal);            // WO-136: npccombat
+        var actOut = new ActionOutbox();
+        var doorInbox = new ActionInbox();   // WO-151 3.9: a joiner's DoorAsk, logged                                                                                                      // WO-136: NpcAttack / NpcCombat                                                                                    // WO-135: hstate crouch=1 -- the host avatar's state block                                                                                      // WO-135: announced to every joiner every 10 s
+        var ledger = new Wo134Rules.Ledger();
+        uint qseq = 0;                                                                                                                         // WO-137: this host's change numbers
+        bool qauto = true;                                                                                                                     // WO-137: quest auto on|off
+        var qstate = new System.Collections.Concurrent.ConcurrentDictionary<string, (int Val, string Port, int QuestLen)>(StringComparer.Ordinal);   // WO-137: this host's States
+        var leashSeen = new Dictionary<byte, LeashState>();   // WO-114: the last LeashState per joiner
+        var world = Load(Arg(a, "--join-host125", ""), Arg(a, "--reseed", ""));
+        bool shared = true;
+        bool loading = false;   // like a WO-125 host agent: silent, and joins deferred, while a load runs
+        uint seq = 0;
+        var parent = new Dictionary<string, string?>(StringComparer.Ordinal) { [world.Md5] = null };
+        string head = world.Md5;
+        var names = new Dictionary<string, (byte Kind, byte Pl, ushort Idx)>(StringComparer.Ordinal);
+
+        using var hard = new CancellationTokenSource(TimeSpan.FromSeconds(duration));
+        var tcp = new TcpClient { NoDelay = true };
+        await tcp.ConnectAsync(host, port);
+        var st = tcp.GetStream();
+        {
+            var nb = Encoding.UTF8.GetBytes(name); var rb = Encoding.UTF8.GetBytes(release);
+            int hl = 2 + nb.Length + rb.Length; var hs = new byte[3 + hl];
+            hs[0] = Protocol.Handshake; BinaryPrimitives.WriteUInt16LittleEndian(hs.AsSpan(1), (ushort)hl);
+            hs[3] = Protocol.Version; hs[4] = (byte)nb.Length; nb.CopyTo(hs, 5); rb.CopyTo(hs, 5 + nb.Length);
+            await st.WriteAsync(hs);
+        }
+        var inbox = Channel.CreateUnbounded<(byte Type, byte[] Payload)>();
+        async Task<(byte, byte[])> Read()
+        {
+            var h = new byte[3]; await Exact(h);
+            var b = new byte[BinaryPrimitives.ReadUInt16LittleEndian(h.AsSpan(1))]; await Exact(b);
+            return (h[0], b);
+        }
+        async Task Exact(byte[] b) { int got = 0; while (got < b.Length) { int n = await st.ReadAsync(b.AsMemory(got), hard.Token); if (n <= 0) throw new IOException("closed"); got += n; } }
+        var (t0, ack) = await Read();
+        if (t0 != Protocol.Ack) { Say("refused by the relay"); return 1; }
+        Say($"host connected id={ack[0]} world={world.Label} ({world.Bytes.Length} B) tag={Tag(world)} player={world.Player} henry={(world.Henry ? "yes" : "no")} md5={world.Md5[..8]}");
+        var wlock = new SemaphoreSlim(1, 1);
+        bool npcQuiet = false, linkQuiet = false;   // WO-138
+        string sleepAuto = "none"; uint sleepN = 0; byte myGhost = ack[0];   // WO-140
+        uint carryTok = 0; string? carryBody = null, carryWhat = null; bool carryHeld = true, carryAuto = true;   // WO-148
+        double walkUntil = 0; float wvx = 0, wvy = 0, wvz = 0; int walkGen = 0;                                                   // WO-148: walk
+        async Task W(byte[] pkt) { if (linkQuiet) return; await wlock.WaitAsync(); try { await st.WriteAsync(pkt, hard.Token); } finally { wlock.Release(); } }
+        async Task Announce()
+        {
+            if (loading) return;
+            ushort flags = world.Seed is null ? (ushort)0 : (ushort)(Protocol.SessionSeedKnown | (world.Henry ? Protocol.SessionHenryWorld : 0));
+            for (byte g = 1; g < 8; g++)
+                await W(JoinStatusCodec.Build(g, shared ? world.Seed ?? 0 : 0, Protocol.JoinStateSession, Protocol.JoinReasonId(shared ? "shared-world" : "separate"), shared ? flags : (ushort)0));
+        }
+        byte[] WsPacket(WorldSaved ws)
+        {
+            var body = ws.Encode();
+            var p = new byte[3 + body.Length];
+            p[0] = Protocol.WorldSavedUp; BinaryPrimitives.WriteUInt16LittleEndian(p.AsSpan(1), (ushort)body.Length); body.CopyTo(p, 3);
+            return p;
+        }
+        static byte[] VitalsPacket(float hpv, float stv, byte flags)
+        {
+            var vp = new byte[3 + Protocol.PlayerStateUpPayloadLen]; vp[0] = Protocol.PlayerStateUp;
+            BinaryPrimitives.WriteUInt16LittleEndian(vp.AsSpan(1), (ushort)Protocol.PlayerStateUpPayloadLen);
+            BinaryPrimitives.WriteSingleLittleEndian(vp.AsSpan(3), hpv); BinaryPrimitives.WriteSingleLittleEndian(vp.AsSpan(7), stv);
+            vp[11] = flags;
+            return vp;
+        }
+        List<string> Branch()
+        {
+            var o = new List<string>(); string? cur = head;
+            while (cur is not null && o.Count < 64 && !o.Contains(cur)) { o.Add(cur); cur = parent.GetValueOrDefault(cur); }
+            return o;
+        }
+        // reader
+        _ = Task.Run(async () =>
+        {
+            try { while (true) { var p = await Read(); await inbox.Writer.WriteAsync(p); } }
+            catch (Exception ex) { Say($"connection ended: {ex.Message}"); hard.Cancel(); }
+        });
+        // heartbeat
+        _ = Task.Run(async () =>
+        {
+            int n = 0;
+            try
+            {
+                while (!hard.IsCancellationRequested)
+                {
+                    if (Clock.Elapsed.TotalSeconds >= walkUntil)   // WO-154: while walking, the walk's own 10 Hz stream is the position (a repeat here is a stall)
+                        await W(PositionCodec.BuildPosition(hp[0], hp[1], hp[2], hyaw, hostRiding, false, hostSt2, hostClaim: true));   // WO-127: the synthetic host claims the session like a real one (WO-135: + its state block)
+                    if (vitHp >= 0 && n % 2 == 0) await W(VitalsPacket(vitHp, vitSt, vitFlags));   // WO-154
+                    if (n++ % 5 == 0) await Announce();
+                    if (carryBody is not null && carryHeld && n % 2 == 0)   // WO-148: still carrying (every 2 s)
+                        for (byte g = 1; g < 8; g++)
+                            if (g != myGhost) await W(new LootMsg(Protocol.CarryHeld, carryTok, CarryText.Held(myGhost, carryWhat ?? "dead", carryBody, hp[0], hp[1], hp[2])).BuildUp(Protocol.CarryUp, g));
+                    await Task.Delay(1000, hard.Token);
+                }
+            }
+            catch { }
+        });
+        // control file
+        var joinQ = Channel.CreateUnbounded<(byte Joiner, uint JoinId)>();
+        var joinMsgs = Channel.CreateUnbounded<(byte Type, byte[] Body)>();
+        _ = Task.Run(async () =>
+        {
+            int done = 0;
+            while (!hard.IsCancellationRequested && ctl != "")
+            {
+                try
+                {
+                    var lines = File.Exists(ctl) ? File.ReadAllLines(ctl) : [];
+                    for (; done < lines.Length; done++)
+                    {
+                        var p = lines[done].Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                        if (p.Length == 0 || p[0].StartsWith('#')) continue;
+                        switch (p[0])
+                        {
+                            case "save":
+                            {
+                                var nw = Load(p[1], null);
+                                if (nw.Seed != world.Seed && world.Seed is uint cs) nw = Load(p[1], cs.ToString("x8"));   // a save of THIS playthrough
+                                string nm = p.Length > 2 ? p[2] : $"autosave{100 + (int)seq:D3}";
+                                var id = WorldSaved.ParsePath(Path.Combine("playline1", nm + ".whs")) ?? (Protocol.SaveKindAuto, (byte)1, (ushort)seq);
+                                parent.TryAdd(nw.Md5, head);
+                                head = nw.Md5;
+                                names[nw.Md5] = id;
+                                world = nw;
+                                var ws = new WorldSaved(++seq, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), id.Item1, id.Item2, id.Item3, Convert.FromHexString(nw.Md5));
+                                await W(WsPacket(ws));
+                                Say($"SAVE seq={seq} as playline{id.Item2}/{ws.FileName} md5={nw.Md5[..8]} (from {nw.Label}); branch depth {Branch().Count}");
+                                break;
+                            }
+                            case "reload":
+                            case "world":
+                            {
+                                loading = true;
+                                for (byte g = 1; g < 8; g++) await W(JoinStatusCodec.Build(g, 0, Protocol.JoinStateReloading, Protocol.JoinReasonId("reloading"), 0));
+                                Say($"{p[0].ToUpperInvariant()} {Path.GetFileName(p[1])}: 'reloading' sent to every peer; loading 3 s");
+                                await Task.Delay(3000, hard.Token);
+                                var nw = Load(p[1], p.Length > 2 ? p[2] : null);
+                                if (!parent.ContainsKey(nw.Md5)) parent[nw.Md5] = null;
+                                head = nw.Md5;
+                                world = nw;
+                                loading = false;
+                                await Announce();
+                                Say($"{p[0].ToUpperInvariant()} done: world {nw.Label} tag={Tag(nw)} player={nw.Player} md5={nw.Md5[..8]} branch depth {Branch().Count}; announced");
+                                break;
+                            }
+                            case "mode":
+                                shared = p.Length > 1 && p[1] == "shared";
+                                await Announce();
+                                Say($"MODE {(shared ? "shared-world" : "separate")} announced");
+                                break;
+                            case "walk":   // WO-148: walk <vx> <vy> <secs> [vz] [ms] -- streamed every ms (default 100; WO-154: a real host ~30) on its own task
+                            {
+                                wvx = float.Parse(p[1], CultureInfo.InvariantCulture); wvy = float.Parse(p[2], CultureInfo.InvariantCulture);
+                                wvz = p.Length > 4 ? float.Parse(p[4], CultureInfo.InvariantCulture) : 0;
+                                int walkMs = p.Length > 5 ? int.Parse(p[5], CultureInfo.InvariantCulture) : 100;
+                                walkUntil = Clock.Elapsed.TotalSeconds + double.Parse(p[3], CultureInfo.InvariantCulture);
+                                int myWalk = ++walkGen;   // WO-154: a new walk replaces a running one (two loops moved the host twice as fast)
+                                Say(FormattableString.Invariant($"WALK v=({wvx:F2}, {wvy:F2}, {wvz:F2}) for {p[3]} s from ({hp[0]:F1}, {hp[1]:F1}, {hp[2]:F1})"));
+                                _ = Task.Run(async () =>
+                                {
+                                    double tw = Clock.Elapsed.TotalSeconds;   // WO-154: steps by the time that really passed (Task.Delay runs late)
+                                    while (Clock.Elapsed.TotalSeconds < walkUntil && !hard.IsCancellationRequested && myWalk == walkGen)
+                                    {
+                                        double tn = Clock.Elapsed.TotalSeconds; float dtw = (float)(tn - tw); tw = tn;
+                                        hp = [hp[0] + wvx * dtw, hp[1] + wvy * dtw, hp[2] + wvz * dtw];
+                                        float yawW = (float)Math.Atan2(-wvx, wvy);
+                                        hyaw = yawW;   // WO-154: the 1 s heartbeat keeps the heading (it sent 0: a yaw snap every second)
+                                        await W(PositionCodec.BuildPosition(hp[0], hp[1], hp[2], yawW, hostRiding, false, hostSt2, hostClaim: true));
+                                        try { await Task.Delay(walkMs, hard.Token); } catch { break; }
+                                    }
+                                    if (myWalk == walkGen) Say(FormattableString.Invariant($"WALK done at ({hp[0]:F1}, {hp[1]:F1}, {hp[2]:F1})"));
+                                });
+                                break;
+                            }
+                            case "carry":   // WO-148
+                            {
+                                if (p.Length > 2 && p[1] == "held") { carryHeld = p[2] == "on"; Say($"CARRY held heartbeat {(carryHeld ? "on" : "off")}"); break; }
+                                if (p.Length > 2 && p[1] == "auto") { carryAuto = p[2] == "on"; Say($"CARRY auto {(carryAuto ? "on" : "off")}"); break; }
+                                if (p.Length > 4 && p[1] == "refuse")
+                                {
+                                    byte rj = byte.Parse(p[2], CultureInfo.InvariantCulture);
+                                    string rt = CarryText.Refuse(rj, p[3], p[4]);
+                                    await W(new LootMsg(Protocol.CarryRefuse, 0, rt).BuildUp(Protocol.CarryUp, rj));
+                                    Say($"CARRY refuse sent to {rj}: {rt}");
+                                    break;
+                                }
+                                if (p.Length < 4 || (p[1] != "grab" && p[1] != "put")) { Say("CARRY usage: carry grab <what> <body> [x y z] | put <how> <body> [x y z] | held on|off | refuse <id> <body> <why> | auto on|off"); break; }
+                                bool grab = p[1] == "grab";
+                                float cx = p.Length > 6 ? float.Parse(p[4], CultureInfo.InvariantCulture) : hp[0];
+                                float cy = p.Length > 6 ? float.Parse(p[5], CultureInfo.InvariantCulture) : grab ? hp[1] : hp[1] + 1f;
+                                float cz = p.Length > 6 ? float.Parse(p[6], CultureInfo.InvariantCulture) : hp[2];
+                                string ctext;
+                                if (grab) { carryTok++; carryBody = p[3]; carryWhat = p[2]; ctext = CarryText.Grab(myGhost, p[2], p[3], cx, cy, cz); }
+                                else { ctext = CarryText.Put(myGhost, p[2], carryWhat ?? "dead", p[3], cx, cy, cz); carryBody = null; }
+                                byte ck = grab ? Protocol.CarryGrab : Protocol.CarryPut;
+                                for (byte g = 1; g < 8; g++) if (g != myGhost) await W(new LootMsg(ck, carryTok, ctext).BuildUp(Protocol.CarryUp, g));
+                                Say($"CARRY {Protocol.CarryKindName(ck)} tok={carryTok} sent: {ctext}");
+                                break;
+                            }
+                            case "pos":   // WO-114
+                                hp = [float.Parse(p[1], CultureInfo.InvariantCulture), float.Parse(p[2], CultureInfo.InvariantCulture), float.Parse(p[3], CultureInfo.InvariantCulture)];
+                                await W(PositionCodec.BuildPosition(hp[0], hp[1], hp[2], 0, hostRiding, false, null, hostClaim: true));
+                                Say(FormattableString.Invariant($"POS the host is now at ({hp[0]:F1}, {hp[1]:F1}, {hp[2]:F1})"));
+                                break;
+                            case "leash":   // WO-114
+                            {
+                                byte kind = p[1] switch { "warn" => Protocol.LeashKindWarn, "countdown" => Protocol.LeashKindCountdown, "cancel" => Protocol.LeashKindCancel,
+                                                          "pull" => Protocol.LeashKindPull, "config" => Protocol.LeashKindConfig, "hold" => Protocol.LeashKindHold, _ => (byte)0 };
+                                ushort arg = 0; byte sq = 0; ushort dist = 0;
+                                if (kind is Protocol.LeashKindCountdown or Protocol.LeashKindHold) arg = ushort.Parse(p[2], CultureInfo.InvariantCulture);
+                                if (kind == Protocol.LeashKindWarn) arg = 600;
+                                if (kind == Protocol.LeashKindPull)
+                                {
+                                    sq = ++leashSeq;
+                                    arg = p.Contains("fast") ? Protocol.LeashReasonFastTravel : Protocol.LeashReasonDistance;
+                                    if (p.Contains("forced")) arg |= Protocol.LeashReasonForced;   // WO-147: after the host's hold cap
+                                }
+                                if (kind == Protocol.LeashKindConfig) { sq = (byte)(p[2] == "on" ? 1 : 0); arg = ushort.Parse(p[3], CultureInfo.InvariantCulture); dist = ushort.Parse(p[4], CultureInfo.InvariantCulture); }
+                                if (kind == 0) { Say($"LEASH unknown kind {p[1]}"); break; }
+                                for (byte g = 1; g < 8; g++)
+                                    await W(new LeashCommand(kind, sq, arg, hp[0], hp[1], hp[2], dist).Build(g));
+                                Say(FormattableString.Invariant($"LEASH {Protocol.LeashKindName(kind)} seq={sq} arg={arg} host=({hp[0]:F1}, {hp[1]:F1}, {hp[2]:F1}) sent"));
+                                break;
+                            }
+                            case "sleep":   // WO-140
+                            {
+                                if (p[1] == "auto") { sleepAuto = p[2]; Say($"SLEEP auto={sleepAuto}"); break; }
+                                byte sk; uint stk; string stx; byte target = 0xFE;
+                                if (p[1] == "ask") { sk = Protocol.SleepAsk; stk = ((uint)myGhost << 16) | (++sleepN & 0xFFFF); stx = Wo140Text.Ask(p[2], myGhost, p[3] == "1"); }
+                                else if (p[1] == "answer") { sk = Protocol.SleepAnswer; stk = Convert.ToUInt32(p[2], 16); stx = Wo140Text.Answer(p[3], byte.Parse(p[4], CultureInfo.InvariantCulture)); target = byte.Parse(p[4], CultureInfo.InvariantCulture); }
+                                else if (p[1] == "begin") { sk = Protocol.SleepBegin; stk = Convert.ToUInt32(p[2], 16); stx = Wo140Text.Begin("sleep", myGhost, float.Parse(p[3], CultureInfo.InvariantCulture), p[4] == "1"); }
+                                else if (p[1] == "cancel") { sk = Protocol.SleepCancel; stk = Convert.ToUInt32(p[2], 16); stx = Wo140Text.Cancel(p[3], myGhost); }
+                                else { Say($"SLEEP unknown verb {p[1]}"); break; }
+                                if (target != 0xFE) await W(new LootMsg(sk, stk, stx).BuildUp(Protocol.SleepVoteUp, target));
+                                else for (byte g = 1; g < 8; g++) if (g != myGhost) await W(new LootMsg(sk, stk, stx).BuildUp(Protocol.SleepVoteUp, g));
+                                Say($"SLEEP {Protocol.SleepVoteName(sk)} tok=0x{stk:X8} sent: {stx}");
+                                break;
+                            }
+                            case "clock":       // WO-140: the host's clock announce
+                            case "sleeptime":   // WO-140: the host's own sleep's result
+                            {
+                                uint wt = uint.Parse(p[1], CultureInfo.InvariantCulture);
+                                var phases = p[0] == "clock" ? new[] { Protocol.TimeSkipPhaseSync } : new[] { Protocol.TimeSkipPhaseStart, Protocol.TimeSkipPhaseDone };
+                                foreach (byte ph in phases)
+                                {
+                                    var pk = new byte[3 + Protocol.TimeSkipUpPayloadLen];
+                                    pk[0] = Protocol.TimeSkipUp; BinaryPrimitives.WriteUInt16LittleEndian(pk.AsSpan(1), Protocol.TimeSkipUpPayloadLen);
+                                    pk[3] = ph; pk[4] = p[0] == "clock" ? Protocol.TimeSkipKindUnknown : Protocol.TimeSkipKindSleep;
+                                    BinaryPrimitives.WriteUInt32LittleEndian(pk.AsSpan(5), ph == Protocol.TimeSkipPhaseStart ? 0 : wt);
+                                    await W(pk);
+                                }
+                                Say($"{(p[0] == "clock" ? "CLOCK sync" : "SLEEPTIME sleep start + done")} t={wt} sent");
+                                break;
+                            }
+                            case "timeskip":   // WO-114: the host's fast travel's time skip
+                            {
+                                uint wt = uint.Parse(p[1], CultureInfo.InvariantCulture);
+                                foreach (byte ph in new[] { Protocol.TimeSkipPhaseStart, Protocol.TimeSkipPhaseDone })
+                                {
+                                    var pk = new byte[3 + Protocol.TimeSkipUpPayloadLen];
+                                    pk[0] = Protocol.TimeSkipUp; BinaryPrimitives.WriteUInt16LittleEndian(pk.AsSpan(1), Protocol.TimeSkipUpPayloadLen);
+                                    pk[3] = ph; pk[4] = Protocol.TimeSkipKindFastTravel;
+                                    BinaryPrimitives.WriteUInt32LittleEndian(pk.AsSpan(5), ph == Protocol.TimeSkipPhaseStart ? 0 : wt);
+                                    await W(pk);
+                                }
+                                Say($"TIMESKIP fast-travel start + done t={wt} sent");
+                                break;
+                            }
+                            case "w164" when p.Length >= 3 && byte.TryParse(p[1], out byte wk):   // WO-189: w164 <kind> <text> -- one W164 message to every joiner, as a host sends it
+                            {
+                                string wt = string.Join(' ', p.Skip(2));
+                                for (byte g = 1; g < 8; g++) await W(new LootMsg(wk, 0, wt).BuildUp(Protocol.W164Up, g));
+                                Say($"W164 kind {wk} '{wt}' sent");
+                                break;
+                            }
+                            case "story":   // WO-133: story objective|fingerprint|approach <text>
+                            {
+                                byte sk = p[1] switch { "fingerprint" => Protocol.StoryBeatKindFingerprint, "approach" => Protocol.StoryBeatKindApproach, _ => Protocol.StoryBeatKindObjective };
+                                var body = StoryBeat.BuildUpPayload(sk, string.Join(' ', p.Skip(2)));
+                                var sp = new byte[3 + body.Length]; sp[0] = Protocol.StoryBeatUp;
+                                BinaryPrimitives.WriteUInt16LittleEndian(sp.AsSpan(1), (ushort)body.Length); body.CopyTo(sp, 3);
+                                await W(sp);
+                                Say($"STORY {p[1]} sent ({body.Length} bytes)");
+                                break;
+                            }
+                            case "itemdrop":   // WO-134
+                            {
+                                uint did = p.Length > 7 ? uint.Parse(p[7], CultureInfo.InvariantCulture) : (uint)Random.Shared.Next(1, int.MaxValue);
+                                var dp = new byte[3 + Protocol.ItemDropUpPayloadLen]; dp[0] = Protocol.ItemDropUp;
+                                BinaryPrimitives.WriteUInt16LittleEndian(dp.AsSpan(1), (ushort)Protocol.ItemDropUpPayloadLen);
+                                BinaryPrimitives.WriteUInt32LittleEndian(dp.AsSpan(3), did);
+                                Guid.Parse(p[1]).TryWriteBytes(dp.AsSpan(7, 16));
+                                BinaryPrimitives.WriteUInt16LittleEndian(dp.AsSpan(23), ushort.Parse(p[2], CultureInfo.InvariantCulture));
+                                for (int k = 0; k < 4; k++) BinaryPrimitives.WriteSingleLittleEndian(dp.AsSpan(25 + 4 * k), float.Parse(p[3 + k], CultureInfo.InvariantCulture));
+                                await W(dp);
+                                Say($"ITEMDROP sent drop={did} class={p[1]} x{p[2]}");
+                                break;
+                            }
+                            case "itemclaim":   // WO-134
+                            {
+                                var cp = new byte[3 + Protocol.ItemClaimUpPayloadLen]; cp[0] = Protocol.ItemClaimUp;
+                                BinaryPrimitives.WriteUInt16LittleEndian(cp.AsSpan(1), (ushort)Protocol.ItemClaimUpPayloadLen);
+                                BinaryPrimitives.WriteUInt32LittleEndian(cp.AsSpan(3), uint.Parse(p[1], CultureInfo.InvariantCulture));
+                                await W(cp);
+                                Say($"ITEMCLAIM sent drop={p[1]}");
+                                break;
+                            }
+                            case "npc":   // WO-134: npc <name> <x> <y> <z> <yaw> <hp> <flags> [secs]
+                            {
+                                string nm = p[1];
+                                float nx = float.Parse(p[2], CultureInfo.InvariantCulture), ny = float.Parse(p[3], CultureInfo.InvariantCulture), nz = float.Parse(p[4], CultureInfo.InvariantCulture);
+                                float nyaw = float.Parse(p[5], CultureInfo.InvariantCulture), nhp = float.Parse(p[6], CultureInfo.InvariantCulture);
+                                byte nfl = byte.Parse(p[7], CultureInfo.InvariantCulture);
+                                double secs = p.Length > 8 ? double.Parse(p[8], CultureInfo.InvariantCulture) : 30;
+                                bool running = npcFlags.ContainsKey(nm);
+                                npcFlags[nm] = nfl;
+                                npcHp[nm] = nhp;
+                                if (!running) _ = Task.Run(async () =>
+                                {
+                                    ushort nseq = 0; var t0 = Clock.Elapsed.TotalSeconds; double tl = t0;
+                                    float cx = nx, cy = ny, cz = nz;
+                                    while (Clock.Elapsed.TotalSeconds - t0 < secs && !hard.IsCancellationRequested)
+                                    {
+                                        double tn = Clock.Elapsed.TotalSeconds; float dt = (float)(tn - tl); tl = tn;
+                                        if (npcVel.TryGetValue(nm, out var v)) { cx += v.Vx * dt; cy += v.Vy * dt; cz += v.Vz * dt; }
+                                        float yaw2 = npcVel.TryGetValue(nm, out var v2) && (v2.Vx != 0 || v2.Vy != 0) ? MathF.Atan2(-v2.Vx, v2.Vy) : nyaw;
+                                        if (!npcQuiet) await W(P.BuildUp(nm, cx, cy, cz, yaw2, npcHp.GetValueOrDefault(nm, nhp), npcFlags.GetValueOrDefault(nm, nfl), ++nseq, (uint)Clock.ElapsedMilliseconds));
+                                        await Task.Delay(npcVel.ContainsKey(nm) ? 100 : 200);
+                                    }
+                                    npcFlags.TryRemove(nm, out _);
+                                    npcHp.TryRemove(nm, out _);
+                                });
+                                Say($"NPC {nm} streamed at {p[2]},{p[3]},{p[4]} hp={p[6]} flags={p[7]} for {secs} s");
+                                break;
+                            }
+                            case "pause":   // WO-138: pause <hex> -- a PauseUp with that state byte
+                            {
+                                byte stt = Convert.ToByte(p[1], 16);
+                                await W([Protocol.PauseUp, 1, 0, stt]);
+                                Say($"PAUSE sent state=0x{stt:X2}");
+                                break;
+                            }
+                            case "npcquiet":   // WO-138
+                                npcQuiet = p.Length > 1 && p[1] == "on";
+                                Say($"NPCQUIET {(npcQuiet ? "on: the npc streams are silent" : "off: the npc streams send again")}");
+                                break;
+                            case "linkquiet":   // WO-138
+                                linkQuiet = p.Length > 1 && p[1] == "on";
+                                Say($"LINKQUIET {(linkQuiet ? "on: nothing goes out" : "off")}");
+                                break;
+                            case "hstate":   // WO-135/136: hstate crouch=0|1 torch=0|1 combat=0|1 -- the host's state block rides its position packets (1 s heartbeat)
+                            {
+                                var bits = hostSt2?.Bits ?? BodyState2Bits.None;
+                                foreach (var kv in p.Skip(1))
+                                {
+                                    var q = kv.Split('='); if (q.Length != 2) continue;
+                                    var b = q[0] switch { "crouch" => BodyState2Bits.Crouched, "torch" => BodyState2Bits.TorchLit, "combat" => BodyState2Bits.CombatMode, "downed" => BodyState2Bits.Downed, _ => BodyState2Bits.None };
+                                    bits = q[1] == "1" ? bits | b : bits & ~b;
+                                }
+                                hostSt2 = new BodyState2(0, 0, bits, WireZone.Undefined, WireGuardStance.None, WireZone.Undefined, 0, 0, 0);
+                                await W(PositionCodec.BuildPosition(hp[0], hp[1], hp[2], 0, hostRiding, false, hostSt2, hostClaim: true));
+                                Say($"HSTATE bits={bits}");
+                                break;
+                            }
+                            case "npcmove":   // WO-136: npcmove <name> <vx> <vy> [vz]
+                                npcVel[p[1]] = (float.Parse(p[2], CultureInfo.InvariantCulture), float.Parse(p[3], CultureInfo.InvariantCulture),
+                                                p.Length > 4 ? float.Parse(p[4], CultureInfo.InvariantCulture) : 0f);
+                                Say($"NPCMOVE {p[1]} v=({p[2]},{p[3]})");
+                                break;
+                            case "npchit":   // WO-147: npchit <name> <hp> <st> [fatal] -- the host's own blow on its NPC (0x30), as a host sends it
+                            {
+                                var nhb = System.Text.Encoding.UTF8.GetBytes(p[1]);
+                                var pk = new byte[3 + 1 + nhb.Length + Protocol.NpcDamageFixedTail];
+                                pk[0] = Protocol.NpcDamageUp;
+                                BinaryPrimitives.WriteUInt16LittleEndian(pk.AsSpan(1), (ushort)(1 + nhb.Length + Protocol.NpcDamageFixedTail));
+                                pk[3] = (byte)nhb.Length; nhb.CopyTo(pk, 4);
+                                int o = 4 + nhb.Length;
+                                BinaryPrimitives.WriteSingleLittleEndian(pk.AsSpan(o), float.Parse(p[3], CultureInfo.InvariantCulture));
+                                BinaryPrimitives.WriteSingleLittleEndian(pk.AsSpan(o + 4), float.Parse(p[2], CultureInfo.InvariantCulture));
+                                pk[o + 8] = (byte)(Protocol.DamageFlagSuppressHitReaction | (p.Length > 4 && p[4] == "fatal" ? Protocol.NpcDamageFlagFatal : 0));
+                                await W(pk);
+                                Say($"NPCHIT {p[1]} hp={p[2]} st={p[3]}{(p.Length > 4 && p[4] == "fatal" ? " FATAL" : "")} sent (the host's own blow)");
+                                break;
+                            }
+                            case "npcrow":   // WO-136: npcrow <name> <rowGuid>
+                                await W(actOut.Build(ActionKind.NpcAttack, ActionPhase.Commit, new RowEvent((uint)Clock.ElapsedMilliseconds, 0, Guid.Parse(p[2]), p[1]).ToBytes()));
+                                Say($"NPCROW {p[1]} row={p[2]}");
+                                break;
+                            case "npcreact":   // WO-151: npcreact <name> <rowGuid> -- the host NPC's hit reaction (NpcHit)
+                                await W(actOut.Build(ActionKind.NpcHit, ActionPhase.Commit, new RowEvent((uint)Clock.ElapsedMilliseconds, 0, Guid.Parse(p[2]), p[1]).ToBytes()));
+                                Say($"NPCREACT {p[1]} row={p[2]}");
+                                break;
+                            case "weather":   // WO-151 3.7: weather <profile> [blendSec] -- the host's weather (WeatherUp 0x2E)
+                            {
+                                var wn = Encoding.UTF8.GetBytes(p[1]);
+                                ushort wb = p.Length > 2 ? ushort.Parse(p[2], CultureInfo.InvariantCulture) : (ushort)30;
+                                var wp = new byte[3 + 1 + wn.Length + 2]; wp[0] = Protocol.WeatherUp;
+                                BinaryPrimitives.WriteUInt16LittleEndian(wp.AsSpan(1), (ushort)(1 + wn.Length + 2));
+                                wp[3] = (byte)wn.Length; wn.CopyTo(wp, 4);
+                                BinaryPrimitives.WriteUInt16LittleEndian(wp.AsSpan(4 + wn.Length), wb);
+                                await W(wp);
+                                Say($"WEATHER {p[1]} blend={wb}s");
+                                break;
+                            }
+                            case "emote":   // WO-151 3.5: emote whistle -- the host whistles (Emote [ms][1])
+                            {
+                                var eb = new byte[EmoteId.PayloadLen];
+                                BinaryPrimitives.WriteUInt32LittleEndian(eb, (uint)Clock.ElapsedMilliseconds);
+                                eb[4] = EmoteId.Whistle;
+                                await W(actOut.Build(ActionKind.Emote, ActionPhase.Commit, eb));
+                                Say("EMOTE whistle");
+                                break;
+                            }
+                            case "door":   // WO-151 3.9: door <name> <dir -1|1> <locked 0|1> <x> <y> <z> -- a door of the host's world (DoorState)
+                            {
+                                var dev = new DoorEvent((uint)Clock.ElapsedMilliseconds, sbyte.Parse(p[2], CultureInfo.InvariantCulture), p[3] == "1" ? DoorEvent.FlagLocked : (byte)0,
+                                    float.Parse(p[4], CultureInfo.InvariantCulture), float.Parse(p[5], CultureInfo.InvariantCulture), float.Parse(p[6], CultureInfo.InvariantCulture), p[1]);
+                                await W(actOut.Build(ActionKind.DoorState, ActionPhase.Commit, dev.ToBytes()));
+                                Say($"DOOR {dev}");
+                                break;
+                            }
+                            case "vitals":   // WO-154: vitals <hp> <st> [knockeddown|downed] -- the host's own PlayerState (0x1F), now and every 2 s
+                            {
+                                vitHp = float.Parse(p[1], CultureInfo.InvariantCulture); vitSt = float.Parse(p[2], CultureInfo.InvariantCulture);
+                                vitFlags = p.Length > 3 && p[3] == "knockeddown" ? (byte)(Protocol.PlayerStateFlagUnconscious | Protocol.PlayerStateFlagKnockedDown)
+                                         : p.Length > 3 && p[3] == "downed" ? Protocol.PlayerStateFlagUnconscious : (byte)0;
+                                await W(VitalsPacket(vitHp, vitSt, vitFlags));
+                                Say(FormattableString.Invariant($"VITALS hp={vitHp} st={vitSt} flags=0x{vitFlags:X2}"));
+                                break;
+                            }
+                            case "phit":   // WO-155: phit <hp> <st> [joinerId=1] -- the host's NPC blow on the joiner (PlayerHitUp 0x21 -> the joiner's 0x22)
+                            {
+                                byte tgt = p.Length > 3 ? byte.Parse(p[3], CultureInfo.InvariantCulture) : (byte)1;
+                                var hp9 = new byte[3 + Protocol.PlayerHitUpPayloadLen]; hp9[0] = Protocol.PlayerHitUp;
+                                BinaryPrimitives.WriteUInt16LittleEndian(hp9.AsSpan(1), (ushort)Protocol.PlayerHitUpPayloadLen);
+                                hp9[3] = tgt;
+                                BinaryPrimitives.WriteSingleLittleEndian(hp9.AsSpan(4), float.Parse(p[1], CultureInfo.InvariantCulture));
+                                BinaryPrimitives.WriteSingleLittleEndian(hp9.AsSpan(8), float.Parse(p[2], CultureInfo.InvariantCulture));
+                                hp9[12] = 0;
+                                await W(hp9);
+                                Say($"PHIT hp={p[1]} st={p[2]} -> ghost {tgt} (an NPC blow of the host's world)");
+                                break;
+                            }
+                            case "hverdict":   // WO-161: hverdict <hit|blocked|parried|missed> <hp> <st> <npc|-> [swing=0] [joinerId=1] [hitId=auto]
+                            {
+                                var verdict = p[1] switch { "hit" => HitVerdict.Hit, "blocked" => HitVerdict.Blocked, "parried" => HitVerdict.Parried, "missed" => HitVerdict.Missed, _ => throw new FormatException("verdict: hit|blocked|parried|missed") };
+                                string vnpc = p[4] == "-" ? "" : p[4];
+                                uint vswing = p.Length > 5 ? uint.Parse(p[5], CultureInfo.InvariantCulture) : 0u;
+                                byte vtgt = p.Length > 6 ? byte.Parse(p[6], CultureInfo.InvariantCulture) : (byte)1;
+                                uint vid = p.Length > 7 ? uint.Parse(p[7], CultureInfo.InvariantCulture) : ++_hitVerdictId;
+                                byte vflags = (byte)((vswing != 0 ? Protocol.HitFlagSwingKnown : 0) | (vnpc.Length == 0 ? Protocol.HitFlagNoAttacker : 0));
+                                await W(new HitVerdictMsg(vid, verdict, vflags, 0, vswing, float.Parse(p[2], CultureInfo.InvariantCulture), float.Parse(p[3], CultureInfo.InvariantCulture), vnpc).BuildUp(vtgt));
+                                Say($"HVERDICT id={vid} {p[1]} hp={p[2]} st={p[3]} npc={(vnpc.Length == 0 ? "-" : vnpc)} swing={vswing} -> ghost {vtgt}");
+                                break;
+                            }
+                            case "ffhit":   // WO-155: ffhit <hp> <st> [unarmed] [joinerId=1] -- the host's friendly-fire hit on the joiner (PlayerHitV8Up 0x44 -> 0x45)
+                            {
+                                bool unarmed = p.Length > 3 && p[3] == "unarmed";
+                                byte tg2 = p.Length > 4 ? byte.Parse(p[4], CultureInfo.InvariantCulture) : (byte)1;
+                                await W(new PlayerHitV8(tg2, float.Parse(p[2], CultureInfo.InvariantCulture), float.Parse(p[1], CultureInfo.InvariantCulture),
+                                                        (byte)(unarmed ? PlayerHitV8.FlagUnarmed : 0), 0).BuildUp());
+                                Say($"FFHIT hp={p[1]} st={p[2]} unarmed={(unarmed ? 1 : 0)} -> ghost {tg2} (friendly fire)");
+                                break;
+                            }
+                            case "death":   // WO-155: the host dies (PlayerDeathUp 0x23: every other client's 0x24); pair with vitals <hp> <st> downed
+                            {
+                                await W([Protocol.PlayerDeathUp, 0, 0]);
+                                Say("DEATH sent (PlayerDeathUp)");
+                                break;
+                            }
+                            case "setting":   // WO-154: setting ff|crime|ft 0|1 -- the host's session lever (SessionSetting), as a real host sends it
+                            {
+                                byte key = p[1] switch { "ff" => SessionSettingKey.FriendlyFire, "crime" => SessionSettingKey.CrimeMode, "ft" => SessionSettingKey.FastTravel, _ => (byte)0 };
+                                if (key == 0 || p.Length < 3) { Say("SETTING usage: setting ff|crime|ft 0|1"); break; }
+                                byte val = p[2] == "1" ? (byte)1 : (byte)0;
+                                await W(actOut.Build(ActionKind.SessionSetting, ActionPhase.Commit, [key, val]));
+                                Say($"SETTING {SessionSettingKey.Name(key)}={val} sent");
+                                break;
+                            }
+                            case "ride":   // WO-151: ride <horse>|off -- the host rides (HorseInfo + the riding flag)
+                            {
+                                string hn = p.Length > 1 && p[1] != "off" ? p[1] : "-";
+                                hostRiding = hn != "-";
+                                var hnb = Encoding.UTF8.GetBytes(hn);
+                                var hip = new byte[3 + 1 + hnb.Length]; hip[0] = Protocol.HorseInfoUp;
+                                BinaryPrimitives.WriteUInt16LittleEndian(hip.AsSpan(1), (ushort)(1 + hnb.Length));
+                                hip[3] = (byte)hnb.Length; hnb.CopyTo(hip, 4);
+                                await W(hip);
+                                await W(PositionCodec.BuildPosition(hp[0], hp[1], hp[2], 0, hostRiding, false, hostSt2, hostClaim: true));
+                                Say($"RIDE {(hostRiding ? hn : "off")} (HorseInfo + the riding flag)");
+                                break;
+                            }
+                            case "npccombat":   // WO-136: npccombat <name> on|off [host|avatar:N|none] [gz]
+                            {
+                                bool on = p[2] == "on";
+                                var tg = p.Length > 3 && p[3].StartsWith("avatar:", StringComparison.Ordinal) ? NpcCombatTarget.Avatar
+                                       : p.Length > 3 && p[3] == "none" ? NpcCombatTarget.None : NpcCombatTarget.Host;
+                                byte tgh = tg == NpcCombatTarget.Avatar ? byte.Parse(p[3][7..], CultureInfo.InvariantCulture) : (byte)0;
+                                var gz = p.Length > 4 ? (WireZone)byte.Parse(p[4], CultureInfo.InvariantCulture) : WireZone.UpperRight;
+                                var ev = new NpcCombatEvent((uint)Clock.ElapsedMilliseconds,
+                                    new BodyState2(0, 0, on ? BodyState2Bits.CombatMode | BodyState2Bits.Locked : BodyState2Bits.None, gz, WireGuardStance.Left, gz, 0, 0, 0),
+                                    on ? tg : NpcCombatTarget.None, tgh, p[1]);
+                                await W(actOut.Build(ActionKind.NpcCombat, ActionPhase.Commit, ev.ToBytes()));
+                                if (on && !npcCombatOn.ContainsKey(p[1]))
+                                {
+                                    npcCombatOn[p[1]] = ev;
+                                    string cn = p[1];
+                                    _ = Task.Run(async () =>
+                                    {
+                                        while (npcCombatOn.TryGetValue(cn, out var e) && !hard.IsCancellationRequested)
+                                        {
+                                            await Task.Delay(1000);
+                                            if (!npcCombatOn.TryGetValue(cn, out e)) break;
+                                            await W(actOut.Build(ActionKind.NpcCombat, ActionPhase.Commit, (e with { SenderMs = (uint)Clock.ElapsedMilliseconds }).ToBytes()));
+                                        }
+                                    });
+                                }
+                                else if (on) npcCombatOn[p[1]] = ev;
+                                else npcCombatOn.TryRemove(p[1], out _);
+                                Say($"NPCCOMBAT {p[1]} {(on ? "on" : "off")} target={tg}{(tg == NpcCombatTarget.Avatar ? ":" + tgh : "")}");
+                                break;
+                            }
+                            case "appearance":   // WO-136: appearance <guid,...> -- the host's outfit
+                            {
+                                var gs = p[1].Split(',', StringSplitOptions.RemoveEmptyEntries);
+                                var ap = new byte[3 + 1 + gs.Length * 16]; ap[0] = Protocol.AppearanceUp;
+                                BinaryPrimitives.WriteUInt16LittleEndian(ap.AsSpan(1), (ushort)(1 + gs.Length * 16));
+                                ap[3] = (byte)gs.Length;
+                                for (int gi = 0; gi < gs.Length; gi++) Guid.Parse(gs[gi]).ToByteArray().CopyTo(ap, 4 + gi * 16);
+                                await W(ap);
+                                Say($"APPEARANCE sent ({gs.Length} classes)");
+                                break;
+                            }
+                            case "quest":   // WO-137
+                            {
+                                string rest = string.Join(' ', p.Skip(2));
+                                switch (p[1])
+                                {
+                                    case "change":
+                                    {
+                                        string text = $"{++qseq} {rest}";
+                                        if (!Wo137Rules.TryParseChangeText(text, out var qc)) { Say($"QUEST change refused (malformed): {rest}"); break; }
+                                        qstate[qc.Path] = (qc.New, qc.Port, qc.QuestLen);
+                                        for (byte g = 1; g < 8; g++) await W(new LootMsg(Protocol.QuestHostChange, 0, text).BuildUp(Protocol.QuestHostUp, g));
+                                        Say($"QUEST change #{qseq} sent: {text}");
+                                        break;
+                                    }
+                                    case "mode":
+                                    case "hold":
+                                    {
+                                        byte k = p[1] == "mode" ? Protocol.QuestHostMode : Protocol.QuestHostHold;
+                                        for (byte g = 1; g < 8; g++) await W(new LootMsg(k, 0, rest).BuildUp(Protocol.QuestHostUp, g));
+                                        Say($"QUEST {p[1]} sent: {rest}");
+                                        break;
+                                    }
+                                    case "result":
+                                    {
+                                        uint tk = uint.Parse(p[2], CultureInfo.InvariantCulture);
+                                        string text = string.Join(' ', p.Skip(3));
+                                        for (byte g = 1; g < 8; g++) await W(new LootMsg(Protocol.QuestHostResult, tk, text).BuildUp(Protocol.QuestHostUp, g));
+                                        Say($"QUEST result tok={tk} sent: {text}");
+                                        break;
+                                    }
+                                    case "checkpoint":
+                                        foreach (var t in Wo137Rules.CheckpointTexts(qstate.Select(kv => new Wo137Rules.CheckpointEntry(kv.Key, kv.Value.Val, kv.Value.Port)).ToList()))
+                                            for (byte g = 1; g < 8; g++) await W(new LootMsg(Protocol.QuestHostCheckpoint, 0, t).BuildUp(Protocol.QuestHostUp, g));
+                                        Say($"QUEST checkpoint of {qstate.Count} State(s) sent");
+                                        break;
+                                    case "auto":
+                                        qauto = p.Length > 2 && p[2] == "on";
+                                        Say($"QUEST auto {(qauto ? "on" : "off")}");
+                                        break;
+                                    case "set":
+                                        qstate[p[2]] = (int.Parse(p[3], CultureInfo.InvariantCulture), p[4] == "-" ? "" : p[4], p[2].IndexOf(".h.", StringComparison.Ordinal) is int hi and > 0 ? hi : 0);
+                                        Say($"QUEST set {p[2]} = {p[3]} ({p[4]})");
+                                        break;
+                                    default:
+                                        Say($"QUEST unknown verb {p[1]}");
+                                        break;
+                                }
+                                break;
+                            }
+                            case "activity":   // WO-141
+                            {
+                                if (p.Length < 3) { Say("ACTIVITY usage: activity npc <name> ... | activity player ..."); break; }
+                                bool npcRow = p[1] == "npc";
+                                int at = npcRow ? 3 : 2;
+                                string aname = npcRow ? p[2] : "";
+                                var act = ActivityState.None;
+                                for (int i = at; i < p.Length; )
+                                {
+                                    if (i < p.Length && p[i] == "none") { i++; continue; }
+                                    if (i + 2 < p.Length && p[i] == "stance")
+                                    { act = act with { Stance = byte.Parse(p[i + 1], CultureInfo.InvariantCulture), StanceObj = ulong.Parse(p[i + 2], NumberStyles.HexNumber, CultureInfo.InvariantCulture) }; i += 3; continue; }
+                                    if (i + 2 < p.Length && p[i] == "unstance")
+                                    { act = act with { Unstance = ushort.Parse(p[i + 1], CultureInfo.InvariantCulture), UnstanceObj = ulong.Parse(p[i + 2], NumberStyles.HexNumber, CultureInfo.InvariantCulture) }; i += 3; continue; }
+                                    if (i + 2 < p.Length && p[i] == "minigame")   // WO-143: the player's minigame (C_MinigameElement type, its object)
+                                    { act = act with { Minigame = byte.Parse(p[i + 1], CultureInfo.InvariantCulture), MinigameObj = ulong.Parse(p[i + 2], NumberStyles.HexNumber, CultureInfo.InvariantCulture) }; i += 3; continue; }
+                                    break;
+                                }
+                                act = act.Normalised();
+                                var arow = new List<ActivityRow> { new(npcRow ? Protocol.ActivityPeerNone : myGhost, aname, act) };
+                                for (byte g = 1; g < 8; g++) if (g != myGhost) await W(ActivityCodec.BuildUp(Protocol.ActivityHostUp, g, npcRow ? Protocol.ActivityKindNpc : Protocol.ActivityKindPlayer, arow));
+                                Say($"ACTIVITY {(npcRow ? "npc " + aname : "player")} sent: {act}");
+                                break;
+                            }
+                            case "activityfile":   // WO-141: a recorded ActivityHost stream, in order, with its spacing (WO-143: + ActivityExtra 6F)
+                            {
+                                var alines = File.ReadAllLines(string.Join(' ', p.Skip(1)));
+                                long prevMs = -1; int sent = 0, extra = 0;
+                                foreach (var aline in alines)
+                                {
+                                    var q = aline.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                                    if (q.Length < 3 || (q[1] != "6B" && q[1] != "6F")) continue;
+                                    long ms = long.Parse(q[0], CultureInfo.InvariantCulture);
+                                    var pay = Convert.FromHexString(q[2]);   // [src][target][joinId:4][body]
+                                    if (pay.Length < 1 + Protocol.JoinHeaderLen) continue;
+                                    if (prevMs >= 0 && ms > prevMs) await Task.Delay((int)Math.Min(ms - prevMs, 5000));
+                                    prevMs = ms;
+                                    var body2 = pay.AsSpan(1 + Protocol.JoinHeaderLen).ToArray();
+                                    byte up = q[1] == "6B" ? Protocol.ActivityHostUp : Protocol.ActivityExtraUp;
+                                    for (byte g = 1; g < 8; g++) if (g != myGhost) await W(Protocol.BuildJoinUp(up, g, 0, body2));
+                                    if (up == Protocol.ActivityExtraUp) extra++; else sent++;
+                                }
+                                Say($"ACTIVITYFILE {sent} recorded ActivityHost and {extra} ActivityExtra message(s) replayed");
+                                break;
+                            }
+                            case "extra":   // WO-143: extra hands <npc> <left|-> <right|-> | gaits <npc> <maskHex> | shot <npc> <frag> <tags|-> <alignGuidHex> [flags] | look <npc> <kind> [target]
+                            {
+                                if (p.Length < 3) { Say("EXTRA usage: extra hands|gaits|shot|look <npc> ..."); break; }
+                                byte ek = 0; ExtraRow er = new();
+                                switch (p[1])
+                                {
+                                    case "hands" when p.Length >= 5:
+                                        ek = Protocol.ExtraKindHands;
+                                        er = new ExtraRow { Name = p[2], Left = p[3] == "-" ? new byte[16] : ExtraRow.ClassBytes(p[3]), Right = p[4] == "-" ? new byte[16] : ExtraRow.ClassBytes(p[4]) };
+                                        break;
+                                    case "gaits" when p.Length >= 4:
+                                        ek = Protocol.ExtraKindGaits;
+                                        er = new ExtraRow { Name = p[2], Gaits = ushort.Parse(p[3], NumberStyles.HexNumber, CultureInfo.InvariantCulture) };
+                                        break;
+                                    case "shot" when p.Length >= 6:
+                                        ek = Protocol.ExtraKindOneShot;
+                                        er = new ExtraRow { Name = p[2], Fragment = p[3], Tags = p[4] == "-" ? "" : p[4], AlignGuid = ulong.Parse(p[5], NumberStyles.HexNumber, CultureInfo.InvariantCulture),
+                                                            Flags = p.Length > 6 ? byte.Parse(p[6], CultureInfo.InvariantCulture) : (byte)0 };
+                                        break;
+                                    case "look" when p.Length >= 4:
+                                        ek = Protocol.ExtraKindLooks;
+                                        er = new ExtraRow { Name = p[2], TargetKind = byte.Parse(p[3], CultureInfo.InvariantCulture), Target = p.Length > 4 ? p[4] : "" };
+                                        break;
+                                }
+                                if (ek == 0) { Say($"EXTRA unknown or incomplete: {string.Join(' ', p)}"); break; }
+                                for (byte g = 1; g < 8; g++) if (g != myGhost) await W(ExtraCodec.BuildUp(g, ek, new List<ExtraRow> { er }));
+                                Say($"EXTRA {p[1]} {p[2]} sent");
+                                break;
+                            }
+                            case "crime":   // WO-139
+                            {
+                                byte ck = p[1] switch
+                                {
+                                    "stop" => Protocol.CrimeHostStop, "judged" => Protocol.CrimeHostJudged, "pursue" => Protocol.CrimeHostPursue,
+                                    "mode" => Protocol.CrimeHostMode, "cleared" => Protocol.CrimeHostCleared, "horses" => Protocol.CrimeHostHorses,
+                                    "record" => Protocol.CrimeHostRecord, _ => (byte)0,
+                                };
+                                if (ck == 0) { Say($"CRIME unknown verb {p[1]}"); break; }
+                                uint ctk = 0;
+                                string ctext;
+                                if (ck is Protocol.CrimeHostStop or Protocol.CrimeHostJudged) { ctk = uint.Parse(p[2], CultureInfo.InvariantCulture); ctext = string.Join(' ', p.Skip(3)); }
+                                else if (ck == Protocol.CrimeHostHorses) ctext = $"1 1 {(p.Length > 2 ? p[2] : "-")}";
+                                else ctext = string.Join(' ', p.Skip(2));
+                                for (byte g = 1; g < 8; g++) await W(new LootMsg(ck, ctk, ctext).BuildUp(Protocol.CrimeHostUp, g));
+                                Say($"CRIME {Protocol.CrimeHostName(ck)} tok={ctk} sent: {ctext}");
+                                break;
+                            }
+                            case "questfile":   // WO-137: replay a recorded host change stream, renumbered, in order
+                            {
+                                int n = 0, bad = 0;
+                                foreach (var raw in File.ReadAllLines(p[1]))
+                                {
+                                    var q = raw.Trim();
+                                    if (q.Length == 0 || q.StartsWith('#')) continue;
+                                    var f5 = q.Split(' ', 2);
+                                    string text = $"{++qseq} {(f5.Length > 1 ? f5[1] : "")}";
+                                    if (!Wo137Rules.TryParseChangeText(text, out var qc)) { bad++; qseq--; continue; }
+                                    qstate[qc.Path] = (qc.New, qc.Port, qc.QuestLen);
+                                    for (byte g = 1; g < 8; g++) await W(new LootMsg(Protocol.QuestHostChange, 0, text).BuildUp(Protocol.QuestHostUp, g));
+                                    n++;
+                                    await Task.Delay(10, hard.Token);
+                                }
+                                Say($"QUESTFILE {Path.GetFileName(p[1])}: {n} recorded host change(s) replayed as #{qseq - n + 1}..#{qseq}{(bad > 0 ? $", {bad} malformed skipped" : "")}");
+                                break;
+                            }
+                            case "npcflags":   // WO-135: npcflags <name> <flags> -- a running npc stream's flags (2 = knocked out, 0 = up, 1 = dead)
+                                npcFlags[p[1]] = byte.Parse(p[2], CultureInfo.InvariantCulture);
+                                Say($"NPCFLAGS {p[1]} = {p[2]}");
+                                break;
+                            case "build":   // WO-135: build <BuildInfo> -- the host world's game build, to every joiner every 10 s
+                                hostBuild = p[1];
+                                _ = Task.Run(async () =>
+                                {
+                                    string mine = p[1];
+                                    while (hostBuild == mine && !hard.IsCancellationRequested)
+                                    {
+                                        for (byte g = 1; g < 8; g++) await W(new LootMsg(Protocol.LootHostBuild, 0, mine).BuildUp(Protocol.LootHostUp, g));
+                                        await Task.Delay(10_000);
+                                    }
+                                });
+                                Say($"BUILD {p[1]} announced to every joiner");
+                                break;
+                            case "bodyset":   // WO-134
+                                bodies[p[1]] = Wo134Rules.ParseItems(p.Length > 2 ? p[2] : "-") ?? [];
+                                Say($"BODY {p[1]} = {bodies[p[1]].Count} item(s)");
+                                break;
+                            case "bodypush":   // WO-134
+                            {
+                                var items = bodies.GetValueOrDefault(p[1]) ?? [];
+                                for (byte g = 1; g < 8; g++)
+                                    await W(new LootMsg(Protocol.LootHostBodyState, 0, $"{p[1]} update 1 1 1 {Wo134Rules.FormatItems(items)}").BuildUp(Protocol.LootHostUp, g));
+                                Say($"BODYPUSH {p[1]} ({items.Count} item(s)) to every joiner");
+                                break;
+                            }
+                            case "witem":
+                            case "witemtaken":   // WO-134
+                                witems.Add((Guid.Parse(p[1]), float.Parse(p[2], CultureInfo.InvariantCulture), float.Parse(p[3], CultureInfo.InvariantCulture), float.Parse(p[4], CultureInfo.InvariantCulture), p[0] == "witemtaken"));
+                                Say($"WITEM {p[1]} at {p[2]},{p[3]},{p[4]} taken={p[0] == "witemtaken"}");
+                                break;
+                            case "itemgone":   // WO-134
+                                for (byte g = 1; g < 8; g++)
+                                    await W(new LootMsg(Protocol.LootHostItemGone, 0, $"{p[1]} {p[2]} {p[3]} {p[4]}").BuildUp(Protocol.LootHostUp, g));
+                                Say($"ITEMGONE {p[1]} at {p[2]},{p[3]},{p[4]} to every joiner");
+                                break;
+                            case "ledger":   // WO-134
+                            {
+                                ledger = new Wo134Rules.Ledger();
+                                if (p.Length > 1 && p[1] != "-")
+                                    foreach (var r in p[1].Split(';')) if (Wo134Rules.ParseRow(r) is { } e) ledger.Entries.Add(e);
+                                Say($"LEDGER {ledger.Entries.Count} entries");
+                                break;
+                            }
+                            case "ledgersend":   // WO-134
+                                for (byte g = 1; g < 8; g++)
+                                    foreach (var lp in Wo134Rules.LedgerParts(ledger)) await W(new LootMsg(Protocol.LootHostLedger, 0, lp).BuildUp(Protocol.LootHostUp, g));
+                                Say($"LEDGERSEND {ledger.Entries.Count} entries to every joiner");
+                                break;
+                            case "leave":
+                                Say("LEAVE: disconnecting -- the joiner must leave the host's world");
+                                tcp.Close();
+                                hard.Cancel();
+                                return;
+                        }
+                    }
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException) { Say($"control line {done + 1} failed: {ex.Message}"); done++; }
+                try { await Task.Delay(500, hard.Token); } catch { return; }
+            }
+        });
+        // joins, one at a time
+        _ = Task.Run(async () =>
+        {
+            await foreach (var (joiner, joinId) in joinQ.Reader.ReadAllAsync(hard.Token))
+            {
+                while (loading) await Task.Delay(500, hard.Token);   // a real host defers a join through its load
+                var w0 = world;
+                if (!shared) { await W(JoinStatusCodec.Build(joiner, joinId, Protocol.JoinStateRefused, Protocol.JoinReasonId("shared-world-off"), 0)); Say("refused: shared-world-off"); continue; }
+                if (!w0.Henry)
+                {
+                    await W(JoinStatusCodec.Build(joiner, joinId, Protocol.JoinStateRefused, Protocol.JoinReasonId("not-henry"), 0));
+                    Say($"JOIN 0x{joinId:x8} refused: this world's player is not Henry ({w0.Player}) -- NOT paused");
+                    continue;
+                }
+                double tr = Clock.Elapsed.TotalSeconds;
+                await W(JoinStatusCodec.Build(joiner, joinId, Protocol.JoinStatePaused, 0, 0));
+                await W(JoinStatusCodec.Build(joiner, joinId, Protocol.JoinStateSaving, 0, 0));
+                Say($"JOIN 0x{joinId:x8} from {joiner}: 'paused' (synthetic); serving {w0.Label} md5={w0.Md5[..8]} (the join save = the current world)");
+                var tx = new WorldSender(w0.Bytes, joinId, joiner, seq, Convert.FromHexString(w0.Md5));
+                await W(JoinStatusCodec.Build(joiner, joinId, Protocol.JoinStateSending, 0, 0));
+                var br = Branch(); br.Reverse();
+                for (int i = 0; i < br.Count; i++)
+                {
+                    var id = names.TryGetValue(br[i], out var x) ? x : (Protocol.SaveKindAuto, (byte)1, (ushort)0);
+                    await W(WsPacket(new WorldSaved((uint)br.Count, i, (byte)(Protocol.SaveKindBranchFlag | id.Item1), id.Item2, id.Item3, Convert.FromHexString(br[i]))));
+                }
+                Say($"JOIN 0x{joinId:x8}: branch replayed ({br.Count}, newest {br[^1][..8]})");
+                await W(tx.BuildOfferPacket());
+                bool done = false; double tDone = 0; string end = "";
+                while (end == "")
+                {
+                    foreach (var pkt in tx.TakeSendable()) await W(pkt);
+                    var rt = joinMsgs.Reader.ReadAsync(hard.Token).AsTask();
+                    double left = done ? 300 - (Clock.Elapsed.TotalSeconds - tDone) : 60;
+                    if (await Task.WhenAny(rt, Task.Delay(TimeSpan.FromSeconds(Math.Max(1, left)), hard.Token)) != rt)
+                    { await W(WorldReceiver.BuildAbort(joiner, joinId, Protocol.JoinAbortTimeout)); end = "timeout"; break; }
+                    var (ty, body) = await rt;
+                    switch (ty)
+                    {
+                        case Protocol.WorldAckDown: tx.OnAck(BinaryPrimitives.ReadUInt32LittleEndian(body), out _); break;
+                        case Protocol.WorldDoneDown:
+                            done = true; tDone = Clock.Elapsed.TotalSeconds;
+                            await W(JoinStatusCodec.Build(joiner, joinId, Protocol.JoinStateWaitingReady, 0, 0));
+                            Say(FormattableString.Invariant($"JOIN 0x{joinId:x8}: Done after {tDone - tr:F2} s; waiting for Ready"));
+                            break;
+                        case Protocol.JoinerReadyDown: end = "ready"; break;
+                        case Protocol.JoinAbortDown: end = "abort " + Protocol.JoinAbortName(body.Length > 0 ? body[0] : (byte)0); break;
+                    }
+                }
+                double now = Clock.Elapsed.TotalSeconds;
+                await W(JoinStatusCodec.Build(joiner, joinId, Protocol.JoinStateResumed, Protocol.JoinReasonId(end == "ready" ? "ready" : "failed"), (ushort)(now - tr)));
+                Say(FormattableString.Invariant($"JOIN 0x{joinId:x8} ended: {end} after {now - tr:F1} s -- THE HOST RESUMES"));
+                if (end == "ready")   // WO-134: this world's chest ledger, as a real host sends it
+                {
+                    var lps = Wo134Rules.LedgerParts(ledger);
+                    foreach (var lp in lps) await W(new LootMsg(Protocol.LootHostLedger, 0, lp).BuildUp(Protocol.LootHostUp, joiner));
+                    Say($"LEDGER sent to {joiner}: {ledger.Entries.Count} entries in {lps.Count} part(s)");
+                }
+            }
+        });
+        try
+        {
+            await foreach (var (type, p) in inbox.Reader.ReadAllAsync(hard.Token))
+            {
+                if (type == Protocol.ItemDropDown && p.Length == Protocol.ItemDropDownPayloadLen)   // WO-134
+                {
+                    Say(FormattableString.Invariant($"GOT ItemDrop from={p[0]} drop={BinaryPrimitives.ReadUInt32LittleEndian(p.AsSpan(1))} class={new Guid(p.AsSpan(5, 16))} x{BinaryPrimitives.ReadUInt16LittleEndian(p.AsSpan(21))} hp={BinaryPrimitives.ReadSingleLittleEndian(p.AsSpan(23)):F2} at=({BinaryPrimitives.ReadSingleLittleEndian(p.AsSpan(27)):F2}, {BinaryPrimitives.ReadSingleLittleEndian(p.AsSpan(31)):F2}, {BinaryPrimitives.ReadSingleLittleEndian(p.AsSpan(35)):F2})"));
+                    continue;
+                }
+                if (type == Protocol.ItemClaimDown && p.Length == Protocol.ItemClaimDownPayloadLen)   // WO-134
+                {
+                    Say($"GOT ItemClaim claimer={p[0]} drop={BinaryPrimitives.ReadUInt32LittleEndian(p.AsSpan(1))}");
+                    continue;
+                }
+                // WO-147: a joiner's hit on the host's NPC ([src][nameLen][name][stamina:4f][health:4f][flags:1]) -- logged
+                // (a real host applies it; this one only shows it arrived).
+                if (type == Protocol.NpcDamageDown && p.Length >= 2 && p.Length == 2 + p[1] + 9)
+                {
+                    string dn = System.Text.Encoding.UTF8.GetString(p, 2, p[1]);
+                    int dof = 2 + p[1];
+                    Say(FormattableString.Invariant(
+                        $"GOT NpcDamage from={p[0]} npc={dn} hp={BinaryPrimitives.ReadSingleLittleEndian(p.AsSpan(dof + 4)):F2} st={BinaryPrimitives.ReadSingleLittleEndian(p.AsSpan(dof)):F2} flags=0x{p[dof + 8]:X2}"));
+                    continue;
+                }
+                if (type == Protocol.ActionDown && doorInbox.Accept(p, out _) is { } act && act.Kind == ActionKind.DoorAsk)   // WO-151 3.9: logged (a real host applies it)
+                {
+                    Say(DoorEvent.TryFromBytes(act.Payload, out var dq) ? $"GOT DoorAsk from ghost {act.SourceGhostId}: {dq}" : $"GOT DoorAsk malformed len={act.Payload.Length}");
+                    continue;
+                }
+                if (!Protocol.IsJoinDown(type, p.Length) || Split(p) is not var (src, jid, body)) continue;
+                if (type == Protocol.LeashStateDown)   // WO-114: logged on a change only
+                {
+                    if (LeashState.TryDecode(body, out var ls) && (!leashSeen.TryGetValue(src, out var prev) || prev != ls))
+                    {
+                        leashSeen[src] = ls;
+                        Say($"LEASHSTATE from {src}: flags={Protocol.LeashFlagsText(ls.Flags)} pull #{ls.PullSeq} {Protocol.LeashResultName(ls.Result)} from={ls.FromM} to={ls.ToM} residual_cm={ls.ResidualCm}");
+                    }
+                    continue;
+                }
+                if (type == Protocol.LootAskDown && LootMsg.TryDecode(body, out var la))   // WO-134: answered like a real host
+                {
+                    var f = la.Text.Split(' ');
+                    Say($"LOOTASK {Protocol.LootAskName(la.Kind)} tok={la.Tok} from {src}: {la.Text}");
+                    switch (la.Kind)
+                    {
+                        case Protocol.LootAskBodyOpen:
+                        {
+                            var items = bodies.GetValueOrDefault(f[0]);
+                            string bst = items is null ? $"{f[0]} open 2 1 1 -" : $"{f[0]} open 1 1 1 {Wo134Rules.FormatItems(items)}";
+                            await W(new LootMsg(Protocol.LootHostBodyState, la.Tok, bst).BuildUp(Protocol.LootHostUp, src));
+                            Say($"  -> BodyState {bst}");
+                            break;
+                        }
+                        case Protocol.LootAskBodyTake:
+                        {
+                            var items = bodies.GetValueOrDefault(f[0]);
+                            var cls = Guid.Parse(f[1]); int amt = int.Parse(f[2], CultureInfo.InvariantCulture);
+                            int i = items?.FindIndex(x => x.Cls == cls && x.Amt >= amt) ?? -1;
+                            string v = i >= 0 ? "ok" : "gone";
+                            if (i >= 0) { var it = items![i]; if (it.Amt == amt) items.RemoveAt(i); else items[i] = it with { Amt = it.Amt - amt }; }
+                            await W(new LootMsg(Protocol.LootHostTakeResult, la.Tok, $"{v} {f[0]} {f[1]} {f[2]}").BuildUp(Protocol.LootHostUp, src));
+                            Say($"  -> TakeResult {v}");
+                            break;
+                        }
+                        case Protocol.LootAskBodyPut:
+                            if (bodies.TryGetValue(f[0], out var pitems)) pitems.Add(new Wo134Rules.Item(Guid.Parse(f[1]), int.Parse(f[2], CultureInfo.InvariantCulture), float.Parse(f[3], CultureInfo.InvariantCulture), false));
+                            break;
+                        case Protocol.LootAskTakedown:   // WO-135: the host's world performs it -- here: ok, and the NPC's stream says the result
+                        {
+                            string res = f.Length == 2 && npcFlags.ContainsKey(f[0]) ? "ok" : "refused";
+                            if (res == "ok") npcFlags[f[0]] = f[1] == "knockout" ? (byte)2 : (byte)1;
+                            await W(new LootMsg(Protocol.LootHostTakedownResult, la.Tok, $"{res} {f[0]} {(f.Length > 1 ? f[1] : "mercy")}").BuildUp(Protocol.LootHostUp, src));
+                            Say($"  -> TakedownResult {res} (stream flags now {npcFlags.GetValueOrDefault(f[0])})");
+                            break;
+                        }
+                        case Protocol.LootAskItemTake:
+                        {
+                            var cls = Guid.Parse(f[0]);
+                            float x = float.Parse(f[1], CultureInfo.InvariantCulture), y = float.Parse(f[2], CultureInfo.InvariantCulture), z = float.Parse(f[3], CultureInfo.InvariantCulture);
+                            int i = witems.FindIndex(w => w.Cls == cls && (w.X - x) * (w.X - x) + (w.Y - y) * (w.Y - y) + (w.Z - z) * (w.Z - z) <= 0.35f * 0.35f);
+                            string v = i < 0 ? "unknown" : witems[i].Taken ? "gone" : "ok";
+                            if (i >= 0) witems[i] = witems[i] with { Taken = true };
+                            await W(new LootMsg(Protocol.LootHostItemResult, la.Tok, $"{v} {f[0]} {f[1]} {f[2]} {f[3]}").BuildUp(Protocol.LootHostUp, src));
+                            Say($"  -> ItemResult {v}");
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                if (type == Protocol.QuestAskDown && LootMsg.TryDecode(body, out var qa))   // WO-137: answered like a real host
+                {
+                    Say($"QUESTASK {Protocol.QuestAskName(qa.Kind)} tok={qa.Tok} from {src}: {qa.Text}");
+                    if (!qauto) continue;
+                    switch (qa.Kind)
+                    {
+                        case Protocol.QuestAskRequest when Wo137Rules.TryParseRequestText(qa.Text, out var rq):
+                        {
+                            bool known = qstate.TryGetValue(rq.Path, out var cur);
+                            int hv = known ? cur.Val : rq.Old;
+                            var v = Wo137Rules.Judge(true, hv, rq.Old, rq.New);
+                            if (v == Wo137Rules.Verdict.Apply)
+                            {
+                                string ct = $"{++qseq} {QuestChange.FNotify | QuestChange.FOldOk | QuestChange.FNewOk | QuestChange.FMirror} {rq.Old} {rq.New} {rq.Port} {rq.QuestLen} {rq.Path}";
+                                qstate[rq.Path] = (rq.New, rq.Port, rq.QuestLen);
+                                for (byte g = 1; g < 8; g++) await W(new LootMsg(Protocol.QuestHostChange, 0, ct).BuildUp(Protocol.QuestHostUp, g));
+                                await W(new LootMsg(Protocol.QuestHostResult, qa.Tok, Wo137Rules.ResultText("applied", rq.New, rq.Port, rq.Path)).BuildUp(Protocol.QuestHostUp, src));
+                                Say($"  -> applied (change #{qseq} to every joiner, then Result applied)");
+                            }
+                            else
+                            {
+                                string verdict = v == Wo137Rules.Verdict.Already ? "already" : "refused";
+                                await W(new LootMsg(Protocol.QuestHostResult, qa.Tok, Wo137Rules.ResultText(verdict, hv, known ? cur.Port : "", rq.Path)).BuildUp(Protocol.QuestHostUp, src));
+                                Say($"  -> {verdict} (this host has {hv})");
+                            }
+                            break;
+                        }
+                        case Protocol.QuestAskTalk when Wo137Rules.TryParseTalkText(qa.Text, out bool ton, out string tnpc):
+                            await W(new LootMsg(Protocol.QuestHostHold, qa.Tok, Wo137Rules.TalkText(ton, tnpc)).BuildUp(Protocol.QuestHostUp, src));
+                            Say($"  -> Hold {(ton ? "on" : "off")} {tnpc} (this host's {tnpc} {(ton ? "is busy" : "is free again")})");
+                            break;
+                        case Protocol.QuestAskResync:
+                            foreach (var t in Wo137Rules.CheckpointTexts(qstate.Select(kv => new Wo137Rules.CheckpointEntry(kv.Key, kv.Value.Val, kv.Value.Port)).ToList()))
+                                await W(new LootMsg(Protocol.QuestHostCheckpoint, 0, t).BuildUp(Protocol.QuestHostUp, src));
+                            Say($"  -> Checkpoint of {qstate.Count} State(s)");
+                            break;
+                        default:
+                            Say("  -> not answered (malformed)");
+                            break;
+                    }
+                    continue;
+                }
+                if (type == Protocol.SleepVoteDown && LootMsg.TryDecode(body, out var sv))   // WO-140: logged; `sleep auto` answers an Ask
+                {
+                    Say($"SLEEPVOTE {Protocol.SleepVoteName(sv.Kind)} tok=0x{sv.Tok:X8} from {src}: {sv.Text}");
+                    if (sv.Kind == Protocol.SleepAsk && sleepAuto is "yes" or "no" or "busy" && Wo140Text.TryAsk(sv.Text, out var sKind, out byte sAsker, out _))
+                    {
+                        await W(new LootMsg(Protocol.SleepAnswer, sv.Tok, Wo140Text.Answer(sleepAuto, sAsker)).BuildUp(Protocol.SleepVoteUp, src));
+                        Say($"  -> answered {sleepAuto} (auto) to {sAsker}'s {sKind}");
+                    }
+                    continue;
+                }
+                if (type == Protocol.CarryDown && LootMsg.TryDecode(body, out var cym))   // WO-148: logged; `carry auto` refuses a grab of the host's own carry
+                {
+                    Say($"CARRY {Protocol.CarryKindName(cym.Kind)} tok={cym.Tok} from {src}: {cym.Text}");
+                    if (carryAuto && (cym.Kind == Protocol.CarryGrab || cym.Kind == Protocol.CarryHeld) && CarryText.TryParse(cym.Kind, cym.Text, out var cyt)
+                        && carryBody is not null && cyt.Name == carryBody)
+                    {
+                        await W(new LootMsg(Protocol.CarryRefuse, cym.Tok, CarryText.Refuse(cyt.Carrier, cyt.Name, "carried")).BuildUp(Protocol.CarryUp, src));
+                        Say($"  -> refused (auto): this host carries {cyt.Name}");
+                    }
+                    continue;
+                }
+                if (type == Protocol.ActivityPeerDown && ActivityCodec.TryDecode(body, out byte apk, out var aprows))   // WO-141: logged
+                {
+                    foreach (var r in aprows) Say($"ACTIVITY player {src}: {r.A}");
+                    continue;
+                }
+                if (type == Protocol.CrimeAskDown && LootMsg.TryDecode(body, out var ca))   // WO-139: logged (the test drives the answers)
+                {
+                    Say($"CRIMEASK {Protocol.CrimeAskName(ca.Kind)} tok={ca.Tok} from {src}: {ca.Text}");
+                    continue;
+                }
+                if (type == Protocol.JoinRequestDown) { Say($"JoinRequest 0x{jid:x8} from {src}"); await joinQ.Writer.WriteAsync((src, jid)); }
+                else await joinMsgs.Writer.WriteAsync((type, body));
+            }
+        }
+        catch (OperationCanceledException) { Say("stopped"); }
+        finally { tcp.Dispose(); }
+        return 0;
+    }
+}
