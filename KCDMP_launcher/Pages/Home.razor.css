@@ -106,3 +106,14 @@
 ::deep .content-wrapper { gap: 18px; overflow-y: auto; justify-content: flex-start; padding-top: 4vh; }
 .main-window.hub-hidden { display: none; }
 .main-window { height: 60vh; }
+
+/* IgnisComeDeliverance: the painted logo fills the top third of the background -- the start screen begins below it */
+::deep .content-wrapper { padding-top: 33vh; }
+.visually-hidden {
+    position: absolute !important;
+    width: 1px; height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+    margin: 0; padding: 0;
+}

@@ -25,9 +25,9 @@
 
 <div class="content-wrapper">
 
-    <div class="game-title">
-        IgnisComeDeliverance
-    </div>
+    @* IgnisComeDeliverance: the name is painted into the background (wwwroot/img/background.webp); the text title stays
+       for screen readers only, so the name never shows twice *@
+    <h1 class="game-title visually-hidden">IgnisComeDeliverance</h1>
 
     @* IgnisComeDeliverance: the start screen -- host or join, in plain steps (Components/PlayHub.razor) *@
     <PlayHub SetupReady="@setupReady"

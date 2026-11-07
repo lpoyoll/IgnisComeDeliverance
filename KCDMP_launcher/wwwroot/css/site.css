@@ -38,9 +38,15 @@
 }
 
 body {
-    background-image: linear-gradient(rgba(var(--kcd-shadow-rgb), 0.7), rgba(var(--kcd-shadow-rgb), 0.7)), url('../img/background.jpg');   /* WO-134: the Kingdom Come: Together art (tools/Build-Branding.py) */
+    /* IgnisComeDeliverance: its own art, with the name painted in. Light at the top so the painted logo reads, darker
+       from the middle down, where the Host / Join panels and the status bar sit. Anchored at the top so a wide
+       window crops the foreground, never the logo. */
+    background-image: linear-gradient(rgba(var(--kcd-shadow-rgb), 0.15) 0%, rgba(var(--kcd-shadow-rgb), 0.15) 30%,
+                                      rgba(var(--kcd-shadow-rgb), 0.55) 50%, rgba(var(--kcd-shadow-rgb), 0.7) 100%),
+                      url('../img/background.webp');
+    background-color: var(--kcd-shadow);
     background-size: cover;
-    background-position: center;
+    background-position: center top;
     background-repeat: no-repeat;
     margin: 0;
     overflow: hidden;

@@ -114,3 +114,6 @@
     .hub-cards { flex-direction: column; }
     .hub-or { margin: -6px 0; }
 }
+
+/* over the bright campfire of the background art */
+.hub-notes, .hub-direct { text-shadow: 0 1px 3px rgba(var(--kcd-shadow-rgb), 1), 0 0 10px rgba(var(--kcd-shadow-rgb), 0.9); }
