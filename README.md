@@ -43,15 +43,22 @@ Download from [Releases](https://github.com/lpoyoll/IgnisComeDeliverance/release
 
 - **`IgnisComeDeliverance-Setup-<version>.exe`**: the installer. It is **not code-signed**, so Windows SmartScreen
   may warn: choose *More info → Run anyway* only if you downloaded it from this repository.
-- **`IgnisComeDeliverance-DirectInstall-<version>.zip`**: an update over an existing install. Close the game and the
-  launcher, unzip, run `Apply.ps1`.
+- **`IgnisComeDeliverance-DirectInstall-<version>.zip`**: an update for an existing IgnisComeDeliverance install.
+  Close the game and the launcher, unzip, run `Apply.ps1`.
+
+**It installs beside Kingdom Come: Together, not over it.** IgnisComeDeliverance has its own install folder
+(`%LOCALAPPDATA%\IgnisComeDeliverance`), its own Start menu entry and its own uninstaller; Kingdom Come: Together stays
+installed. The game has **one mod slot** (`Mods\kdcmp`), so only one of the two is active at a time: the
+IgnisComeDeliverance launcher puts its own mod into the slot when it opens (the game must be closed). To go back to
+Kingdom Come: Together, run its Setup again (it repairs its mod).
+
+**Your Kingdom Come: Together saves work as they are.** Both share the game's saves and the player data in
+`%LOCALAPPDATA%\KCDMP` (carried-over characters, world transfers). Your game saves are backed up before every session
+(the launcher's *restore a backup*). When uninstalling either one, answer **No** to "remove the mod from your game"
+if you still use the other.
 
 **Both players need the same build.** The handshake refuses a partner on another build, including official
 Kingdom Come: Together.
-
-**Your Kingdom Come: Together saves work as they are.** The fork keeps the same install folder
-(`%LOCALAPPDATA%\KCDMP`), registry key, mod folder (`kdcmp`) and save backups, so it installs over Kingdom Come:
-Together and uses its data. Your game saves are backed up before every session (the launcher's *restore a backup*).
 
 Requirements: Kingdom Come: Deliverance II and its free **Modding Tools** on Steam, Steam running, Windows 10/11.
 

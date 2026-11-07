@@ -1,4 +1,4 @@
-﻿; Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
+; Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
 ; GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 ; content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 ; Kingdom Come: Together -- one-click installer (WO-134: the new name; before, "KCD2 Multiplayer").
@@ -28,9 +28,11 @@
 ; the Start menu folder use ShortcutName. Never renamed (installs, saves and upgrades
 ; depend on them): the AppId below, the install folder {localappdata}\KCDMP, the
 ; HKCU\Software\KCDMP key, the kdcmp mod folder, the launcher's exe name.
-; IgnisComeDeliverance: a fork of Kingdom Come: Together (see AUTHORS). The player-visible names changed; the internal
-; ids above (AppId, {localappdata}\KCDMP, HKCU\Software\KCDMP, the kdcmp mod folder, the launcher exe) did not, so this
-; installer upgrades over a Kingdom Come: Together install instead of fighting it for the same game folder.
+; IgnisComeDeliverance: a fork of Kingdom Come: Together (see AUTHORS) that installs BESIDE it: its own AppId and its own
+; install folder ({localappdata}\IgnisComeDeliverance, HKCU\Software\IgnisComeDeliverance\InstallDir). Shared with
+; Kingdom Come: Together on purpose: the game's one mod slot (Mods\kdcmp -- whichever launcher you open puts its own
+; mod back there, via its setup checklist), HKCU\Software\KCDMP\ModsPath (the same path for both), and the player data
+; in %LOCALAPPDATA%\KCDMP (carried-over characters, world transfers), so the two use the same saves.
 #define AppName "IgnisComeDeliverance"
 #define ShortcutName "IgnisComeDeliverance"
 #define OldShortcutName "KCD2 Multiplayer"
@@ -49,7 +51,7 @@
 #define WebView2BootstrapUrl "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
 
 [Setup]
-AppId={{88C5B9F1-0E71-4D60-9418-5575D5684F95}
+AppId={{AC3386F6-2A53-41F9-B6D6-8AF820A1761D}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
@@ -67,7 +69,7 @@ AppUpdatesURL={#AppUrl}
 ;     BUILTIN\Users FullControl on its own tree, so an unelevated install can
 ;     write <ModdingTools>\Mods even when Steam sits in Program Files;
 ;   * a non-technical friend never sees a UAC prompt.
-DefaultDirName={localappdata}\KCDMP
+DefaultDirName={localappdata}\IgnisComeDeliverance
 PrivilegesRequired=lowest
 UsePreviousAppDir=yes
 
@@ -170,18 +172,8 @@ Name: "{group}\Uninstall {#ShortcutName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#ShortcutName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; IconFilename: "{app}\app.ico"; Tasks: desktopicon; Comment: "{#Disclaimer}"
 
 [InstallDelete]
-; WO-134: an upgrade from a build before the rename replaces its shortcuts, so the
-; Start menu and the desktop never show both names. Only the old shortcut files and
-; the old folder once it is empty -- nothing else there is ours.
-Type: files; Name: "{autoprograms}\{#OldShortcutName}\{#OldShortcutName}.lnk"
-Type: files; Name: "{autoprograms}\{#OldShortcutName}\Uninstall {#OldShortcutName}.lnk"
-Type: dirifempty; Name: "{autoprograms}\{#OldShortcutName}"
-Type: files; Name: "{autodesktop}\{#OldShortcutName}.lnk"
-; the Kingdom Come: Together shortcuts, replaced by this fork's
-Type: files; Name: "{autoprograms}\{#OldShortcutName2}\{#OldShortcutName2}.lnk"
-Type: files; Name: "{autoprograms}\{#OldShortcutName2}\Uninstall {#OldShortcutName2}.lnk"
-Type: dirifempty; Name: "{autoprograms}\{#OldShortcutName2}"
-Type: files; Name: "{autodesktop}\{#OldShortcutName2}.lnk"
+; IgnisComeDeliverance installs BESIDE Kingdom Come: Together (its own AppId and folder), so it removes none of
+; Kingdom Come: Together's shortcuts (WO-134's old-name cleanup here belonged to that install, not this one).
 
 [Registry]
 ; Not settings -- just enough for the uninstaller to find the mod it deployed
@@ -190,8 +182,10 @@ Type: files; Name: "{autodesktop}\{#OldShortcutName2}.lnk"
 ; Listed first so it is *undone* last (uninstall replays this section in
 ; reverse): uninsdeletekeyifempty on a later line ran while the other values
 ; were still present and left an orphan key behind.
-Root: HKCU; Subkey: "Software\KCDMP"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\KCDMP"; ValueType: string; ValueName: "InstallDir"; ValueData: "{app}"
+; IgnisComeDeliverance: Software\KCDMP is SHARED with a Kingdom Come: Together install beside this one (the mod's location, the same\r
+; for both): this uninstaller leaves it. Its own install folder goes under its own key.
+Root: HKCU; Subkey: "Software\IgnisComeDeliverance"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\IgnisComeDeliverance"; ValueType: string; ValueName: "InstallDir"; ValueData: "{app}"
 ; WO-150: written only when known/placed; the launcher writes both itself once its
 ; checklist places a held-back mod (Home.Wo150.cs RecordModsPath).
 Root: HKCU; Subkey: "Software\KCDMP"; ValueType: string; ValueName: "GamePath"; ValueData: "{code:GetDetectedGameExe}"; Check: HaveGameExe

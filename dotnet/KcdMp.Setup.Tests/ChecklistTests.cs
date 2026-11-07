@@ -74,20 +74,24 @@ public class ModInstallTests
     }
 
     [Fact]
-    public void AHandBuiltPakWarnsButNeverBlocksAndIsNeverOverwritten()
+    public void AnotherInstallsPakIsReplacedByThisInstallsOwn()
     {
-        // The maintainer's workflow: Build-And-Install-Mod.ps1 drops a fresh pak over the installed one.
-        using var f = new FakeSteam("devpak").WithGame().WithModdingTools().Linked().WithInstall().WithModPlaced();
+        // IgnisComeDeliverance installs beside Kingdom Come: Together and the game has one mod slot: a pak that differs from
+        // this install's (most often the other install's) is not "placed" -- the checklist puts this install's own back.
+        using var f = new FakeSteam("otherpak").WithGame().WithModdingTools().Linked().WithInstall().WithModPlaced();
         var pak = Path.Combine(ModInstall.TargetDir(f.MtRoot), "Data", "kdcmp.pak");
-        File.WriteAllText(pak, "a pak built by hand, different bytes");
+        File.WriteAllText(pak, "the other install's pak, different bytes");
         var r = ModInstall.Check(f.AppDir, f.MtRoot, ownsModFolder: false);   // not even the registry marker
-        Assert.True(r.Ok);
+        Assert.False(r.Ok);
         Assert.False(r.ForeignFolder);
-        Assert.Single(r.Warnings);
+        Assert.Single(r.ModDifferent);
+        Assert.Empty(r.Warnings);
         var steps = SetupChecklist.Evaluate(f.Snapshot(ownsMod: false), SetupActivity.Idle);
-        Assert.True(SetupChecklist.IsReady(steps));
-        Assert.Contains("differ from what Setup installed", steps.Single(s => s.Id == StepId.Mod).Detail);
-        Assert.Equal("a pak built by hand, different bytes", File.ReadAllText(pak));
+        Assert.False(SetupChecklist.IsReady(steps));
+        Assert.Equal(StepAction.PlaceMod, steps.Single(s => s.Id == StepId.Mod).Action);
+        Assert.True(ModInstall.Place(f.AppDir, f.MtRoot).Ok);
+        Assert.NotEqual("the other install's pak, different bytes", File.ReadAllText(pak));
+        Assert.True(ModInstall.Check(f.AppDir, f.MtRoot, ownsModFolder: false).Ok);
     }
 
     [Fact]

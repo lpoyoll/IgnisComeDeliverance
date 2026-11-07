@@ -80,3 +80,15 @@ queues could coalesce away. Now a first-packet death is applied (`GameBridge.cs`
 ### Building the installer
 Needs Visual Studio's C++ tools (the DLL), the .NET 8 SDK and Inno Setup 6, then `tools\Build-Installer.ps1`. Its release gates
 (the frame-rate soak, the save round trip) need the game; for a test build pass `-ReleaseCandidate` and the waiver text it asks for.
+
+### Side by side with Kingdom Come: Together (0.64.1-icd2)
+- The installer has its own AppId and folder (`%LOCALAPPDATA%\IgnisComeDeliverance`, `HKCU\Software\IgnisComeDeliverance`)
+  and no longer removes Kingdom Come: Together's shortcuts; uninstalling it leaves `HKCU\Software\KCDMP` (shared).
+- Shared on purpose: the game's one mod slot `Mods\kdcmp`, `HKCU\Software\KCDMP\ModsPath`, and the player data in
+  `%LOCALAPPDATA%\KCDMP` (so both use the same saves and characters).
+- `ModInstall.Placed` now counts a mod file that differs from this install's as not placed, so the launcher's checklist
+  puts its own mod back (before, it only warned and ran this agent against the other install's game scripts).
+  Test `AnotherInstallsPakIsReplacedByThisInstallsOwn` replaces `AHandBuiltPakWarnsButNeverBlocksAndIsNeverOverwritten`.
+  Side effect for developers: a hand-built pak dropped into an installed copy is replaced by the launcher; develop with
+  a development build (no install manifest), which is never touched.
+- `Apply-DirectInstall.ps1` updates only an IgnisComeDeliverance install (its own InstallDir), never `%LOCALAPPDATA%\KCDMP`.

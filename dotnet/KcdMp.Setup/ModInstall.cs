@@ -25,7 +25,12 @@ public sealed class ModReport
     public bool ForeignFolder { get; init; }
     public string TargetDir { get; init; } = "";
 
-    public bool Placed => !DevelopmentBuild && ModMissing.Count == 0 && !ForeignFolder;
+    /// IgnisComeDeliverance: it installs BESIDE Kingdom Come: Together, and the game has one mod slot (Mods\kdcmp), so a mod
+    /// file that differs from this install's is most often the OTHER install's -- run against it, this agent and DLL would
+    /// drive a different version of the game scripts (a certain desync). A differing file is therefore "not placed": the
+    /// checklist puts this install's own copy back (ModInstall.Place), exactly as for a missing one. A development build
+    /// (no install manifest) is still never touched.
+    public bool Placed => !DevelopmentBuild && ModMissing.Count == 0 && ModDifferent.Count == 0 && !ForeignFolder;
 
     /// <summary>
     /// What blocks Host and Join: Setup's own verdict said the install failed, the mod is not
@@ -36,7 +41,7 @@ public sealed class ModReport
     /// </summary>
     public bool Ok => DevelopmentBuild || (VerdictPass && Placed);
 
-    public IEnumerable<string> Warnings => AppProblems.Concat(ModDifferent);
+    public IEnumerable<string> Warnings => AppProblems;   // a differing mod file is no longer a warning: it is re-placed (Placed)
 }
 
 /// <summary>

@@ -54,8 +54,10 @@ $ErrorActionPreference = 'Stop'
 
 $reg = 'HKCU:\Software\KCDMP'
 if (-not $AppDir) {
-    $AppDir = (Get-ItemProperty $reg -ErrorAction SilentlyContinue).InstallDir
-    if (-not $AppDir) { $AppDir = Join-Path $env:LOCALAPPDATA 'KCDMP' }
+    # IgnisComeDeliverance installs beside Kingdom Come: Together: its own folder and its own InstallDir key -- never
+    # HKCU\Software\KCDMP\InstallDir or %LOCALAPPDATA%\KCDMP, which are Kingdom Come: Together's install.
+    $AppDir = (Get-ItemProperty 'HKCU:\Software\IgnisComeDeliverance' -ErrorAction SilentlyContinue).InstallDir
+    if (-not $AppDir) { throw "IgnisComeDeliverance is not installed yet: run IgnisComeDeliverance-Setup once, then use this zip for updates." }
 }
 if (-not $ModDir) {
     $ModDir = (Get-ItemProperty $reg -ErrorAction SilentlyContinue).ModsPath
