@@ -111,3 +111,31 @@ The top-left line used to say only `Ping: 63 ms  clock +0.02 s`. It now says how
 
 Code: `KCD2MP_ShowPing` / `KCD2MP_IcdConnSample` / `KCD2MP_IcdConnGrade` in kdcmp.lua; `GameBridge.LinkLossPct` in
 GameBridge.Wo202Net.cs. Tests: tools/Test-WO98Synthetic.lua (h2), dotnet/KcdMp.Client.Tests/IcdConnTests.cs.
+
+## icd5: catch-up instead of rubber-banding, quiet console, icon badge, rename
+
+**What was already there.** Most of the usual anti-lag tricks were already built (WO-213, WO-201, WO-210): an adaptive
+play-out delay per stream (`mp_playout_adaptive`, `mp_figure_playout`), 150 ms of walk-on prediction, a soft blend after
+binds, swing holds, silences and the end of a prediction, sending by distance and combat (`mp_npc_bands`), and the joiner's
+blows on copies playing their impact at once while the host judges them (`mp_copy_hit_local_none`).
+
+**What was missing: the jump after a hold** (`mp_catch_up`, on). When samples stop, a moving body walks on for at most
+150 ms and then holds, but its render clock ran on, so the next sample was already "in the past" and the body jumped to it.
+Now the clock is held at the edge of what is known while the body waits, and the wait is replayed at 1.2x once samples
+come (`wo213rules::catch_debt_step`; at most 0.4 s is replayed, never before the oldest sample held). A body that still
+stood past its stream blends back from where it stands (`catch-up` blend). The ring holds 32 samples (was 16) so a 30 Hz
+figure keeps enough history. Native test: a 400 ms dropout never moves the body more than 1.2x a frame's walk.
+Counters: `catch_frames`, `catch_resumes` on `MP-NPCWRITE-COST`.
+
+**Quiet console** (`mp_quiet`, on; the mod menu's "Quiet console"). The mod's routine lines go to kcd.log only; errors,
+warnings, failures and the mod's important lines still show on the ~ console. kcd.log must keep every line (the agent and
+the launcher read it), so it is proven first: 20 s into a session the console's verbosity goes to 1 and a probe is
+written with `System.Log`; the agent sees the probe in the file and confirms; without a confirm in 5 s the console is put
+back exactly as it was (`MP-QUIET on|unavailable|unneeded`).
+
+**Partner badge as an icon** (`mp_badge_icon`, on; "Partner badge: icon"). A small "v" over the partner coloured by
+health (green / amber / red), a short bar only while hurt, grey in a menu or reconnecting, a grey "x" when dead. Off: the
+old name and numbers.
+
+**Rename.** The mod menu title, the mod's toasts, the "could not connect" and "did not load" messages and Discord
+presence say IgnisComeDeliverance.

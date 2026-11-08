@@ -368,6 +368,9 @@ public sealed class LogTailGameTransport : IGameTransport
     /// </summary>
     public event Action? ModInitDetected;
 
+    /// <summary>KCT QoL: the mod's quiet-console probe ("[KCD2-MP] MP-QUIET probe &lt;nonce&gt;") reached kcd.log -- the nonce.</summary>
+    public event Action<string>? QuietProbeSeen;
+
     /// <summary>
     /// WO-122: the engine printed "Gameplay started" -- a save load (or a new
     /// game) just finished. Every load wipes every script save lock (WO-112
@@ -888,6 +891,14 @@ public sealed class LogTailGameTransport : IGameTransport
 
         // WO-98 Phase 7: "[KCD2-MP] MOD INIT" (the second of the mod's two
         // init lines; the first is "=== MOD INIT ===" and does not match).
+        // KCT QoL: the quiet console's probe line was written to the FILE -- the mod may send its chatter there only
+        if (QuietProbeSeen is not null && line.IndexOf("[KCD2-MP] MP-QUIET probe ", StringComparison.Ordinal) is int qi && qi >= 0)
+        {
+            string nonce = line[(qi + "[KCD2-MP] MP-QUIET probe ".Length)..].ToString().Split(' ')[0];
+            try { QuietProbeSeen.Invoke(nonce); }
+            catch (Exception ex) { Console.WriteLine($"[quiet] probe handler threw: {ex.Message}"); }
+        }
+
         if (ModInitDetected is not null && line.IndexOf("[KCD2-MP] MOD INIT") >= 0)
         {
             try { ModInitDetected.Invoke(); }

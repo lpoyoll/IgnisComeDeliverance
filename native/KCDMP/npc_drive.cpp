@@ -76,7 +76,7 @@ constexpr uint32_t kUnusedInt       = 0x80000000u;
 
 constexpr double kSilenceS      = 4.0;    // Lua releases a puppet at 3 s; the DLL stops a hair later on its own
 constexpr double kStreamForgetS = 15.0;   // an unbound stream entry is forgotten after this much silence
-constexpr int    kRingDepth     = 16;     // Lua keeps 3 (enough at 100 ms samples); a faster stream (a ghost, ~30 Hz) needs (delay + allowance)/period + 2
+constexpr int    kRingDepth     = 32;     // KCT: 32 (was 16) so a 30 Hz figure keeps its delay plus a catch-up (~0.7 s); Lua keeps 3 (enough at 100 ms samples); a faster stream (a ghost, ~30 Hz) needs (delay + allowance)/period + 2
 constexpr double kClockResetS   = 5.0;    // a source silent this long gets a fresh offset estimate (a reconnect reuses relay ids)
 constexpr double kSeqRestartS   = 2.0;    // a stream silent this long may restart its sequence (a sender restart)
 // Jitter allowance. The render needs, at every frame, a sample stamped at or
@@ -134,6 +134,7 @@ std::atomic<bool> g_holdAll{false};      // WO-138: the host is paused, hold eve
 std::atomic<bool> g_snapFix{true};       // WO-166 C4: mp_snap_fix
 std::atomic<bool> g_walkFromHost{true};   // WO-201 B10: mp_walk_from_host
 std::atomic<uint32_t> c_extrapFrames{0}, c_extrapEnds{0}, c_silenceKept{0};
+std::atomic<uint32_t> c_catchFrames{0}, c_catchResumes{0};   // KCT catch_up: frames rendered with the clock held back; blends back from a hold
 constexpr double kExtrapMaxS = 2.0;        // WO-201 B10: a gap shorter than this is walked through on the host's last speed
 constexpr double kSilenceMovingS = 10.0;   // WO-201 B10: a copy that was moving is not dropped for silence before this
 constexpr float  kExtrapMinMps = 0.3f, kExtrapMaxMps = 8.0f;
@@ -328,6 +329,8 @@ struct Puppet {
     float    lastRot = 0;
     float    speedMps = 0;          // WO-121: the rendered planar speed of the last written frame (gait for NPC copies)
     bool     extrapolating = false; // WO-201 B10: the last frame walked on past the newest sample
+    double   catchDebt = 0;         // KCT catch_up: how far the render clock is held back (s), paid back at 1.2x
+    bool     heldPast = false;      // KCT catch_up: the last frame stood past what the stream covers
     float    velX = 0, velY = 0;    // WO-129: the same frame's planar velocity (the engine's direction tag input)
     uint64_t writes = 0;
     uint32_t frameNo = 0;
@@ -1328,9 +1331,22 @@ void tick() {
             p.playout = wo213rules::playout_step(p.playout, p.playoutTarget, dt);
             renderDelay = p.playout;
         } else p.playout = -1;
+        bool ex = g_walkFromHost.load(std::memory_order_relaxed) && !p.beast;   // WO-201 B10: in = allowed, out = extrapolated
+        // KCT catch_up: a moving body that runs out of samples waits at the edge of what is known (its walk-on included) instead of
+        // standing while its clock runs on -- and replays the wait at 1.2x once samples come, instead of jumping to them.
+        if (wo213::on(wo213rules::kBitCatchUp) && s.n > 0) {
+            const double allowS = ex ? wo213rules::extrap_max_s(e1, wo202rules::extrap_max_s((s.flags & 0x04) != 0,
+                                           wo202::on(wo202rules::kBitFightPosFresh), kExtrapMaxS)) : 0.0;
+            const double covered = s.ring[s.n - 1].at + allowS;
+            p.catchDebt = wo213rules::catch_debt_step(p.catchDebt, now - renderDelay, covered, s.ring[0].at, s.lastMoved, dt);
+            renderDelay += p.catchDebt;
+            const bool heldPastNow = (now - renderDelay) > covered + 1e-4;
+            if (wo213rules::resume_from_hold_blends(p.heldPast, heldPastNow)) { p.blendPending = true; p.blendWhy = "catch-up"; c_catchResumes.fetch_add(1, std::memory_order_relaxed); }
+            p.heldPast = heldPastNow;
+            if (p.catchDebt > 0.001) c_catchFrames.fetch_add(1, std::memory_order_relaxed);
+        } else { p.catchDebt = 0; p.heldPast = false; }
         g_playoutByEid[p.eid] = renderDelay;
         float pose[4];
-        bool ex = g_walkFromHost.load(std::memory_order_relaxed) && !p.beast;   // WO-201 B10: in = allowed, out = extrapolated
         float segMps = 0.0f;
         if (!render(s, now - renderDelay, renderDelay, pose, &ex, &segMps, e1)) { ++it; continue; }
         if (ex) c_extrapFrames.fetch_add(1, std::memory_order_relaxed);
@@ -1400,10 +1416,10 @@ void tick() {
         if (now - g_cost.start >= kPullWindowS) {
             const double n = static_cast<double>(g_cost.frames);
             logf("MP-NPCWRITE-COST window_s=%.1f frames=%llu bound_mean=%.1f writing_mean=%.1f tick_us_mean=%.1f tick_us_max=%.1f blends=%llu blend_max_cm=%.1f "
-                 "extrap_frames=%u extrap_ends=%u silence_kept=%u",
+                 "extrap_frames=%u extrap_ends=%u silence_kept=%u catch_frames=%u catch_resumes=%u",
                  now - g_cost.start, static_cast<unsigned long long>(g_cost.frames), g_cost.boundSum / n,
                  g_cost.writingSum / n, g_cost.sumUs / n, g_cost.maxUs, static_cast<unsigned long long>(g_cost.blends),
-                 g_cost.blendMaxCm, c_extrapFrames.load(), c_extrapEnds.load(), c_silenceKept.load());
+                 g_cost.blendMaxCm, c_extrapFrames.load(), c_extrapEnds.load(), c_silenceKept.load(), c_catchFrames.load(), c_catchResumes.load());
             g_cost = CostWindow{};
         }
     }

@@ -34,6 +34,8 @@ public static class Wo154MenuRules
     {
         new("NameBadges", Kind.OnOff, false),
         new("PingLine", Kind.OnOff, false),
+        new("QuietConsole", Kind.OnOff, false),   // KCT QoL: mp_quiet
+        new("BadgeIcon", Kind.OnOff, false),      // KCT QoL: mp_badge_icon
         new("CleanScreen", Kind.OnOff, false),
         new("FriendlyFire", Kind.OnOff, true),
         new("CrimeMode", Kind.Crime, true),

@@ -134,7 +134,7 @@ public class Wo159MenuTests
     public void A_failed_connect_is_said_on_the_games_own_screen()
     {
         string l = MenuTakeoverRule.HudLine(MenuTakeoverRule.ConnectFailedText);
-        Assert.StartsWith("pcall(function() UIAction.CallFunction('hud', -1, 'ShowInfoText', \"Kingdom Come: Together could not connect.", l);
+        Assert.StartsWith("pcall(function() UIAction.CallFunction('hud', -1, 'ShowInfoText', \"IgnisComeDeliverance could not connect.", l);
         Assert.True(Uri.EscapeDataString("#" + l).Length <= MenuTakeoverRule.MaxEncoded);
     }
 

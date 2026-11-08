@@ -116,7 +116,7 @@ do
     KCD2MP.labelCache = { ["0"] = { x = 1, y = 2, z = 3, size = 1.0, name = "Partner", ent = ent } }
     local mark = #LOG
     NOW = 100; KCD2MP_LabelTick()
-    check("L1: drawn at the neck + 0.45 m", #DRAWN == 1 and near(DRAWN[1].z, 101.95) and DRAWN[1].text == "Partner", DRAWN[1] and DRAWN[1].z)
+    check("L1: drawn at the neck + 0.45 m (KCT: the icon badge by default)", #DRAWN == 1 and near(DRAWN[1].z, 101.95) and DRAWN[1].text == "v", DRAWN[1] and DRAWN[1].z)
     check("L2: the level said once", lastLog("WO158-BADGE id=0 hangs on the neck bone", mark) ~= nil)
     local told = 0
     for i = mark + 1, #LOG do if LOG[i]:find("WO158-BADGE", 1, true) then told = told + 1 end end

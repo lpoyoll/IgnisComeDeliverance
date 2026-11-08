@@ -879,6 +879,14 @@ public partial class GameBridge(ClientConfig config)
         _ = ExecLuaAsync($"if KCD2MP_SetCutscene then KCD2MP_SetCutscene({(active ? "true" : "false")}, \"{EscapeLua(name)}\") end");
     }
 
+    /// <summary>KCT QoL: the quiet console's probe reached kcd.log, so file logging does not depend on the console's verbosity: confirm.</summary>
+    private void OnQuietProbeSeen(string nonce)
+    {
+        if (nonce.Length == 0 || nonce.Length > 16 || !nonce.All(char.IsLetterOrDigit)) return;
+        Console.WriteLine($"[quiet] probe {nonce} reached kcd.log -- the mod's routine lines go to the file only");
+        _ = ExecLuaAsync($"if KCD2MP_QuietConfirm then KCD2MP_QuietConfirm('{nonce}') end");
+    }
+
     /// <summary>WO-98 Phase 7: the mod's Lua was reborn; re-push standing state on the next re-arm.</summary>
     private void OnModInitDetected()
     {
@@ -1933,6 +1941,7 @@ public partial class GameBridge(ClientConfig config)
             tailForPause.SceneStage += Wo151OnSceneStage;            // WO-151 3.4: the scene guard
             tailForPause.SceneStage += Wo167OnSceneStage;            // WO-167 T4: a conversation's scene
             tailForPause.ModInitDetected += OnModInitDetected;       // WO-98 Phase 7
+            tailForPause.QuietProbeSeen += OnQuietProbeSeen;         // KCT QoL: the quiet console
             tailForPause.GameplayStarted += Wo122OnGameplayStarted;  // WO-122
             tailForPause.AutoSaveRefused += Wo122OnAutoSaveRefused;  // WO-122
             tailForPause.GameplayStarted += Wo123OnGameplayStarted;  // WO-123: a host load ends a join
@@ -2352,6 +2361,7 @@ public partial class GameBridge(ClientConfig config)
                 tailForPause2.FastTravelRefused -= Wo114OnFastTravelRefused;       // WO-114
                 tailForPause2.CutsceneEdge -= OnLocalCutsceneEdge;      // WO-98 Phase 5
                 tailForPause2.ModInitDetected -= OnModInitDetected;     // WO-98 Phase 7
+                tailForPause2.QuietProbeSeen -= OnQuietProbeSeen;       // KCT QoL
                 tailForPause2.GameplayStarted -= Wo122OnGameplayStarted; // WO-122
                 tailForPause2.AutoSaveRefused -= Wo122OnAutoSaveRefused; // WO-122
                 tailForPause2.GameplayStarted -= Wo123OnGameplayStarted; // WO-123

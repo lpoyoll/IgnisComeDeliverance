@@ -15,7 +15,7 @@ public partial class GameBridge
     /// </summary>
     internal const string Wo157ModMissingLua =
         "if KCD2MP == nil then pcall(function() UIAction.CallFunction('hud', -1, 'ShowInfoText', " +
-        "'Kingdom Come: Together did not load in this game: its mod file (kdcmp.pak) is missing or was blocked. " +
+        "'IgnisComeDeliverance did not load in this game: its mod file (kdcmp.pak) is missing or was blocked. " +
         "Close the game and read the launcher message.', 10, 15000, true) end) end";
 
     // ------------------------------------------------------------ 3b.5 sleeping together

@@ -109,7 +109,7 @@ public sealed class DiscordPresence : IDisposable
                 Assets = new Assets
                 {
                     LargeImageKey = _largeImageKey,
-                    LargeImageText = "Kingdom Come: Together (unofficial)",   // WO-134: the new name; the art key is the maintainer's (unchanged)
+                    LargeImageText = "IgnisComeDeliverance (unofficial; a fork of Kingdom Come: Together)",   // WO-134: the new name; the art key is the maintainer's (unchanged)
                     // No small image (a second real key would badge the art).
                     // The Assets.Merge NRE this used to be blamed for is on
                     // Discord's reply side: see ForgetCachedAssets (WO-129).

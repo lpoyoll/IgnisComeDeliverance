@@ -27,13 +27,15 @@ constexpr uint32_t kBitPostureHoldLate = 0x04; // E.2 posture_hold_late
 constexpr uint32_t kBitPostureNoPos = 0x08;    // E.3 posture_no_pos
 constexpr uint32_t kBitFigurePlayout = 0x10;   // E.5 figure_playout (the figures on the same play-out as NPCs)
 constexpr uint32_t kBitFigureBand = 0x20;      // D.4 figure_band (the local player's state read each frame, served to the pipe at once)
-constexpr uint32_t kBitsDefault = kBitNpcBands | kBitPlayoutAdaptive | kBitPostureHoldLate | kBitPostureNoPos | kBitFigurePlayout | kBitFigureBand;
+constexpr uint32_t kBitCatchUp = 0x40;       // KCT catch_up: a held body replays what it missed at 1.2x instead of jumping, and blends back from a hold
+constexpr uint32_t kBitsDefault = kBitNpcBands | kBitPlayoutAdaptive | kBitPostureHoldLate | kBitPostureNoPos | kBitFigurePlayout | kBitFigureBand | kBitCatchUp;
 
 // The bench's twin names (KCDMP_TEST_W213_OFF=name,name -- the same variable the agent and the relay read).
 inline uint32_t twin_off_bits(const char* list) {
     struct N { const char* n; uint32_t b; };
     static const N k[] = {{"npc_bands", kBitNpcBands}, {"playout_adaptive", kBitPlayoutAdaptive}, {"posture_hold_late", kBitPostureHoldLate},
-                          {"posture_no_pos", kBitPostureNoPos}, {"figure_playout", kBitFigurePlayout}, {"figure_band", kBitFigureBand}};
+                          {"posture_no_pos", kBitPostureNoPos}, {"figure_playout", kBitFigurePlayout}, {"figure_band", kBitFigureBand},
+                          {"catch_up", kBitCatchUp}};
     uint32_t b = 0;
     if (!list) return 0;
     const char* p = list;
@@ -112,6 +114,34 @@ inline double playout_step(double applied, double target, double dt) {
 }
 // How far past the newest sample a moving stream may be extrapolated: E.1's cap (on) or the old bound (off).
 inline double extrap_max_s(bool on, double oldMaxS) { return on ? (std::min)(kExtrapCapS, oldMaxS) : oldMaxS; }
+
+// ---- KCT catch_up: replay a hold at 1.2x instead of jumping ----
+// The render clock is (now - delay). When packets stop arriving, a moving body walks on (the extrapolation, at most allowS) and then
+// HOLDS -- but the clock runs on, so when the next sample lands the clock is already past it and the body JUMPS forward: the rubber
+// band. The debt is how far the render clock is held back: it grows while the render would stand past what the stream covers (a
+// moving stream only: a stopped NPC standing still is not late), so the body waits at the edge of what is known; it is paid back at
+// kCatchRate (the body plays 1.2x real time) once samples are there again, never past what they cover, never before the oldest
+// sample the ring still holds. It never grows past kCatchDebtMaxS: a long silence is not replayed (the resume blend takes that one).
+constexpr double kCatchDebtMaxS = 0.40;
+constexpr double kCatchRate = 0.20;
+// One frame. renderAt0 = now - delay (no debt); covered = the newest sample's stamp + the extrapolation allowed; oldestAt = the
+// ring's oldest stamp. Returns the new debt (s, >= 0).
+inline double catch_debt_step(double debt, double renderAt0, double covered, double oldestAt, bool moving, double dt) {
+    if (!(debt >= 0)) debt = 0;
+    if (!(dt > 0)) dt = 0;
+    const double over = (renderAt0 - debt) - covered;   // how far the render would stand past what is known
+    double d;
+    if (moving && over > 0) d = debt + over;              // hold the clock at the edge of what is known
+    else {
+        d = debt - kCatchRate * dt;                       // pay back: the body plays 1.2x
+        if (over <= 0 && d < debt + over) d = debt + over;   // ...never past what the samples cover
+    }
+    if (d > kCatchDebtMaxS) d = kCatchDebtMaxS;
+    if (d > renderAt0 - oldestAt) d = renderAt0 - oldestAt;  // never render before the oldest sample still held
+    return d < 0 ? 0 : d;
+}
+// The body comes back onto the stream after standing past it (a hold the debt could not cover): blend from where it stands.
+inline bool resume_from_hold_blends(bool wasHeldPast, bool heldPastNow) { return wasHeldPast && !heldPastNow; }
 
 // ---- E.2 a late host state against a missing posture ----
 constexpr double kStateLateS = 2.5;         // the host resends every body each 2 s (wo208_rules.h kResendS): past this the state is late

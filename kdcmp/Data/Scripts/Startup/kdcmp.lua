@@ -209,6 +209,99 @@ local function mp_log(msg)
     System.LogAlways(string.format("[KCD2-MP] %s t=%.3f", msg, os.clock()))
 end
 
+-- KCT QoL (IgnisComeDeliverance): the quiet console, on by default (mp_quiet on|off, the mod menu's "Quiet console").
+-- The mod writes thousands of routine lines; System.LogAlways puts every one on the ~ console as well as in kcd.log.
+-- kcd.log must keep them ALL: the agent reads it (menus, loads, cutscenes, the mod's events), the launcher reads it,
+-- and bug reports are made from it. So the console is quietened only once it is PROVEN that kcd.log still gets
+-- everything:
+--   1. 20 s into a session the console's verbosity goes to 1 (errors only), the file's is kept at 3 or more, and one
+--      probe line is written with System.Log (the verbosity-filtered call);
+--   2. the agent, which reads kcd.log line by line, sees the probe in the FILE and calls KCD2MP_QuietConfirm(nonce);
+--   3. confirmed: every "[KCD2-MP..." line that is not important (an error, a failure, a warning, a refusal, a crash,
+--      the init and build lines) is written with System.Log instead -- in the file, not on the console.
+--   Not confirmed within 5 s (no agent reading the log, or this engine filters the file by the console's verbosity):
+--   the console's verbosity is put back exactly as it was, and nothing else changes. Lines: MP-QUIET <state> ...
+KCD2MP.quiet = KCD2MP.quiet or { want = true, state = "off" }   -- state: off | probing | on | unavailable
+KCD2MP.QUIET_KEEP = { "error", "fail", "warn", "refus", "crash", "fault", "unavailable", "abort", "exception",
+    "MOD INIT", "-BUILD", "MP-QUIET", "MP-SUMMARY", "MP-TOAST" }
+function KCD2MP_QuietImportant(s)
+    local lower = string.lower(s)
+    for _, k in ipairs(KCD2MP.QUIET_KEEP) do
+        if string.find(lower, string.lower(k), 1, true) then return true end
+    end
+    return false
+end
+local function quietCvar(name)
+    local ok, v = pcall(System.GetCVar, name)
+    return ok and tonumber(v) or nil
+end
+local function quietExec(cmd) pcall(System.ExecuteCommand, cmd) end
+local function quietRestore(q, why)
+    if q.always then System.LogAlways = q.always; q.always = nil end
+    if q.oldVerbosity then quietExec("log_Verbosity " .. q.oldVerbosity) end
+    q.oldVerbosity, q.nonce = nil, nil
+    q.state = why == "off" and "off" or "unavailable"
+    mp_log("MP-QUIET " .. q.state .. " -- " .. why .. "; the console shows every line again")
+end
+function KCD2MP_QuietStart()
+    local q = KCD2MP.quiet
+    if not q.want or q.state == "on" or q.state == "probing" then return false end
+    if type(System.Log) ~= "function" then q.state = "unavailable"; mp_log("MP-QUIET unavailable -- no System.Log"); return false end
+    local v, fv = quietCvar("log_Verbosity"), quietCvar("log_WriteToFileVerbosity")
+    if not v then q.state = "unavailable"; mp_log("MP-QUIET unavailable -- log_Verbosity cannot be read"); return false end
+    if v <= 1 then q.state = "unneeded"; mp_log("MP-QUIET unneeded -- the console already shows errors only (log_Verbosity " .. v .. ")"); return false end
+    if fv and fv < 3 then quietExec("log_WriteToFileVerbosity 3") end   -- the file keeps messages (never lowered)
+    q.oldVerbosity = v
+    q.nonce = string.format("q%d", math.floor((os.clock() * 1000) % 1000000))
+    q.state, q.probeAt = "probing", os.clock()
+    quietExec("log_Verbosity 1")
+    System.Log("[KCD2-MP] MP-QUIET probe " .. q.nonce)
+    local nonce = q.nonce
+    Script.SetTimer(5000, function()
+        local qq = KCD2MP.quiet
+        if qq.state == "probing" and qq.nonce == nonce then quietRestore(qq, "the probe did not reach kcd.log within 5 s") end
+    end)
+    return true
+end
+function KCD2MP_QuietConfirm(nonce)
+    local q = KCD2MP.quiet
+    if q.state ~= "probing" or nonce ~= q.nonce then return false end
+    q.state = "on"
+    local always, log = System.LogAlways, System.Log
+    q.always = always
+    System.LogAlways = function(s)
+        s = tostring(s)
+        if string.sub(s, 1, 8) == "[KCD2-MP" and not KCD2MP_QuietImportant(s) then return log(s) end
+        return always(s)
+    end
+    mp_log("MP-QUIET on -- kcd.log keeps every line; the console shows only errors, warnings and the mod's important lines (mp_quiet off to see everything)")
+    return true
+end
+function KCD2MP_QuietSchedule()   -- no timer of its own: the label loop (KCD2MP_QuietTick) starts it when due
+    local q = KCD2MP.quiet
+    if not q.want or q.state ~= "off" or q.startAt then return end
+    q.startAt = os.clock() + 20
+end
+function KCD2MP_QuietTick()
+    local q = KCD2MP.quiet
+    if q.startAt and os.clock() >= q.startAt then q.startAt = nil; KCD2MP_QuietStart() end
+end
+-- mp_quiet on|off (default on); bare = report
+function KCD2MP_QuietSet(arg)
+    local q = KCD2MP.quiet
+    local v = KCD2MP_Wo122ParseBool and KCD2MP_Wo122ParseBool(arg)
+    if v == "bad" then mp_log("mp_quiet: expected on|off, got '" .. tostring(arg) .. "'"); return false end
+    if v == true then
+        q.want = true
+        if q.state ~= "on" and q.state ~= "probing" then q.state = "off"; KCD2MP_QuietStart() end
+    elseif v == false then
+        q.want = false
+        if q.state == "on" or q.state == "probing" then quietRestore(q, "off") else q.state = "off" end
+    end
+    mp_log("MP-QUIET mp_quiet " .. (q.want and "on" or "off") .. " state=" .. q.state)
+    return true
+end
+
 -- WO-106 Phase 5: keep every mod-spawned body out of the player's save.
 -- ENTITY_FLAG_NO_SAVE is registered as a Lua global on this build (WO-106
 -- probe 0.2, live-confirmed = 32768, docs/WO-106-findings.md S1.2) and
@@ -302,6 +395,43 @@ end
 -- ===== Ping Display =====
 -- Called by C# every ~2s after Pong. Stored for render loop to draw via DrawLabel.
 -- Game.ShowNotification adds unwanted "@" decorators so we use DrawLabel instead.
+-- KCT QoL (IgnisComeDeliverance): the partner's badge as a small marker, not a name and numbers (mp_badge_icon on|off, default on;
+-- the mod menu's "Partner badge: icon"). A "v" over the head, coloured by health: green over 60, amber 30-60, red under 30; a short
+-- bar above it only while hurt (under 95); grey while in a menu or reconnecting; a grey "x" when dead. Off: the old name line.
+-- System.DrawLabel draws text only, so the marker is a character, not a picture.
+KCD2MP.icdBadge = KCD2MP.icdBadge or { icon = true }
+function KCD2MP_IcdBadgeIconOn() return KCD2MP.icdBadge.icon ~= false end
+function KCD2MP_IcdBadgeLook(hp, dead, grey)
+    if dead then return "x", 0.6, 0.6, 0.6 end
+    if grey then return "v", 0.65, 0.65, 0.65 end
+    local h = tonumber(hp)
+    if not h then return "v", 0.9, 0.85, 0.6 end                 -- health not known yet: a neutral parchment
+    if h > 60 then return "v", 0.45, 0.85, 0.35 end
+    if h >= 30 then return "v", 1.0, 0.72, 0.2 end
+    return "v", 0.95, 0.25, 0.2
+end
+function KCD2MP_IcdBadgeBar(hp)
+    local h = tonumber(hp)
+    if not h or h >= 95 then return nil end
+    local filled = math.max(0, math.min(8, math.ceil(h / 12.5)))
+    return string.rep("|", filled) .. string.rep(".", 8 - filled)
+end
+function KCD2MP_IcdDrawBadge(x, y, z, lbl, reconnecting)
+    local grey = lbl.inMenu or reconnecting
+    local glyph, r, g, b = KCD2MP_IcdBadgeLook(lbl.hp, lbl.dead, grey)
+    local size = math.max(0.3, lbl.size * 0.9)
+    System.DrawLabel({x=x, y=y, z=z}, size, glyph, r, g, b, 0.85)
+    local bar = not lbl.dead and not grey and KCD2MP_IcdBadgeBar(lbl.hp)
+    if bar then System.DrawLabel({x=x, y=y, z=z + 0.14}, math.max(0.3, lbl.size * 0.7), bar, r, g, b, 0.8) end
+end
+function KCD2MP_IcdSetBadgeIcon(arg)
+    local v = KCD2MP_Wo122ParseBool and KCD2MP_Wo122ParseBool(arg)
+    if v == "bad" then mp_log("mp_badge_icon: expected on|off, got '" .. tostring(arg) .. "'"); return false end
+    if v ~= nil then KCD2MP.icdBadge.icon = v end
+    mp_log("MP-BADGE mp_badge_icon " .. (KCD2MP_IcdBadgeIconOn() and "on -- a small marker coloured by health" or "off -- the partner's name and numbers"))
+    return true
+end
+
 -- KCT QoL (IgnisComeDeliverance): the connection line says how good the link is, not only its ping.
 --   "Connection: Good  ping 63 ms  jitter 8 ms  loss 0%"  (+ "  your game 1.2 s behind" / "  clock +4.75 s" only when they matter)
 -- The grade: Poor at >= 250 ms ping, >= 1 s behind, >= 120 ms jitter or >= 10% loss (the WO-157 thresholds); Fair at >= 120 ms,
@@ -2574,7 +2704,7 @@ function KCD2MP_SetCullRadius(arg)
     end
     if m > CULL_RADIUS_MAX then
         mp_log(string.format("WO1025-CULL-RADIUS %.1f EXCEEDS THE HARD CEILING -- clamped to %.0f m (WO-109 s4.3: the dense-town all-moving bound past this exceeds the joiner's Lua ingress)", m, CULL_RADIUS_MAX))
-        pcall(function() KCD2MP_ShowNativeToast(string.format("Kingdom Come: Together -- cull radius clamped to %.0f m", CULL_RADIUS_MAX)) end)
+        pcall(function() KCD2MP_ShowNativeToast(string.format("IgnisComeDeliverance -- cull radius clamped to %.0f m", CULL_RADIUS_MAX)) end)
         m = CULL_RADIUS_MAX
     end
     local was = w.cullRadius
@@ -9880,7 +10010,7 @@ function KCD2MP_NpcPuppetTick(arg, gen)
                                     or " (observe-only; `mp_npc_chainfix on` to stop it)"))
             -- WO-78: the 2026-09-11 session logged this line on both machines
             -- and nobody could have known to act on it live. Surface it.
-            pcall(function() KCD2MP_ShowNativeToast("Kingdom Come: Together -- NPC puppet chain leak detected -- see kcd.log") end)
+            pcall(function() KCD2MP_ShowNativeToast("IgnisComeDeliverance -- NPC puppet chain leak detected -- see kcd.log") end)
         end
         -- The fix, gated: a stale chain stops rescheduling and dies here.
         if KCD2MP.npcChainFix then return end
@@ -10425,7 +10555,7 @@ function KCD2MP_NpcPuppetTick(arg, gen)
                                     end
                                     pcall(function()
                                         KCD2MP_ShowNativeToast(
-                                            "Kingdom Come: Together -- your story and " .. peer .. "'s have diverged -- nearby NPCs"
+                                            "IgnisComeDeliverance -- your story and " .. peer .. "'s have diverged -- nearby NPCs"
                                             .. " now follow your own game (e.g. " .. tostring(name) .. ")")
                                     end)
                                 end
@@ -11824,6 +11954,7 @@ end
 
 -- Auto-start interp tick (safe to call multiple times)
 function KCD2MP_StartInterp()
+    if KCD2MP_QuietSchedule then pcall(KCD2MP_QuietSchedule) end   -- KCT QoL: the quiet console, 20 s into the session
     -- Liveness, not the flag -- see the comment on tickAlive. A save load
     -- leaves interpRunning true over a dead timer chain, and the old
     -- flag-only guard here made that permanent: every remote ghost frozen for
@@ -12193,11 +12324,16 @@ function KCD2MP_LabelTick()
                 if lbl.ent then lx, ly, lz, lvl = KCD2MP_W158BadgeAnchor(lbl.ent, lbl.x, lbl.y, lbl.z) end
                 if lbl.ent then KCD2MP_W158BadgeNote(id, lvl) end
                 local nm = KCD2MP_W211BadgeName and KCD2MP_W211BadgeName(id, lbl.name) or lbl.name   -- WO-211 A.1.5: "(reconnecting)"
-                System.DrawLabel({x=lx, y=ly, z=lz}, lbl.size, nm, 1, 1, 0, 1)
+                if KCD2MP_IcdBadgeIconOn() then
+                    KCD2MP_IcdDrawBadge(lx, ly, lz, lbl, nm ~= lbl.name)   -- KCT: a small marker coloured by health, a bar only when hurt
+                else
+                    System.DrawLabel({x=lx, y=ly, z=lz}, lbl.size, nm, 1, 1, 0, 1)
+                end
             end)
         end
     end
     if KCD2MP_W211FlyCheck then pcall(KCD2MP_W211FlyCheck) end   -- WO-211 E: the debug flight's state, 10 times a second in a session
+    if KCD2MP_QuietTick then pcall(KCD2MP_QuietTick) end   -- KCT QoL: the quiet console starts 20 s into the session
     -- Draw ping in top-left corner using 2D screen-space DrawText(x, y, text, size).
     if KCD2MP.pingText and not (mm and (mm.clean or mm.pingLine == false)) then
         pcall(function()
@@ -13126,7 +13262,7 @@ function KCD2MP_InterpTick(arg, gen)
                 tostring(gen), tostring(KCD2MP.interpGen),
                 KCD2MP.ghostChainFix and " (stale chain exiting now)"
                                       or " (observe-only; `mp_ghost_chainfix on` to stop it)"))
-            pcall(function() KCD2MP_ShowNativeToast("Kingdom Come: Together -- ghost chain leak detected -- see kcd.log") end)
+            pcall(function() KCD2MP_ShowNativeToast("IgnisComeDeliverance -- ghost chain leak detected -- see kcd.log") end)
         end
         if KCD2MP.ghostChainFix then return end   -- the stale chain stops rescheduling and dies here
     end
@@ -13613,7 +13749,10 @@ function KCD2MP_InterpTick(arg, gen)
                         labelSize = math.max(0.3, math.min(2.0, 10.0 / math.max(dist, 1.0)))
                     end
                 end
-                KCD2MP.labelCache[id] = {x=x, y=y, z=labelZ, size=labelSize, name=displayName, ent=ghost.entity}   -- WO-158 S1: ent = the neck bone read
+                local hs0 = KCD2MP.ghostHealth[id]
+                KCD2MP.labelCache[id] = {x=x, y=y, z=labelZ, size=labelSize, name=displayName, ent=ghost.entity,   -- WO-158 S1: ent = the neck bone read
+                    hp = hs0 and hs0.h and hs0.h >= 0 and hs0.h or nil, dead = KCD2MP.ghostDead[id] and true or nil,   -- KCT: the icon badge
+                    inMenu = KCD2MP.ghostInMenu[id] and true or nil}
             end
         end
         end)  -- end pcall for ghost update
@@ -28026,7 +28165,7 @@ do
         { id = "name_badges", group = "Display", label = "Partner's name badge", kind = "onoff", save = "NameBadges",
           cmd = "mp_name_badges", fn = "KCD2MP_W154SetNameBadges", get = function() return M.nameBadges end,
           help = "Shows your partner's name (and health) above their figure." },
-        { id = "ping_line", group = "Display", label = "Ping and clock line", kind = "onoff", save = "PingLine",
+        { id = "ping_line", group = "Display", label = "Connection line", kind = "onoff", save = "PingLine",
           cmd = "mp_ping_line", fn = "KCD2MP_W154SetPingLine", get = function() return M.pingLine end,
           help = "Shows the connection line in the top left corner (grade, ping, jitter, loss)." },
         { id = "clean_screen", group = "Display", label = "Clean screen", kind = "onoff", save = "CleanScreen",
@@ -28038,6 +28177,12 @@ do
         { id = "marker_style", group = "Display", label = "Marker style (knight)", kind = "onoff", save = "PartnerMarkerArt",
           cmd = "mp_partner_marker_style", fn = "KCD2MP_W171SetStyle", get = function() return KCD2MP.w171 ~= nil and KCD2MP.w171.style ~= "companion" end,
           help = "On: your partner is the artist's knight on the map, in their colour, turning with them. Off: the game's plain pin." },
+        { id = "badge_icon", group = "Display", label = "Partner badge: icon", kind = "onoff", save = "BadgeIcon",
+          cmd = "mp_badge_icon", fn = "KCD2MP_IcdSetBadgeIcon", get = function() return KCD2MP_IcdBadgeIconOn() end,
+          help = "A small marker over your partner coloured by their health (a bar when hurt); off: their name and numbers." },
+        { id = "quiet_console", group = "Display", label = "Quiet console", kind = "onoff", save = "QuietConsole",
+          cmd = "mp_quiet", fn = "KCD2MP_QuietSet", get = function() return KCD2MP.quiet.want end,
+          help = "Keeps the mod's routine lines off the ~ console (they still go to kcd.log); errors and warnings still show." },
         { id = "friendly_fire", group = "Gameplay", label = "Friendly fire", kind = "onoff", host = true, save = "FriendlyFire",
           cmd = "mp_friendly_fire", fn = "KCD2MP_Wo121SetFriendlyFire",
           get = function() return KCD2MP.w121 ~= nil and KCD2MP.w121.friendlyFire end,
@@ -28345,7 +28490,7 @@ do
         local x = math.floor(M.vp.w * L.xFrac)
         local y = math.floor(M.vp.h * L.yFrac)
         local key = M.KEY_NAMES[M.menuKey] or "Insert"
-        System.DrawText(x, y, "Kingdom Come: Together -- mod menu (" .. key .. " to close)", L.title)
+        System.DrawText(x, y, "IgnisComeDeliverance -- mod menu (" .. key .. " to close)", L.title)
         y = y + L.line + 6
         if M.clean then
             System.DrawText(x, y, "Clean screen is ON: the mod shows nothing else.", L.row)
@@ -28531,8 +28676,8 @@ end
 KCD2MP.w159 = { armed = false, listening = false, page = "root", depth = 0, dirty = true, model = nil, sig = "",
     builds = 0, joinState = "idle", lastWhy = "" }
 
-KCD2MP_W159_HINT = "Use Start Game / Join Game while Kingdom Come: Together is running."
-KCD2MP_W159_ABOUT = "Kingdom Come: Together -- unofficial, not affiliated with or endorsed by Warhorse Studios or PLAION."
+KCD2MP_W159_HINT = "Use Start Game / Join Game while IgnisComeDeliverance is running."
+KCD2MP_W159_ABOUT = "IgnisComeDeliverance (a modified version of Kingdom Come: Together) -- unofficial, not affiliated with or endorsed by Warhorse Studios or PLAION."
 -- the game's own pages under the root; Back from one of them returns one level (depth 0 = the root again)
 KCD2MP_W159_SUBPAGES = { Settings = true, GameSettings = true, GraphicSettings = true, AdvancedGraphics = true,
     SoundSettings = true, Controls = true, Keybinds = true, HelpOverlays = true, DLC = true }
@@ -29163,6 +29308,8 @@ local ok, err = pcall(function()
     System.AddCCommand("mp_menu",         'KCD2MP_W154Menu(%line)',           "WO-154: the mod menu (Insert opens it, PgUp/PgDn choose, End changes) -- exactly what its keys do: mp_menu open|close|up|down|change|status|select <n|item>; bare = status")
     System.AddCCommand("mp_name_badges",  'KCD2MP_W154SetNameBadges(%line)',  "WO-154: your partner's name (and health) above his figure (default on): mp_name_badges on|off; bare = report")
     System.AddCCommand("mp_ping_line",    'KCD2MP_W154SetPingLine(%line)',    "WO-154: the connection line in the top left corner (grade, ping, jitter, loss) (default on): mp_ping_line on|off; bare = report")
+    System.AddCCommand("mp_quiet",        'KCD2MP_QuietSet(%line)',        "KCT QoL: the quiet console (default on): the mod's routine lines go to kcd.log only, errors still show: mp_quiet on|off; bare = report")
+    System.AddCCommand("mp_badge_icon",   'KCD2MP_IcdSetBadgeIcon(%line)',   "KCT QoL: the partner's badge as a small marker coloured by health (default on); off = name and numbers: mp_badge_icon on|off")
     System.AddCCommand("mp_clean_screen", 'KCD2MP_W154SetCleanScreen(%line)', "WO-154: hide everything the mod draws -- its lines, the ping line, the name badges, its messages -- for screenshots and recording (default off; the mod menu still opens): mp_clean_screen on|off; bare = report")
     System.AddCCommand("mp_fast_travel",  'KCD2MP_W154SetFastTravel(%line)',  "WO-154 (HOST -- the host's value is the session's): fast travel in a co-op session (default OFF: the engine's wh_pl_FastTravelEnabled is 0 on both machines while a partner is here, given back after): mp_fast_travel on|off; bare = report")
     do
@@ -31975,7 +32122,7 @@ function KCD2MP_QuestFire(beat, who)
     -- call did not throw (WO-43), but a call that DID throw must not be
     -- toasted as a granted objective.
     if not ok then
-        KCD2MP_ShowNativeToast("Kingdom Come: Together -- catch-up command FAILED for " .. beat .. " -- see kcd.log")
+        KCD2MP_ShowNativeToast("IgnisComeDeliverance -- catch-up command FAILED for " .. beat .. " -- see kcd.log")
     elseif fix then
         KCD2MP_ShowNativeToast("Granting objective " .. fix.o .. " (" .. fix.dir .. ") via " .. beat)
     else
@@ -34401,6 +34548,7 @@ do
         posture_no_pos = "mp_posture_no_pos",
         figure_playout = "mp_figure_playout",
         figure_band = "mp_figure_band",
+        catch_up = "mp_catch_up",
         line_latency = "mp_line_latency",
         link_toast = "mp_link_toast",
     }
@@ -34416,6 +34564,7 @@ do
         posture_no_pos = "E.3: (joiner) a seated, lying or working copy takes no position while its posture holds",
         figure_playout = "E.5: (both) the partner's figure on the same play-out as the copies",
         figure_band = "D.4: (both) the figures in the top band: this player's position is read every frame it moves, never behind NPC states",
+        catch_up = "KCT: (joiner) a body that runs out of samples waits, then replays the gap at 1.2x instead of jumping (rubber-banding)",
         line_latency = "E.4: (both) a joined conversation's late line keeps its voice inside its window and never cuts the one before",
         link_toast = "G: (joiner) a plain word when the link to the host is poor for 10 s",
     }

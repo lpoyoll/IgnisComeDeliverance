@@ -178,7 +178,7 @@ namespace KCDMP_launcher.Models
             "pcall(function() UIAction.CallFunction('hud', -1, 'ShowInfoText', " + Lua(text) + ", 10, 15000, true) end)";
 
         public const string ConnectFailedText =
-            "Kingdom Come: Together could not connect. Switch to the launcher window: it says why and what to do.";
+            "IgnisComeDeliverance could not connect. Switch to the launcher window: it says why and what to do.";
 
         /// <summary>A load from the menu (the WO-124 call, after the menu's video is stopped: WO-154's freeze).</summary>
         public static string LoadCall(int playline, string name) =>

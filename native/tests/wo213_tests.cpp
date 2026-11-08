@@ -87,6 +87,37 @@ int wo213_tests(int* passed) {
         WCHECK(posture_hold_sitting(true, false, 24.0f, 0.0f, 17.0, &none) && !none.drifted, "no position read: the hold stays");
     }
 
+    // ---- KCT catch_up: a held body replays what it missed at 1.2x instead of jumping
+    {
+        WCHECK((kBitsDefault & kBitCatchUp) && twin_off_bits("catch_up") == kBitCatchUp, "catch_up: on by default, its own twin name");
+        WCHECK(near_(catch_debt_step(0, 10.0, 10.0, 9.0, true, 0.016), 0), "the render inside what is known: no debt");
+        WCHECK(near_(catch_debt_step(0, 10.05, 10.0, 9.0, true, 0.016), 0.05), "a moving stream 50 ms past what is known: held at the edge");
+        WCHECK(near_(catch_debt_step(0, 10.05, 10.0, 9.0, false, 0.016), 0), "a stopped stream past its newest sample: not late, no debt");
+        WCHECK(near_(catch_debt_step(0, 11.0, 10.0, 9.0, true, 0.016), kCatchDebtMaxS), "a long silence is not replayed: the debt stops at its cap");
+        WCHECK(near_(catch_debt_step(0.3, 10.2, 10.5, 10.0, true, 0.016), 0.2), "never rendered before the oldest sample the ring holds");
+        WCHECK(near_(catch_debt_step(0.1, 10.0, 10.5, 9.0, true, 0.1), 0.08), "data again: paid back at 0.2 s per s (1.2x)");
+        WCHECK(near_(catch_debt_step(0.1, 10.0, 9.91, 9.0, true, 0.1), 0.09), "paying back never runs past what the samples cover");
+        WCHECK(near_(catch_debt_step(-1, 10.0, 10.0, 9.0, true, 0.016), 0) && near_(catch_debt_step(0.1, 10.0, 11.0, 9.0, true, -1), 0.1),
+               "a bad debt or dt does no harm");
+        // a 30 Hz stream walking 1.5 m/s, delay 100 ms, frames at 60 fps; the samples stop for 400 ms, then resume (the backlog arrives)
+        double debt = 0, maxStep = 0, lastX = -1, newest = 0, t = 0;
+        const double delay = 0.10, allow = 0.15, v = 1.5, fps = 1.0 / 60;
+        for (int f = 0; f < 240; ++f, t += fps) {
+            const bool dropout = t >= 1.0 && t < 1.4;
+            if (!dropout) newest = std::floor(t * 30) / 30;        // the newest sample stamp received by now
+            const double r0 = t - delay;
+            debt = catch_debt_step(debt, r0, newest + allow, newest - 0.5, true, fps);
+            const double r = r0 - debt;
+            double x = v * (r < newest + allow ? r : newest + allow);   // interpolation, extrapolation up to `allow`, then hold
+            if (lastX >= 0 && std::fabs(x - lastX) > maxStep) maxStep = std::fabs(x - lastX);
+            lastX = x;
+        }
+        WCHECK(maxStep <= v * fps * 1.25 + 1e-9, "a 400 ms dropout: never a step bigger than 1.2x a frame's walk (max %.4f m)", maxStep);
+        WCHECK(debt < 0.02, "and the debt is paid back once the samples flow again (left %.3f s)", debt);
+        WCHECK(resume_from_hold_blends(true, false) && !resume_from_hold_blends(false, false) && !resume_from_hold_blends(true, true),
+               "a body back on the stream after standing past it blends from where it stands");
+    }
+
     *passed = g_pass;
     return g_fail;
 }

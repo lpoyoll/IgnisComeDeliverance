@@ -308,6 +308,86 @@ check("(h2) grade rules", KCD2MP_IcdConnGrade(119, 39, 1, 499) == 1 and KCD2MP_I
 noErrs("(h2)")
 
 -- ---------------------------------------------------------------------------
+-- (h3) KCT QoL: the quiet console
+do
+    local CV = { log_Verbosity = "3", log_WriteToFileVerbosity = "3" }
+    local FILE, CONSOLE = {}, {}
+    local oldAlways, oldLog, oldGet, oldExec = System.LogAlways, System.Log, System.GetCVar, System.ExecuteCommand
+    local fileFollowsConsole = false
+    System.GetCVar = function(n) return CV[n] end
+    System.ExecuteCommand = function(s) local k, v = tostring(s):match("^(%S+) (%S+)$"); if k and CV[k] then CV[k] = v end end
+    System.LogAlways = function(s) s = tostring(s); LOG[#LOG + 1] = s; FILE[#FILE + 1] = s; CONSOLE[#CONSOLE + 1] = s end
+    System.Log = function(s)
+        s = tostring(s)
+        if not fileFollowsConsole or tonumber(CV.log_Verbosity) >= 3 then FILE[#FILE + 1] = s end
+        if tonumber(CV.log_Verbosity) >= 3 then CONSOLE[#CONSOLE + 1] = s end
+    end
+    local function probe() for _, l in ipairs(FILE) do local n = l:match("MP%-QUIET probe (%w+)") if n then return n end end end
+    KCD2MP.quiet = { want = true, state = "off" }
+    TIMERS = {}
+    check("(h3) start: probing, console verbosity 1", KCD2MP_QuietStart() == true and KCD2MP.quiet.state == "probing" and CV.log_Verbosity == "1")
+    local n = probe()
+    check("(h3) the probe went to the file", n ~= nil)
+    check("(h3) a wrong nonce is refused", KCD2MP_QuietConfirm("zzz") == false and KCD2MP.quiet.state == "probing")
+    check("(h3) the agent confirms: on", KCD2MP_QuietConfirm(n) == true and KCD2MP.quiet.state == "on")
+    FILE, CONSOLE = {}, {}
+    mp_log("NPC-STATE routine line")
+    System.LogAlways("[KCD2-MP-DATA] v2 1 2 3")
+    mp_log("WO208 own_release failed for x")
+    System.LogAlways("an engine line")
+    local function has(t, s) for _, l in ipairs(t) do if l:find(s, 1, true) then return true end end return false end
+    check("(h3) a routine line: in the file, not on the console", has(FILE, "routine line") and not has(CONSOLE, "routine line"))
+    check("(h3) a data line: in the file, not on the console", has(FILE, "KCD2-MP-DATA") and not has(CONSOLE, "KCD2-MP-DATA"))
+    check("(h3) a failure: on the console too", has(CONSOLE, "own_release failed"))
+    check("(h3) the engine's own lines are untouched", has(CONSOLE, "an engine line"))
+    for _, t in ipairs(TIMERS) do t.f() end   -- the 5 s timer after a confirm: nothing
+    check("(h3) the timeout after a confirm does nothing", KCD2MP.quiet.state == "on")
+    check("(h3) mp_quiet off: verbosity back, every line on the console", KCD2MP_QuietSet("off") == true and CV.log_Verbosity == "3" and KCD2MP.quiet.state == "off")
+    CONSOLE = {}; mp_log("NPC-STATE routine again")
+    check("(h3) ...routine lines on the console again", has(CONSOLE, "routine again"))
+    -- an engine that filters the file by the console's verbosity: the probe never reaches the file, the agent never confirms
+    fileFollowsConsole = true; FILE = {}; TIMERS = {}
+    check("(h3) mp_quiet on: probing again", KCD2MP_QuietSet("on") == true and KCD2MP.quiet.state == "probing")
+    check("(h3) ...the probe is not in the file", probe() == nil)
+    for _, t in ipairs(TIMERS) do if t.ms == 5000 then t.f() end end
+    check("(h3) no confirm in 5 s: unavailable, verbosity restored", KCD2MP.quiet.state == "unavailable" and CV.log_Verbosity == "3")
+    check("(h3) ...and LogAlways is the engine's own again", System.LogAlways ~= nil and (function() CONSOLE = {}; mp_log("x routine"); return has(CONSOLE, "x routine") end)())
+    CV.log_WriteToFileVerbosity = "1"; KCD2MP.quiet = { want = true, state = "off" }; fileFollowsConsole = false
+    KCD2MP_QuietStart()
+    check("(h3) a file verbosity under 3 is raised to 3, never lowered", CV.log_WriteToFileVerbosity == "3")
+    KCD2MP_QuietSet("off")
+    System.LogAlways, System.Log, System.GetCVar, System.ExecuteCommand = oldAlways, oldLog, oldGet, oldExec
+    KCD2MP.quiet = { want = true, state = "off" }
+    noErrs("(h3)")
+end
+
+-- ---------------------------------------------------------------------------
+-- (h4) KCT QoL: the partner's badge as a small marker coloured by health
+do
+    local D = {}
+    local oldDL = System.DrawLabel
+    System.DrawLabel = function(pos, size, text, r, g, b, a) D[#D + 1] = { z = pos.z, size = size, text = tostring(text), r = r, g = g, b = b } end
+    local function look(hp, dead, grey) local gl, r, g, b = KCD2MP_IcdBadgeLook(hp, dead, grey); return gl, r, g, b end
+    local _, r1, g1 = look(100); local _, r2, g2 = look(45); local _, r3, g3 = look(10)
+    check("(h4) green when healthy, amber when hurt, red when low", g1 > r1 and r2 == 1.0 and g2 > 0.5 and r3 > 0.9 and g3 < 0.3)
+    check("(h4) dead: a grey x", (look(50, true)) == "x")
+    check("(h4) the bar: none when (nearly) full, 8 segments, filled by health", KCD2MP_IcdBadgeBar(100) == nil and KCD2MP_IcdBadgeBar(96) == nil
+        and KCD2MP_IcdBadgeBar(50) == "||||...." and KCD2MP_IcdBadgeBar(1) == "|......." and KCD2MP_IcdBadgeBar(nil) == nil)
+    KCD2MP_IcdDrawBadge(0, 0, 2, { size = 1.0, hp = 100 }, false)
+    check("(h4) healthy: one small marker, no name, no bar", #D == 1 and D[1].text == "v" and D[1].size < 1.0)
+    D = {}; KCD2MP_IcdDrawBadge(0, 0, 2, { size = 1.0, hp = 40 }, false)
+    check("(h4) hurt: the marker and a bar above it, both amber", #D == 2 and D[2].text == "||||...." and D[2].z > D[1].z and D[1].r == 1.0 and D[2].r == 1.0)
+    D = {}; KCD2MP_IcdDrawBadge(0, 0, 2, { size = 1.0, hp = 40, inMenu = true }, false)
+    check("(h4) in a menu: a grey marker, no bar", #D == 1 and D[1].r == D[1].g)
+    D = {}; KCD2MP_IcdDrawBadge(0, 0, 2, { size = 1.0, hp = 40 }, true)
+    check("(h4) reconnecting: a grey marker, no bar", #D == 1 and D[1].r == D[1].g)
+    check("(h4) mp_badge_icon off / on", KCD2MP_IcdSetBadgeIcon("off") == true and not KCD2MP_IcdBadgeIconOn()
+        and KCD2MP_IcdSetBadgeIcon("on") == true and KCD2MP_IcdBadgeIconOn() and KCD2MP_IcdSetBadgeIcon("maybe") == false)
+    System.DrawLabel = oldDL
+    noErrs("(h4)")
+end
+
+-- ---------------------------------------------------------------------------
 -- (i) peer cutscene state in the local line
 resetQuest()
 before = #LOG
