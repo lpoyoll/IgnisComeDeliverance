@@ -236,6 +236,11 @@ namespace KCDMP_launcher.Models
         // KCT QoL: the launcher checks this fork's GitHub releases once at start and offers a newer one (Home.Update.cs).
         public bool CheckForUpdates { get; set; } = true;
 
+        // KCT QoL: when hosting, the world pauses while the joiner is more than CatchUpPauseSeconds behind and runs again once they've caught
+        // up (60 s at most at a time). The host's choice: passed to the agent as --catchup-pause-s (0 = off).
+        public bool CatchUpPauseOn { get; set; } = true;
+        public int CatchUpPauseSeconds { get; set; } = 5;
+
         // WO-159: the bundled start save (a folder holding one save, or the file) a host's New adventure starts
         // from. Relative = next to the launcher, where Setup puts it.
         public string StartSavePath { get; set; } = "start-save";

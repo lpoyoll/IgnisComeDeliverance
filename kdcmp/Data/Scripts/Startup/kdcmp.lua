@@ -18608,6 +18608,11 @@ function KCD2MP_NpcSilenceRelease(name, p, now)
     local ns = KCD2MP.npcSilence
     if KCD2MP_W148Holds and KCD2MP_W148Holds(name) then return false end   -- WO-148: carried -- the stream waits on purpose
     local quiet = now - (p.lastPacketAt or 0)
+    -- KCT fix (live: copies released and re-adopted in bulk while the game ran 30 s behind, the AI and the mod then fighting over
+    -- them until their queues overflowed): while this game runs behind (the agent's queue, reported with every ping), a quiet copy
+    -- is late, not gone -- it stays held where it is, for 60 s at most
+    local ic = KCD2MP.icdConn
+    if ic and ic.at and (os.clock() - ic.at) < 6 and (ic.lag or 0) >= 2000 and quiet < 60 then return false end
     if KCD2MP.w147.npcCatchup and (now - ns.agentAt) < ns.ttlS then
         local m = ns.silent[name]
         return (m ~= nil and m >= (p.lastPacketAt or 0)) or quiet > ns.fallbackS

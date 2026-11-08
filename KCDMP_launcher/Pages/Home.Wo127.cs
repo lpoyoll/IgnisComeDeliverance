@@ -294,6 +294,7 @@ namespace KCDMP_launcher.Pages
             var agentArgs = target +
                 " " + VoiceSetting.AgentFlag(settings.VoiceChatOn) +
                 " " + KeepAwakeSetting.AgentFlag(settings.KeepGameRunningInBackground) +   // WO-207 C.2
+                " --catchup-pause-s " + (settings.CatchUpPauseOn ? Math.Clamp(settings.CatchUpPauseSeconds, 2, 60) : 0) +   // KCT QoL
                 (isHosting ? " --hosting" : "");
 
             var agentStartInfo = new ProcessStartInfo

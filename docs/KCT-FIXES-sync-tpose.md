@@ -217,3 +217,18 @@ closes the launcher and runs the Setup once the launcher has gone. A release wit
 tree), so the handshake's "both players need the same build" could not tell them apart. From icd11 the id is
 `icdN-<commit>`; the updater reads N from it. A build before icd11 has no number and is never offered an update
 automatically -- install icd11 by hand once.
+
+## icd12: the host pauses while the joiner catches up; copies held while the joiner is behind
+
+Live, 2026-11-08: the joiner's game fell 30 s behind the host's world (its window in the background, then its own log flood).
+Its copies of the host's NPCs went quiet, were handed back to its own AI and re-adopted in bulk (one villager 17 times), the AI
+and the mod fought over them, their action queues overflowed every frame and kcd.log reached 265 MB -- which slowed the game
+further. Two fixes:
+
+- **The host pauses while the joiner catches up** (Co-op options, "Keeping in step (host)": on, 5 s by default, 2-60 s). The
+  joiner reports how far behind its game is every 2 s (W203 kind 13, "behind", from the heartbeat loop that never waits on
+  the game); the host holds its world with the engine's own whole-world pause (the one a join uses) while that is over the
+  setting, and runs again under 1 s -- 60 s at most at a time, then 30 s before the next; never during a join or a link
+  hold; released if the joiner stops reporting for 10 s. Toasts on the host say why. `IcdCatchUpRules`, tested.
+- **Copies are held while the joiner is behind** (`KCD2MP_NpcSilenceRelease`): a quiet copy is late, not gone, while the
+  agent reports this game 2 s or more behind -- it stays where it is (60 s at most) instead of going back to the AI.

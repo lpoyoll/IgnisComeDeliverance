@@ -67,6 +67,7 @@ public partial class GameBridge
     private void Wo201OnDisconnect()
     {
         _w201Connected = false;
+        IcdCatchUpReset();   // KCT QoL: a catch-up hold never outlives the session
         Wo201ScenesReset();
         Wo201ValuesReset();
         Wo201CombatReset();

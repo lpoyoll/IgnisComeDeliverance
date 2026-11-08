@@ -39,6 +39,29 @@
                         </label>
                     </div>
 
+                    <div class="coop-group">
+                        <div class="coop-group-title">Keeping in step (host)</div>
+                        <label class="coop-row">
+                            <input type="checkbox" @bind="Settings.CatchUpPauseOn" />
+                            <span class="coop-text">
+                                <span class="coop-label">Pause when my partner falls behind</span>
+                                <span class="kcd-hint">When you host and your partner's game falls more than the seconds below behind
+                                    yours (a slow PC, or their game in the background), your world pauses until they catch up --
+                                    60 seconds at most at a time.</span>
+                            </span>
+                        </label>
+                        <div class="coop-row coop-number @(Settings.CatchUpPauseOn ? "" : "dim")">
+                            <span class="coop-text">
+                                <span class="coop-label">Seconds behind before pausing</span>
+                                <span class="kcd-hint">2 to 60. Lower keeps you closer in step; higher pauses less often.</span>
+                            </span>
+                            <input class="kcd-input coop-seconds" type="number" min="2" max="60" step="1"
+                                   disabled="@(!Settings.CatchUpPauseOn)"
+                                   value="@Settings.CatchUpPauseSeconds"
+                                   @onchange="e => Settings.CatchUpPauseSeconds = int.TryParse(e.Value?.ToString(), out var s) ? Math.Clamp(s, 2, 60) : 5" />
+                        </div>
+                    </div>
+
                     @foreach (var group in CoopOptions.Groups)
                     {
                         <div class="coop-group">
@@ -86,5 +109,7 @@
         foreach (var o in CoopOptions.All) Values[o.Key] = o.Default;
         Settings.AutoConnect = true;
         Settings.CheckForUpdates = true;
+        Settings.CatchUpPauseOn = true;
+        Settings.CatchUpPauseSeconds = 5;
     }
 }

@@ -324,6 +324,8 @@ public class Wo213MeasureTests
 }
 
 /// <summary>WO-213 C/D: the scheduler (pure). Each check with its twin (the switch off).</summary>
+// KCT fix: Wo213LinkTests sets KCDMP_TEST_W213_OFF for a moment, and LinkScheduler reads it when built -- run apart from it, never beside
+[Collection(Wo206FaultCollection.Name)]
 public class Wo213SchedulerTests
 {
     private static byte[] NpcDown(byte src, string name, float x, ushort seq = 1)

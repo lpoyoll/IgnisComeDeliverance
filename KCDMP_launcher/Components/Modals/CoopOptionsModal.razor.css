@@ -37,3 +37,7 @@
 .coop-text { display: flex; flex-direction: column; gap: 2px; }
 
 .coop-label { color: var(--kcd-parchment); font-size: 15px; }
+
+.coop-number { align-items: center; padding-left: 30px; cursor: default; }
+.coop-number.dim { opacity: 0.5; }
+.coop-seconds { width: 80px; flex: none; margin-left: auto; text-align: center; }

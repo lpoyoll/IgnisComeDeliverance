@@ -58,6 +58,8 @@ public sealed class ClientConfig
     public bool VoiceChatEnabled { get; set; } = false;
     /// <summary>WO-207 C.2: the game keeps running behind another window during the session (KeepAwakeSetting; the launcher's choice).</summary>
     public bool KeepAwake { get; set; } = true;
+    // KCT QoL: the host holds its world while the joiner is this many seconds behind (0 = off; the launcher's Co-op options)
+    public int CatchUpPauseS { get; set; } = 5;
 
     /// <summary>
     /// WO-40 Phase 3: whether this agent participates in session weather
@@ -372,6 +374,11 @@ public sealed class ClientConfig
                         break;
                     case "--no-keep-awake":
                         KeepAwake = false;
+                        break;
+                    case "--catchup-pause-s" when value is not null:   // KCT QoL
+                        if (int.TryParse(value, out int cus) && cus >= 0 && cus <= 120) CatchUpPauseS = cus;
+                        else Console.WriteLine($"[config] --catchup-pause-s '{value}' is not 0..120, keeping {CatchUpPauseS}");
+                        i++;
                         break;
                     case "--guid-damage-fallback":
                         GuidDamageFallbackEnabled = true;

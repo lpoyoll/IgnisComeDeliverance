@@ -96,6 +96,8 @@ public partial class GameBridge
                 Wo203AppearOnFrame(src, m); break;
             case Protocol.W203JoinProgress: case Protocol.W203TravelRoute:
                 Wo203JoinOnFrame(src, m); break;
+            case Protocol.W203Behind:   // KCT QoL
+                Wo203CatchUpOnFrame(src, m); break;
             case Protocol.W203FocusEdge:
                 Wo203QuestOnFrame(src, m); break;
             case Protocol.W203DigestCheckpoint:   // WO-206 C
