@@ -538,6 +538,7 @@ public class Wo213SchedulerTests
         var w = new LinkWriter(new LinkScheduler(new LinkSchedOptions { Unreliable = true }), lane);
         for (int i = 0; i < 5; i++) w.Enqueue(Event(i));
         w.Enqueue(NpcDown(0, "a", 1));
+        await Task.Delay(20);   // KCT fix (icd14): the writer's bucket starts empty; a warm JIT pumped before one frame's bytes refilled (the order-dependent failure)
         await w.PumpOnceAsync(CancellationToken.None);
         Assert.Equal([(Protocol.NpcStateDown, true)], lane.Sent);
         lane.EventPending = 0;                                // the lane drained: the events, in order
@@ -549,6 +550,7 @@ public class Wo213SchedulerTests
         var w1 = new LinkWriter(new LinkScheduler(), one);
         for (int i = 0; i < 5; i++) w1.Enqueue(Event(i));
         w1.Enqueue(NpcDown(0, "a", 1));
+        await Task.Delay(20);
         await w1.PumpOnceAsync(CancellationToken.None);
         Assert.Equal(Protocol.StoryBeatDown, one.Sent[0].Type);
     }

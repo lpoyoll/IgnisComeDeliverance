@@ -305,8 +305,11 @@ public sealed class LinkScheduler
     private void EnqueueEvent(byte[] frame, long now)
     {
         var ev = new Ev { F = frame, Ts = now };
-        if (Options.EventAgeLimits && LinkEventRules.MaxAgeMs(frame) is int age and > 0) ev.MaxAgeTicks = (long)(age * TicksPerMs);
-        if (Options.CoalesceEvents && Options.LatestWins && LinkEventRules.TrySplit(frame, out var c) && c is not null)
+        EventPieces? c = null;
+        if (Options.CoalesceEvents || Options.EventAgeLimits) LinkEventRules.TrySplit(frame, out c);
+        // a camera cut is never aged out either: the listener's view must jump there
+        if (Options.EventAgeLimits && c is not { Protected: true } && LinkEventRules.MaxAgeMs(frame) is int age and > 0) ev.MaxAgeTicks = (long)(age * TicksPerMs);
+        if (Options.CoalesceEvents && Options.LatestWins && c is not null)
         {
             ev.C = c;
             foreach (var it in c.Items)
@@ -375,7 +378,7 @@ public sealed class LinkScheduler
             int max = _queueDepthMax;
             _queueDepthMax = _events.Count;
             return string.Create(CultureInfo.InvariantCulture,
-                $"state_coalesced={LinkEventRules.Counts(_coalescedByKind)} events_expired={LinkEventRules.Counts(_expiredByKind)} queue_depth={_events.Count} queue_depth_max={max} older_state_reordered={Reordered}");
+                $"state_coalesced={_coalescedByKind.Values.Sum()} state_coalesced_by_kind={LinkEventRules.Counts(_coalescedByKind)} events_expired={EventsExpired} events_expired_by_kind={LinkEventRules.Counts(_expiredByKind)} queue_depth={_events.Count} queue_depth_max={max} older_state_reordered={Reordered}");
         }
     }
 
@@ -504,10 +507,7 @@ public sealed class LinkWriter
     private readonly LinkScheduler _sched;
     private readonly ILinkPath _path;
     private readonly SemaphoreSlim _signal = new(0);
-    // KCT fix (icd14): the bucket starts FULL (one burst's worth) -- it started empty, so the first frame waited for the refill of
-    // its own bytes; a fast first pump sent nothing (the order-dependent Wo213SchedulerTests state-lane case: a warm JIT pumped
-    // within the 0.2 ms the first state frame's bytes take to refill at 256 KB/s)
-    private double _tokens = double.NaN;
+    private double _tokens;
     private long _lastRefill = Stopwatch.GetTimestamp();
     public Exception? Failed { get; private set; }
     public long Written, WrittenBytes;
@@ -555,8 +555,7 @@ public sealed class LinkWriter
                 LastRate = st.RateBytesPerS;
                 double rate = st.RateBytesPerS * (1.0 - _sched.Options.Headroom);
                 long now = Stopwatch.GetTimestamp();
-                double cap = Math.Max(4096, rate * 0.05);
-                _tokens = double.IsNaN(_tokens) ? cap : Math.Min(cap, _tokens + rate * Stopwatch.GetElapsedTime(_lastRefill, now).TotalSeconds);
+                _tokens = Math.Min(Math.Max(4096, rate * 0.05), _tokens + rate * Stopwatch.GetElapsedTime(_lastRefill, now).TotalSeconds);
                 _lastRefill = now;
                 budget = (int)Math.Max(0, _tokens);
             }

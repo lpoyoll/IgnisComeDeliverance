@@ -56,7 +56,7 @@ public partial class GameBridge
         if (_httpForMenu is { } h) Console.WriteLine(h.HealthLine());
         if (_transport is LogTailGameTransport t) Console.WriteLine(t.HealthLine());
         var sc = _w213Link?.Steam;
-        string sched = _w213Writer is { } w ? w.Scheduler.HealthText() : "state_coalesced=- events_expired=- queue_depth=0 queue_depth_max=0 older_state_reordered=0";
+        string sched = _w213Writer is { } w ? w.Scheduler.HealthText() : "state_coalesced=0 state_coalesced_by_kind=- events_expired=0 events_expired_by_kind=- queue_depth=0 queue_depth_max=0 older_state_reordered=0";
         Console.WriteLine(string.Create(CultureInfo.InvariantCulture,
             $"MP-HEALTH area=link {sched} inbox_dropped={sc?.InboxStateDropped ?? 0} inbox_depth_max={sc?.InboxMaxDepth ?? 0} older_state_dropped={_icd14Order.OlderDropped}"));
     }
