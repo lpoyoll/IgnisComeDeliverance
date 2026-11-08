@@ -888,14 +888,14 @@ void reconcile_tick(double now) {
                     // WO-201 B23: the night/day dress is the host's value (WO-164 N's row flag) -- the neutral rule asked for nothing, so a
                     // copy that undressed for bed stayed undressed all day. The host's body dressed and this copy still in its night
                     // undress: dressed from what the body is now (paced 20 s, re-read after).
-                    if (!pure && g_wakeDress.load() && !d.hostNight && d.a.stance != R::kLying && now - d.dressCheckAt >= 5.0) {   // KCT: the HOST's stance (a copy loaded in bed was never dressed)
+                    if (g_wakeDress.load() && !d.hostNight && d.a.stance != R::kLying && now - d.dressCheckAt >= 5.0) {   // KCT: the HOST's stance (a copy loaded in bed was never dressed)
                         d.dressCheckAt = now;
                         void* wc = ctx_of_eid(d.eid);
                         void* el = wc ? equipment_element(wc) : nullptr;
                         if (!el) { d.copyNight = false; d.dressElem = nullptr; }
                         else if (el != d.dressElem) { d.dressElem = el; d.copyNight = in_sleep_outfit(wc); }
                     }
-                    if (!pure && g_wakeDress.load() && !d.hostNight && d.a.stance != R::kLying && d.copyNight && now >= d.dressNextAt) {
+                    if (g_wakeDress.load() && !d.hostNight && d.a.stance != R::kLying && d.copyNight && now >= d.dressNextAt) {
                         d.dressNextAt = now + 20.0;
                         uint8_t dres = 0;
                         const uint8_t dr = apply_now(d.eid, cur, &dres, nullptr, d.name.c_str());

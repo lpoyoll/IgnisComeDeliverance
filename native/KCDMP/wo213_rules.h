@@ -30,7 +30,7 @@ constexpr uint32_t kBitFigureBand = 0x20;      // D.4 figure_band (the local pla
 constexpr uint32_t kBitCatchUp = 0x40;       // KCT catch_up: a held body replays what it missed at 1.2x instead of jumping, and blends back from a hold
 // KCT fix (icd14) A: a host copy is a pure puppet -- its loaded NPC state (the planner's demand) is not rewritten from the body each time
 // the body's activity changes (WO-200 II.4's neutral write), only once and then when the loaded state itself was replaced (a load, the
-// game's own placement), at most every kPureCopyRewriteS; and no night-dress placement is asked for it
+// game's own placement), at most every kPureCopyRewriteS (the WO-201 B23 night/day dress fix still runs: it is visible, rare and paced)
 constexpr uint32_t kBitPureCopy = 0x80;
 constexpr double kPureCopyRewriteS = 10.0;
 constexpr uint32_t kBitsDefault = kBitNpcBands | kBitPlayoutAdaptive | kBitPostureHoldLate | kBitPostureNoPos | kBitFigurePlayout | kBitFigureBand | kBitCatchUp | kBitPureCopy;
