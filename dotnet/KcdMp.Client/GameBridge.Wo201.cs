@@ -55,11 +55,13 @@ public partial class GameBridge
     // ---- the session loop: the DLL's config every 2 s (B1), the parts' ticks ----
     private bool _w201Connected;
     private long _w201TickN;
+    private int _w201CfgBusy, _w201StatusBusy;   // KCT fix: one of each in flight at most
 
     private void Wo201OnConnect(CancellationToken ct)
     {
         _w201Connected = true;
         _ = Wo201LoopAsync(ct);
+        _ = Wo204HeartbeatLoopAsync(ct);   // KCT fix: the join's "still loading" never waits behind the game
     }
 
     private void Wo201OnDisconnect()
@@ -83,10 +85,14 @@ public partial class GameBridge
             try
             {
                 long n = ++_w201TickN;
-                if (n % 8 == 3) await Wo201PushConfigAsync();
+                // KCT fix: never awaited here -- a loading game does not answer the DLL pipe, and this loop stalled with it (live: the join's
+                // heartbeat stopped for 60 s, the host aborted the join while the joiner loaded). One at a time, so a stall never piles them up.
+                if (n % 8 == 3 && Interlocked.CompareExchange(ref _w201CfgBusy, 1, 0) == 0)
+                    _ = Task.Run(async () => { try { await Wo201PushConfigAsync(); } finally { Volatile.Write(ref _w201CfgBusy, 0); } });
                 Wo201ScenesTick(Environment.TickCount64);
                 Wo201Tick(n);
-                if (n % 240 == 130) await Wo201StatusAsync();
+                if (n % 240 == 130 && Interlocked.CompareExchange(ref _w201StatusBusy, 1, 0) == 0)
+                    _ = Task.Run(async () => { try { await Wo201StatusAsync(); } finally { Volatile.Write(ref _w201StatusBusy, 0); } });
             }
             catch (Exception ex) { Console.WriteLine($"MP-W201 loop: {ex.GetType().Name}: {ex.Message}"); }
         }

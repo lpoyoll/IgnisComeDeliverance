@@ -191,3 +191,15 @@ and queued another idle -- every frame. Fixed:
 
 - a quiet let-go drops the copy's states too (`g_copyStates.erase`): only a new state from the host owns it again;
 - the let-go's base is given at most once per copy every 10 s, whatever loop ever lets a copy go again and again.
+
+## icd10: the join's "still loading" heartbeat never waits behind the game
+
+Live, 2026-11-08: two of three joins ended "The join ended (timeout)". Each time the joiner's game took 112-118 s to load
+the host's world (about 104 s of it the game reading the save), and the host gave up 60 s into the load -- its rule:
+60 s without the joiner's "still loading" (WO-204 IV.1, sent every 5 s). The joiner's session loop, which sent it, printed
+its every-2-s link line twice in that minute: it was stalled, because it awaited two calls into the DLL, which a loading
+game does not answer. The one join that held was a load in which the loop happened not to block.
+
+- the heartbeat runs in its own loop that waits on nothing but the clock (`Wo204HeartbeatLoopAsync`), and logs
+  `MP-JOIN joiner: told the host 'still loading' (...)` every 30 s;
+- the session loop no longer awaits its two DLL calls (one of each in flight at most).

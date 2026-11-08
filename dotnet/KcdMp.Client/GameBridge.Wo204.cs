@@ -37,6 +37,25 @@ public partial class GameBridge
     {
         if (n % 8 == 5) _ = Wo204PushConfigAsync();   // every 2 s: a DLL that came back (a rejoin, a new game) has the switches
         Wo204ConvPollTick();                          // III.3: the starter's HUD rows, while someone listens
+        // IV.1 (the joiner's load reported to the host every 5 s) runs in its own loop now: Wo204HeartbeatLoopAsync
+    }
+
+    /// <summary>
+    /// KCT fix: IV.1's heartbeat in a loop of its own, which waits on nothing but the clock. It ran in the session tick, which stalled
+    /// while a loading game held the DLL pipe: no heartbeat for 60 s, and the host aborted the join while the joiner was still loading
+    /// (live, 2026-11-08: two of three joins).
+    /// </summary>
+    private async Task Wo204HeartbeatLoopAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested && _w201Connected)
+        {
+            try { await Task.Delay(1000, ct); } catch { break; }
+            try { Wo204HeartbeatOnce(); } catch (Exception ex) { Console.WriteLine($"MP-W204 heartbeat: {ex.GetType().Name}: {ex.Message}"); }
+        }
+    }
+
+    private void Wo204HeartbeatOnce()
+    {
         // IV.1, the joiner: from the world's arrival to his ready, his load is reported to the host every 5 s -- the host's paused
         // world waits for it (60 s of silence aborts there)
         uint jid = _joinReceivedId;
@@ -49,6 +68,8 @@ public partial class GameBridge
         string text = Wo204Rules.JoinProgressText(jid, where, (int)((now - _w204JoinWorldAtMs) / 1000));
         Interlocked.Increment(ref _w204JoinProgressOut);
         _ = Wo203SendSideAsync(Protocol.JoinTargetHost, Protocol.W203JoinProgress, text);
+        int secsLoading = (int)((now - _w204JoinWorldAtMs) / 1000);
+        if (secsLoading % 30 < 5) Console.WriteLine($"MP-JOIN joiner: told the host 'still loading' (join 0x{jid:x8}, {where}, {secsLoading} s)");
     }
 
     /// <summary>IV.1, the host: the joiner's load progress renews the paused join's deadline and shows on the host's bar.</summary>
