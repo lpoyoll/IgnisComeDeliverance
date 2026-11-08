@@ -291,6 +291,29 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
     public long Overflowed { get { lock (_queueLock) return _queue.Overflowed; } }
     public long StaleDropped { get { lock (_queueLock) return _queue.StaleDropped; } }
 
+    // ---- KCT fix (icd14): the queue's switches (W207 lua_edge_ttl / lua_evict / lua_replay / lua_recovery_drain) and its health line
+
+    /// <summary>An Edge statement expires by its class (LuaEdgeRules) -- off: 120 s for every Edge.</summary>
+    public bool EdgeTtlByClass { get { lock (_queueLock) return _queue.EdgeTtlByClass; } set { lock (_queueLock) _queue.EdgeTtlByClass = value; } }
+    /// <summary>Over the bound an expired / expendable Edge goes before a Level state -- off: the oldest Level state first.</summary>
+    public bool EvictExpendableFirst { get { lock (_queueLock) return _queue.EvictExpendableFirst; } set { lock (_queueLock) _queue.EvictExpendableFirst = value; } }
+    /// <summary>A timed-out batch's Level statements go behind newer work -- off: back in front with its Edges.</summary>
+    public bool ReplayLevelBehind { get { lock (_queueLock) return _queue.ReplayLevelBehind; } set { lock (_queueLock) _queue.ReplayLevelBehind = value; } }
+    /// <summary>When the game answers again after a hold, several batches go at once -- off: the next one a second later.</summary>
+    public bool RecoveryDrain { get; set; } = true;
+    public int RecoveryDrainBatches { get; set; } = 8;
+
+    public LuaHealth Health { get; } = new();
+
+    /// <summary>MP-HEALTH area=lua (the answer-time window starts over).</summary>
+    public string HealthLine()
+    {
+        int queued; long replays, evicted; long[] expired;
+        lock (_queueLock) { queued = _queue.Count; replays = _queue.ReplaysDroppedSuperseded; evicted = _queue.Overflowed; expired = (long[])_queue.EdgesExpiredByClass.Clone(); }
+        return LuaHealth.Line(queued, Interlocked.Read(ref Health.SentBatches), Interlocked.Read(ref Health.BatchTimeouts), replays, expired, evicted,
+                              Interlocked.Read(ref Health.RecoveryDrains), Health.AnswerMs.Take());
+    }
+
     private static string Wrap(string lua) => "pcall(function() " + lua + " end)\n";
     private static string WrapOnce(string lua, string id) =>
         "pcall(function() local f=function() " + lua + " end if KCD2MP_Once then KCD2MP_Once(\"" + id + "\",f) else f() end end)\n";
@@ -339,7 +362,9 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
         {
             lock (_queueLock)
             {
-                _queue.Add(new BatchQueue.Entry { Lua = lua, Text = text, Kind = kind, Key = key, OnceId = onceId, Encoded = enc, EnqueuedMs = NowMs(), Kind207 = Wo207Trace.Kind.Value });
+                int k207 = Wo207Trace.Kind.Value;
+                var cls = kind == BatchKind.Edge ? LuaEdgeRules.Classify(LuaEdgeRules.FunctionOf(lua), k207) : EdgeClass.Normal;   // KCT fix (icd14)
+                _queue.Add(new BatchQueue.Entry { Lua = lua, Text = text, Kind = kind, Key = key, OnceId = onceId, Encoded = enc, EnqueuedMs = NowMs(), Kind207 = k207, Class = cls });
                 full = _queue.QueuedEncoded >= MaxBatchChars - 200;   // full enough: do not wait for the loop
             }
         }
@@ -440,6 +465,7 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
             await SendNowAsync(sb.ToString(), ct);
             _consecutiveFailures = 0;
             long answeredMs = NowMs();
+            Health.Sent(answeredMs - sentMs);   // KCT fix (icd14): MP-HEALTH area=lua
             foreach (var e in batch)
             {
                 Wo202CrashWatch.NoteApplied(e.Lua);   // WO-202 I.1: a crash report names the last ones
@@ -461,6 +487,7 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
                 return false;
             }
             lock (_queueLock) _queue.Requeue(batch);
+            Interlocked.Increment(ref Health.BatchTimeouts);
             BatchesRetried++;
             int n = ++_consecutiveFailures;
             LogRetry(batch, ex);
@@ -510,16 +537,29 @@ public sealed partial class HttpGameTransport(string gameApiBase, int timeoutMs 
                         // a failure here is expected while the game is away: the statements go back, nothing is counted twice
                         var sb = new StringBuilder();
                         foreach (var e in batch) sb.Append(e.Text);
-                        try { await SendNowAsync(sb.ToString(), ct); answered = true; }
-                        catch (Exception ex) when (IsNoAnswer(ex)) { answered = false; lock (_queueLock) _queue.Requeue(batch); }
+                        long sent = NowMs();
+                        try { await SendNowAsync(sb.ToString(), ct); answered = true; Health.Sent(NowMs() - sent); }
+                        catch (Exception ex) when (IsNoAnswer(ex)) { answered = false; lock (_queueLock) _queue.Requeue(batch); Interlocked.Increment(ref Health.BatchTimeouts); }
                     }
                     if (answered)
                     {
                         long downMs = NowMs() - _heldSinceMs;
                         _consecutiveFailures = 0;
                         _held = false;
+                        // KCT fix (icd14): the game answers again -- the backlog goes now, several batches in a row at the game's own pace,
+                        // not one a second (off: the flusher or the next flush call picks it up)
+                        if (RecoveryDrain)
+                            for (int i = 0; i < RecoveryDrainBatches && !ct.IsCancellationRequested; i++)
+                            {
+                                List<BatchQueue.Entry> more;
+                                lock (_queueLock) more = _queue.TakeBatch(MaxBatchChars, NowMs());
+                                if (more.Count == 0) break;
+                                Interlocked.Increment(ref Health.RecoveryDrains);
+                                if (!await SendEntriesAsync(more, ct)) break;
+                            }
                         int queued; lock (_queueLock) queued = _queue.Count;
                         Console.WriteLine($"MP-BATCH-HOLD up after {downMs / 1000.0:F1} s: {queued} statement(s) still queued, {Superseded} replaced by a newer state, {Expired} expired, {Overflowed} over the bound, {StaleDropped} stale (retried batches {BatchesRetried})");
+                        if (RecoveryDrain && Decoupled && queued > 0) RequestFlush();   // KCT fix (icd14): the flusher takes the rest at once
                         return;
                     }
                 }

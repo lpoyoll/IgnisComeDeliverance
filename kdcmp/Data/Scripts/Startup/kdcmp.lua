@@ -35033,6 +35033,9 @@ do
         proc_side_join = "mp_proc_side_join",
         proc_drop_stale = "mp_proc_drop_stale",
         lane_newest_per_npc = "mp_lane_newest_per_npc",
+        lua_edge_ttl = "mp_lua_edge_ttl", lua_evict = "mp_lua_evict", lua_replay = "mp_lua_replay", lua_recovery_drain = "mp_lua_recovery_drain",   -- KCT fix (icd14)
+        evt_resume = "mp_evt_resume", evt_skip_spam = "mp_evt_skip_spam", evt_early_fast = "mp_evt_early_fast", evt_seq_check = "mp_evt_seq_check", evt_handler_task = "mp_evt_handler_task",   -- KCT fix (icd14)
+        link_event_coalesce = "mp_link_event_coalesce", link_event_age = "mp_link_event_age", steam_inbox_bound = "mp_steam_inbox_bound", state_order = "mp_state_order",   -- KCT fix (icd14)
     }
     W213.HELP = {
         link_sched = "C: (both) a body's newer state replaces its older unsent one; events first, in order (next connection)",

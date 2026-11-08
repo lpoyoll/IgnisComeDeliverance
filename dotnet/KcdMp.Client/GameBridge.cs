@@ -1,4 +1,4 @@
-﻿// Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 // Portions from the original project, marczukmichal/kcd2-multiplayer; its author keeps their copyright (AUTHORS).
@@ -1306,6 +1306,7 @@ public partial class GameBridge(ClientConfig config)
         http.Decoupled = W207("queue_decouple");   // WO-207 B.3 (a twin's KCDMP_TEST_W207_OFF can turn it off from the start)
         _combat.FramesFirst = W207("queue_decouple");
         IcdApplyPipeSwitches();   // KCT fix (icd14): the pipe's switches (a twin's KCDMP_TEST_W213_OFF from the start)
+        Icd14ApplySwitches();   // KCT fix (icd14)
         while (!ct.IsCancellationRequested)
         {
             await WaitForGameAsync(ct);
@@ -4684,6 +4685,7 @@ public partial class GameBridge(ClientConfig config)
                 }
                 Wo213NoteIn(type, payload, arrival, wireBytes);   // WO-213 A.1/A.5: at the socket, before any queue of this agent
                 Wo138NoteArrival(type, payload);   // WO-138: the source's link is alive (the joiner's hold)
+                if (Icd14DropOlderState(type, payload)) continue;   // KCT fix (icd14): an older state of a body than one already read (the other lane)
                 Wo147NotePositionAtRead(type, payload, arrival);   // WO-147: the leash's positions, stamped as they arrive
                 Wo147NoteNpcAtRead(type, payload, arrival);        // the backlog fix: the newest sample of each NPC/avatar, as read
                 Volatile.Write(ref _w202LastReadMs, W147StampMs(arrival));   // WO-202 III.2: the queue's lag is measured against this

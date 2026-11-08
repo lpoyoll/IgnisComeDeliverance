@@ -35,6 +35,7 @@ public partial class GameBridge
     /// the mod every 5 s (the session runs).</summary>
     private void Wo207Tick(long n)
     {
+        if (n % 40 == 5) Icd14HealthTick();   // KCT fix (icd14): MP-HEALTH every 10 s
         if (n % 20 == 1) _ = ExecLuaAsync(Wo207KeepAwakeLua(true));
         if (n % 4 == 2) Wo207NpcTrigTick();   // D.2
         if (n % 4 != 0 || LivePartners().Count == 0) return;

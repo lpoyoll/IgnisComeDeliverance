@@ -124,7 +124,7 @@ public static class LinkStateCodec
     }
 
     /// <summary>One item's length (name byte included), 0 when it does not parse.</summary>
-    private static int ItemLen(int type, byte extraKind, ReadOnlySpan<byte> p, int o, int nl)
+    internal static int ItemLen(int type, byte extraKind, ReadOnlySpan<byte> p, int o, int nl)
     {
         int b = o + 1 + nl;   // after the name
         switch (type)
@@ -202,6 +202,12 @@ public sealed class LinkSchedOptions
     public int EventBurstBytes = 16 * 1024;
     /// <summary>D.2: each band's period (the urgency's yardstick): fight, 40 m, 150 m, beyond.</summary>
     public int[] BandPeriodMs = [33, 50, 100, 500];
+    /// <summary>KCT fix (icd14, W213 link_event_coalesce): an event that is a body's latest state (activity rows and extras, a conversation's
+    /// camera and cursor) is replaced while it waits by a newer one of the same body; it stays reliable and in order (LinkEventRules).</summary>
+    public bool CoalesceEvents = true;
+    /// <summary>KCT fix (icd14, W213 link_event_age): an event worthless once old (voice, camera samples, the cursor, "ms behind") is dropped
+    /// at send time past its kind's age and counted; every kind that must arrive has no age.</summary>
+    public bool EventAgeLimits = true;
 }
 
 /// <summary>
@@ -223,7 +229,18 @@ public sealed class LinkScheduler
     }
 
     private readonly object _lock = new();
-    private readonly Queue<(byte[] F, long Ts)> _events = new();
+    // KCT fix (icd14): a list (was a queue) so a waiting coalescable event can be replaced by a newer one of its body
+    private sealed class Ev
+    {
+        public byte[] F = [];
+        public long Ts, MaxAgeTicks;
+        public EventPieces? C;
+    }
+    private readonly LinkedList<Ev> _events = new();
+    private readonly Dictionary<string, LinkedListNode<Ev>> _evByKey = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, long> _coalescedByKind = new(StringComparer.Ordinal), _expiredByKind = new(StringComparer.Ordinal);
+    private int _queueDepthMax;
+    public long EventsCoalesced, EventsExpired;
     private readonly Dictionary<string, Slot> _slots = new(StringComparer.Ordinal);
     private readonly Dictionary<string, long> _npcSeenTs = new(StringComparer.Ordinal);   // body name -> its last NPC state (repeats' liveness)
     private readonly Dictionary<string, int> _npcBand = new(StringComparer.Ordinal);      // body name -> the band of its last NPC state
@@ -257,9 +274,7 @@ public sealed class LinkScheduler
             _split.Clear();
             if (!Options.LatestWins || !LinkStateCodec.Split(frame, _split))
             {
-                _events.Enqueue((frame, now));
-                _eventBytes += frame.Length;
-                EventsIn++;
+                EnqueueEvent(frame, now);
                 return;
             }
             StateIn++;
@@ -272,6 +287,7 @@ public sealed class LinkScheduler
                     // sample replacing a newer one still waiting meant the newer one was never sent (one step behind until the heartbeat)
                     if (LinkStateCodec.IsOlder(p, s.P)) { Reordered++; continue; }
                     Coalesced++;
+                    Bump(_coalescedByKind, p.Kind.Replace(':', '.'));
                 }
                 s.P = p; s.UpdatedTs = now; s.Dirty = true; s.AliveTs = now;
                 if (p.Kind == "npc-state")
@@ -285,6 +301,87 @@ public sealed class LinkScheduler
         }
     }
 
+    /// <summary>KCT fix (icd14): an event in; a coalescable one first takes its bodies out of an older waiting frame (under the lock).</summary>
+    private void EnqueueEvent(byte[] frame, long now)
+    {
+        var ev = new Ev { F = frame, Ts = now };
+        EventPieces? c = null;
+        if (Options.CoalesceEvents || Options.EventAgeLimits) LinkEventRules.TrySplit(frame, out c);
+        // a camera cut is never aged out either: the listener's view must jump there
+        if (Options.EventAgeLimits && c is not { Protected: true } && LinkEventRules.MaxAgeMs(frame) is int age and > 0) ev.MaxAgeTicks = (long)(age * TicksPerMs);
+        if (Options.CoalesceEvents && Options.LatestWins && c is not null)
+        {
+            ev.C = c;
+            foreach (var it in c.Items)
+                if (_evByKey.TryGetValue(it.Key, out var old) && old.Value.C is { Protected: false } && RemovePiece(old, it.Key))
+                {
+                    EventsCoalesced++;
+                    Bump(_coalescedByKind, c.Kind);
+                }
+        }
+        var node = _events.AddLast(ev);
+        _eventBytes += frame.Length;
+        EventsIn++;
+        if (ev.C is { } cc) foreach (var it in cc.Items) _evByKey[it.Key] = node;
+        if (_events.Count > _queueDepthMax) _queueDepthMax = _events.Count;
+    }
+
+    /// <summary>Takes one body's piece out of a waiting frame (the frame goes when it has none left).</summary>
+    private bool RemovePiece(LinkedListNode<Ev> node, string key)
+    {
+        var ev = node.Value;
+        if (ev.C is not { } c) return false;
+        int i = c.Items.FindIndex(x => x.Key == key);
+        if (i < 0) return false;
+        c.Items.RemoveAt(i);
+        if (_evByKey.TryGetValue(key, out var cur) && ReferenceEquals(cur, node)) _evByKey.Remove(key);
+        if (c.Items.Count == 0)
+        {
+            _events.Remove(node);
+            _eventBytes -= ev.F.Length;
+            return true;
+        }
+        var nf = c.Build();
+        _eventBytes += nf.Length - ev.F.Length;
+        ev.F = nf;
+        return true;
+    }
+
+    private Ev DequeueEvent()
+    {
+        var n = _events.First!;
+        _events.RemoveFirst();
+        var e = n.Value;
+        _eventBytes -= e.F.Length;
+        if (e.C is { } c) foreach (var it in c.Items) if (_evByKey.TryGetValue(it.Key, out var cur) && ReferenceEquals(cur, n)) _evByKey.Remove(it.Key);
+        return e;
+    }
+
+    /// <summary>KCT fix (icd14): the waiting events at the head that are past their kind's age go (counted); the rest wait their turn.</summary>
+    private void DropExpiredHead(long now)
+    {
+        while (_events.First is { } n && n.Value.MaxAgeTicks > 0 && now - n.Value.Ts > n.Value.MaxAgeTicks)
+        {
+            var e = DequeueEvent();
+            EventsExpired++;
+            Bump(_expiredByKind, LinkEventRules.Label(e.F));
+        }
+    }
+
+    private static void Bump(Dictionary<string, long> d, string k) => d[k] = d.TryGetValue(k, out long n) ? n + 1 : 1;
+
+    /// <summary>KCT fix (icd14): the scheduler's part of MP-HEALTH area=link (totals; queue_depth_max starts over).</summary>
+    public string HealthText()
+    {
+        lock (_lock)
+        {
+            int max = _queueDepthMax;
+            _queueDepthMax = _events.Count;
+            return string.Create(CultureInfo.InvariantCulture,
+                $"state_coalesced={_coalescedByKind.Values.Sum()} state_coalesced_by_kind={LinkEventRules.Counts(_coalescedByKind)} events_expired={EventsExpired} events_expired_by_kind={LinkEventRules.Counts(_expiredByKind)} queue_depth={_events.Count} queue_depth_max={max} older_state_reordered={Reordered}");
+        }
+    }
+
     /// <summary>
     /// The next frame to send, or false when nothing may go now. <paramref name="budgetBytes"/>: what the budget allows this moment
     /// (int.MaxValue = no budget); <paramref name="pendingBytes"/>: what the path already holds (-1 = it does not say).
@@ -295,10 +392,10 @@ public sealed class LinkScheduler
         frame = []; isState = false;
         lock (_lock)
         {
+            DropExpiredHead(now);   // KCT fix (icd14)
             bool TakeEvent(out byte[] f)
             {
-                var e = _events.Dequeue();
-                _eventBytes -= e.F.Length;
+                var e = DequeueEvent();
                 EventsSent++;
                 _eventBytesSinceState += e.F.Length;
                 if (_eventAgeAtSendMs.Count < 20_000) _eventAgeAtSendMs.Add((now - e.Ts) / TicksPerMs);

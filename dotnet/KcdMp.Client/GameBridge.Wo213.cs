@@ -108,6 +108,7 @@ public partial class GameBridge
                 _w213On[arg[..eq]] = arg[(eq + 1)..] == "on";
                 Console.WriteLine($"MP-W213 cfg {arg}");
                 IcdApplyPipeSwitches();   // KCT fix (icd14): the pipe's own switches (CombatPipe)
+                Icd14ApplySwitches();   // KCT fix (icd14): the link's event coalescing / ages, Steam's inbox bound, the state order
                 _ = Wo213PushNativeAsync();
                 return;
             }
@@ -266,7 +267,8 @@ public partial class GameBridge
         else if (link.Steam is not null) Console.WriteLine("MP-LINK steam-config left at Steam's own (the twin: steam_cfg off)");
         if (W213Switch.TwinOff("link_sched")) { Console.WriteLine("MP-LINK scheduler OFF (the twin: link_sched) -- every frame written in order as before"); return; }
         ILinkPath path = link.Steam is { } s2 ? new SteamLinkPath(s2) : new StreamLinkPath(stream);
-        var sched = new LinkScheduler(new LinkSchedOptions { Budget = !W213Switch.TwinOff("link_budget") });
+        var sched = new LinkScheduler(new LinkSchedOptions { Budget = !W213Switch.TwinOff("link_budget"),
+                                                             CoalesceEvents = W213On("link_event_coalesce"), EventAgeLimits = W213On("link_event_age") });   // KCT fix (icd14)
         // D.4: this player's own position is the top band; everything else this agent sends is its own few bodies
         if (!W213Switch.TwinOff("figure_band")) sched.BandOf = p => p.Kind == "pos" ? 0 : null;
         var w = new LinkWriter(sched, path);
@@ -484,7 +486,9 @@ public static class W213Rules
         "playout_adaptive", "posture_hold_late", "posture_no_pos", "figure_playout", "line_latency", "link_toast", "catch_up",
         // KCT fix (icd14): the DLL link (GameBridge.Icd14Pipe.cs, CombatPipe; the two native ones ride the word, bits 0x1000 / 0x2000)
         "pipe_oversize_guard", "pipe_oversize_skip", "pipe_pump_budget", "pipe_config_replay", "pipe_poll_age", "pipe_cb_lane",
-        "proc_side_queues", "proc_side_join", "proc_drop_stale", "lane_newest_per_npc"];
+        "proc_side_queues", "proc_side_join", "proc_drop_stale", "lane_newest_per_npc",
+        "lua_edge_ttl", "lua_evict", "lua_replay", "lua_recovery_drain", "evt_resume", "evt_skip_spam", "evt_early_fast", "evt_seq_check", "evt_handler_task",
+        "link_event_coalesce", "link_event_age", "steam_inbox_bound", "state_order"];   // KCT fix (icd14)
 
     /// <summary>D.2's bands: fight / near / mid radii (m), then the four periods (ms); "15:33,40:50,150:100,0:500" overrides (the bench).</summary>
     public static int[] Bands(string? env)
