@@ -101,6 +101,7 @@ public partial class GameBridge(ClientConfig config)
     private bool NpcNativeBound(string npc) => _nativeWriteOn && _nativeBound.ContainsKey(npc);
     private volatile bool _nativeSenderClock = true;  // mirror of mp_npc_senderclock (native side)
     private int _nativeHeartbeatBusy;
+    private int _nativePipeGenSeen;   // KCT fix (icd13): the CombatPipe connection last told to Lua
     private long _nativeHeartbeats;
     private long _nativeBindsOk, _nativeBindsRefused, _nativeDrops, _nativeHolds;
     private static readonly TimeSpan NativeHeartbeatInterval = TimeSpan.FromSeconds(1);
@@ -4644,6 +4645,9 @@ public partial class GameBridge(ClientConfig config)
         // WO-207 B.3: the activity frames' own lane (each row a native write through the pipe; in order, never in the frame processor's way)
         var actLane = Channel.CreateUnbounded<InFrame>(new UnboundedChannelOptions { SingleReader = true });
         _ = Wo207ActivityLaneAsync(actLane.Reader, ct);
+        // KCT fix (icd13): the NPC animation states' own lane (GameBridge.Wo207.cs)
+        var animLane = Channel.CreateUnbounded<InFrame>(new UnboundedChannelOptions { SingleReader = true });
+        _ = IcdAnimLaneAsync(animLane.Reader, ct);
         // The coalescer's clock: a pending Lua push must go out once it is due
         // even when no further frame for that NPC arrives (a puppet that just
         // stopped). Through the channel, so the push state stays single-threaded.
@@ -4694,6 +4698,10 @@ public partial class GameBridge(ClientConfig config)
                 if (type == Protocol.ConvDown && W207("conv_lane")) { convLane.Writer.TryWrite(new InFrame(type, payload, arrival, stamp)); continue; }   // WO-207 A.1
                 if ((type == Protocol.ActivityHostDown || type == Protocol.ActivityExtraDown) && W207("queue_decouple"))   // WO-207 B.3
                 { actLane.Writer.TryWrite(new InFrame(type, payload, arrival, stamp)); continue; }
+                // KCT fix (icd13): the host's NPC animation states wait for the DLL pipe (~300 ms each on the field's joiner); in the one
+                // processor every frame behind them waited too and the joiner fell 30-73 s behind. Their own lane, like the activities.
+                if (type == Protocol.NpcAnimDown && W207("queue_decouple"))
+                { animLane.Writer.TryWrite(new InFrame(type, payload, arrival, stamp)); continue; }
                 FeedNativeAtRead(type, payload, arrival);
                 if (W202("net_game_queue") && Wo202Coalesce(frames.Writer, type, payload, arrival, stamp)) continue;   // WO-202 III.1: a waiting state is replaced
                 Wo207Queue(frames.Writer, new InFrame(type, payload, arrival, stamp), type);   // WO-207 B.1
@@ -4701,7 +4709,7 @@ public partial class GameBridge(ClientConfig config)
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) when (ex is IOException or SocketException or EndOfStreamException) { }
-        finally { frames.Writer.TryComplete(); leashLane.Writer.TryComplete(); convLane.Writer.TryComplete(); actLane.Writer.TryComplete(); }
+        finally { frames.Writer.TryComplete(); leashLane.Writer.TryComplete(); convLane.Writer.TryComplete(); actLane.Writer.TryComplete(); animLane.Writer.TryComplete(); }
         await processor;
     }
 
@@ -7301,6 +7309,19 @@ public partial class GameBridge(ClientConfig config)
         try
         {
             if (!_combat.IsConnected && !await _combat.EnsureConnectedAsync(ct)) return;
+            // KCT fix (icd13): the pipe reopened -- the DLL dropped every body (pipe-closed) and those drops never reached
+            // Lua, which kept them marked native-owned: written by nobody (the partner's figure froze, 55 m back, invisible).
+            int gen = _combat.ConnectGeneration;
+            if (gen != _nativePipeGenSeen)
+            {
+                bool reopened = _nativePipeGenSeen != 0;
+                _nativePipeGenSeen = gen;
+                if (reopened)
+                {
+                    Console.WriteLine("[npcwrite] the DLL pipe reopened -- every bound copy and figure goes back to Lua and binds again");
+                    await ExecLuaAsync("if KCD2MP_NpcNativePipeLost then KCD2MP_NpcNativePipeLost() end");
+                }
+            }
             var st = await _combat.NpcStatusAsync(ct);
             if (st is not { } s) return;
             await ExecLuaAsync(FormattableString.Invariant(

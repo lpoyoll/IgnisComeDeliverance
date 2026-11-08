@@ -435,6 +435,7 @@ public sealed class CombatPipe : IAsyncDisposable
             }
 
             _warnedUnavailable = false;
+            Interlocked.Increment(ref _connectGeneration);   // KCT fix (icd13): a reconnect is told to Lua (GameBridge.NativeHeartbeatAsync)
             Console.WriteLine("[combat] connected to KCDMP.dll");
             _reader = Task.Run(ReadLoopAsync);
             return true;
@@ -2348,7 +2349,8 @@ public sealed class CombatPipe : IAsyncDisposable
         }
         catch (Exception ex) when (ex is IOException or ObjectDisposedException)
         {
-            // Normal on shutdown or if the game exits.
+            // Normal on shutdown or if the game exits. KCT fix (icd13): said, so a mid-session break says why.
+            Console.WriteLine($"[combat] pipe read ended: {ex.GetType().Name}: {ex.Message}");
         }
         catch (Exception ex)
         {
@@ -2675,6 +2677,10 @@ public sealed class CombatPipe : IAsyncDisposable
             got += n;
         }
     }
+
+    private int _connectGeneration;
+    /// <summary>KCT fix (icd13): how many times the pipe has connected; a change after the first means the DLL dropped every body it wrote.</summary>
+    public int ConnectGeneration => Volatile.Read(ref _connectGeneration);
 
     private void Drop()
     {

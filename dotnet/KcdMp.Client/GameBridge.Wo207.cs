@@ -177,7 +177,43 @@ public partial class GameBridge
     }
 
     private string Wo207LaneStats() => $"conv_lane={(W207("conv_lane") ? "on" : "off")} conv_lane_frames={Interlocked.Read(ref _w207ConvLaneFrames)} conv_lane_max_wait_ms={Interlocked.Exchange(ref _w207ConvLaneMaxWaitMs, 0)}"
-        + $" activity_lane_frames={Interlocked.Read(ref _w207ActLaneFrames)} activity_lane_max_wait_ms={Interlocked.Exchange(ref _w207ActLaneMaxWaitMs, 0)}";
+        + $" activity_lane_frames={Interlocked.Read(ref _w207ActLaneFrames)} activity_lane_max_wait_ms={Interlocked.Exchange(ref _w207ActLaneMaxWaitMs, 0)}"
+        + $" anim_lane_frames={Interlocked.Read(ref _icdAnimLaneFrames)} anim_lane_max_wait_ms={Interlocked.Exchange(ref _icdAnimLaneMaxWaitMs, 0)} lane_too_old={Interlocked.Read(ref _icdLaneTooOld)}";
+
+    // KCT fix (icd13): the host's NPC animation states (WO-208 A.2) in their own lane -- each waits for the DLL pipe, and in the one
+    // frame processor every frame behind them (positions, deaths, the leash's world) waited too. In order; one this old is dropped.
+    private long _icdAnimLaneFrames, _icdAnimLaneMaxWaitMs, _icdLaneTooOld;
+
+    private async Task IcdAnimLaneAsync(ChannelReader<InFrame> lane, CancellationToken ct)
+    {
+        try
+        {
+            await foreach (var f in lane.ReadAllAsync(ct))
+            {
+                if (Wo140DropSeparate(f.Type)) continue;
+                if (Wo206DropStale(f)) continue;   // a world write from an older world epoch
+                Interlocked.Increment(ref _icdAnimLaneFrames);
+                long wait = (Stopwatch.GetTimestamp() - f.Arrival) * 1000 / Stopwatch.Frequency;
+                if (wait > Interlocked.Read(ref _icdAnimLaneMaxWaitMs)) Interlocked.Exchange(ref _icdAnimLaneMaxWaitMs, wait);
+                if (IcdLaneRules.TooOld(f.Type, wait)) { IcdLaneDropped(f.Type, wait); continue; }
+                Wo207Trace.Kind.Value = f.Type;
+                long t0 = Stopwatch.GetTimestamp();
+                try { await Wo123OnFrameAsync(f.Type, f.Payload, ct); }
+                catch (Exception ex) { Console.WriteLine($"MP-W207 anim lane: a frame failed: {ex.GetType().Name}: {ex.Message}"); }
+                Wo207Trace.Frame(f.Type, wait, (Stopwatch.GetTimestamp() - t0) * 1000 / Stopwatch.Frequency);
+                Wo207Trace.Kind.Value = 0;
+            }
+        }
+        catch (OperationCanceledException) { }
+    }
+
+    private void IcdLaneDropped(int type, long waitMs)
+    {
+        long n = Interlocked.Increment(ref _icdLaneTooOld);
+        Wo207Trace.Dropped(type);
+        if (n <= 10 || n % 200 == 0)
+            Console.WriteLine($"MP-W207 lane: 0x{type:X2} {waitMs} ms old -- dropped, a newer one carries the state [n={n}]");
+    }
 
     // B.3: the activity lane -- WO-141's activity rows and WO-143's extras (each row a native write: ~4.6 pipe calls a frame, 140-160 ms a
     // frame on the bench's joiner), in order, in their own lane. Charged to their kind in the trace.
@@ -193,6 +229,8 @@ public partial class GameBridge
                 Interlocked.Increment(ref _w207ActLaneFrames);
                 long wait = (Stopwatch.GetTimestamp() - f.Arrival) * 1000 / Stopwatch.Frequency;
                 if (wait > Interlocked.Read(ref _w207ActLaneMaxWaitMs)) Interlocked.Exchange(ref _w207ActLaneMaxWaitMs, wait);
+                // KCT fix (icd13): an activity row this old is history (the field: 330 s); a newer one says where the NPC is now
+                if (IcdLaneRules.TooOld(f.Type, wait)) { IcdLaneDropped(f.Type, wait); continue; }
                 Wo207Trace.Kind.Value = f.Type;
                 long t0 = Stopwatch.GetTimestamp();
                 try { await Wo123OnFrameAsync(f.Type, f.Payload, ct); }

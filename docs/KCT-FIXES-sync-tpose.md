@@ -232,3 +232,16 @@ further. Two fixes:
   hold; released if the joiner stops reporting for 10 s. Toasts on the host say why. `IcdCatchUpRules`, tested.
 - **Copies are held while the joiner is behind** (`KCD2MP_NpcSilenceRelease`): a quiet copy is late, not gone, while the
   agent reports this game 2 s or more behind -- it stays where it is (60 s at most) instead of going back to the AI.
+
+## icd13 -- the partner's figure no longer freezes; the joiner no longer falls minutes behind
+
+- **Invisible partner (frozen figure).** The agent's pipe to KCDMP.dll broke and reconnected once (18:29:09 in the field, right after the
+  host's 11 s freeze ended and a burst of held traffic arrived). The DLL drops every body it writes when its pipe closes, and that drop's
+  message died with the pipe, so Lua kept the host's figure marked native-owned: nobody wrote it, and it stood 55 m back while the top-bar
+  marker followed the real stream. Now (a) the agent tells Lua when the pipe reopens (`KCD2MP_NpcNativePipeLost`: every copy and figure
+  back to Lua, bound again), and (b) a bound figure more than 6 m from its stream for 2 s is taken back (`native=stuck`). The agent also
+  logs why a pipe read ended.
+- **The joiner falling 30-70 s behind.** The frame processor handled the host's NPC animation states (0x7B) inline, each waiting ~300 ms
+  for the DLL pipe; every frame behind them (positions included) waited too. They have their own lane now, and animation states older
+  than 3 s / activity rows older than 15 s are dropped instead of replayed (the activity lane had reached 330 s). `MP-W207-STATS` shows
+  `anim_lane_frames`, `anim_lane_max_wait_ms` and `lane_too_old`.

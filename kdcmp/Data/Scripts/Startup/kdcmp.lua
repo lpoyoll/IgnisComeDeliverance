@@ -3248,6 +3248,26 @@ end
 -- rendered speed, riding, the corpse freeze, labels). A riding, mounted or
 -- frozen ghost is never bound; a one-shot holds the writer for its window.
 TUNE.GHOST_NATIVE_DELAY_MS = 100   -- ~3.5 samples of the ~30 Hz player stream; the ring holds 8
+TUNE.GHOST_NATIVE_STUCK_M = 6.0    -- KCT fix (icd13): a bound figure this far from the stream ...
+TUNE.GHOST_NATIVE_STUCK_S = 2.0    -- ... for this long is not being written by the DLL
+
+-- KCT fix (icd13): the agent's pipe to KCDMP.dll closed and reopened. The DLL dropped every body it wrote (reason
+-- pipe-closed) and its drop messages died with the pipe, so every puppet and figure Lua still marks as native-owned is
+-- written by nobody. All of them go back to Lua at once and bind again.
+function KCD2MP_NpcNativePipeLost()
+    local function reset(p)
+        if not (p.nativeOwned or p.nativeSent) then return 0 end
+        p.nativeOwned, p.nativeSent, p.nativeRetryAt = false, nil, nil
+        p.lastWroteX, p.lastWroteY, p.lastWroteZ = nil, nil, nil
+        return 1
+    end
+    local np, ng = 0, 0
+    for _, p in pairs(KCD2MP.npcPuppets or {}) do np = np + reset(p) end
+    for _, g in pairs(KCD2MP.ghosts or {}) do if g and g.istate then ng = ng + reset(g.istate) end end
+    mp_log(string.format("MP-NPCWRITE pipe-reopened: %d copies and %d partner figure(s) back to Lua, binding again", np, ng))
+    return np + ng
+end
+
 function KCD2MP_GhostNativeSync(id, ghost, want)
     local st = ghost and ghost.istate
     if not st then return end
@@ -3256,6 +3276,27 @@ function KCD2MP_GhostNativeSync(id, ghost, want)
     if want and st.dismountPending then want = false end   -- 0.28.3: still on the horse
     if want then
         local e = ghost.entity
+        if st.nativeOwned and e then
+            -- KCT fix (icd13): a bound figure the DLL no longer writes (its drop never reached this file -- a pipe that
+            -- closed and reopened drops every body, and the drop's own message dies with the pipe) stood frozen where it
+            -- was while the stream and the top-bar marker moved on (field, icd12: 55 m behind, invisible to the joiner).
+            -- Far from the stream for 2 s: the DLL is not writing it; Lua takes it back and binds it again.
+            local wp = nil
+            pcall(function() wp = e:GetWorldPos() end)
+            local dx, dy = wp and (wp.x - (st.cx or wp.x)) or 0, wp and (wp.y - (st.cy or wp.y)) or 0
+            if dx * dx + dy * dy > TUNE.GHOST_NATIVE_STUCK_M * TUNE.GHOST_NATIVE_STUCK_M then
+                st.nativeStuckSince = st.nativeStuckSince or now
+                if now - st.nativeStuckSince >= TUNE.GHOST_NATIVE_STUCK_S then
+                    st.nativeStuckSince = nil
+                    st.nativeOwned, st.nativeSent, st.nativeRetryAt = false, nil, nil
+                    KCD2MP._npcNative.stuck = (KCD2MP._npcNative.stuck or 0) + 1
+                    mp_log(string.format("MP-NPCWRITE npc=%s native=stuck dist_m=%.1f -- the DLL is not moving it: Lua writes it and binds it again [n=%d]",
+                        name, math.sqrt(dx * dx + dy * dy), KCD2MP._npcNative.stuck))
+                end
+            else
+                st.nativeStuckSince = nil
+            end
+        end
         if st.nativeOwned or not e then return end
         if st.nativeSent and (now - (st.nativeSentAt or 0)) < TUNE.NPC_NATIVE_RESEND_S then return end
         -- 0.28.3 peer test: a mounted or parented avatar bound to the writer

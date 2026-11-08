@@ -3,8 +3,26 @@
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 // KCT QoL (IgnisComeDeliverance): the host pauses while the joiner catches up -- the pure rules (GameBridge.IcdCatchUp.cs acts on them).
 using System.Globalization;
+using KcdMp.Wire;
 
 namespace KcdMp.Client;
+
+/// <summary>
+/// KCT fix (icd13): how old a state frame in its own lane may be before it is history. The field's joiner replayed NPC animation
+/// states 30-70 s late and activity rows 330 s late; a newer frame carries the state (WO-210's ask repairs a body that missed one).
+/// </summary>
+public static class IcdLaneRules
+{
+    public const long AnimMaxAgeMs = 3_000;       // WO-208 A.2: the host's NPC animation states
+    public const long ActivityMaxAgeMs = 15_000;  // WO-141 / WO-143: the host's NPC activity rows
+
+    public static bool TooOld(int type, long waitMs) => type switch
+    {
+        Protocol.NpcAnimDown => waitMs > AnimMaxAgeMs,
+        Protocol.ActivityHostDown or Protocol.ActivityExtraDown => waitMs > ActivityMaxAgeMs,
+        _ => false,
+    };
+}
 
 /// <summary>
 /// A joiner whose game runs behind (its agent's queue: the game takes the host's world late -- in the background, busy, or a slow

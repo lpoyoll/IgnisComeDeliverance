@@ -557,6 +557,28 @@ do
     KCD2MP_NpcNativeAck("kcd2mp_7", 0, "entity-gone")
     check("n: a drop hands the ghost back to Lua", ist.nativeOwned == false and ist.nativeRetryAt ~= nil)
     check("n: no Lua errors", #ERRS == 0, ERRS[1])
+
+    -- KCT fix (icd13): a bound figure the DLL stopped writing (its drop lost with the pipe) is taken back after 2 s.
+    ist.nativeRetryAt = nil
+    alive(); gtick(90.9)
+    KCD2MP_NpcNativeAck("kcd2mp_7", 1, "ok")
+    check("o: bound again", ist.nativeOwned == true)
+    e.px, e.py = 60, 60   -- the body stays where the DLL left it; the stream goes on near 91,90
+    for i = 1, 30 do alive(); gtick(90.9 + i * 0.01) end   -- 0.9 s: not yet
+    check("o: under 2 s far from the stream: still the DLL's", ist.nativeOwned == true)
+    for i = 1, 45 do alive(); gtick(91.2 + i * 0.01) end   -- past 2 s
+    check("o: 2 s far from the stream: Lua takes it back", ist.nativeOwned == false or ist.nativeSent == true)
+    check("o: ... and writes it to the stream", math.abs(e.px - ist.cx) < 1.0, e.px)
+    check("o: logged as stuck", (function() for _, l in ipairs(LOG or {}) do if tostring(l):find("native=stuck", 1, true) then return true end end return false end)())
+
+    -- KCT fix (icd13): the agent's pipe reopened -- every owned puppet and figure goes back to Lua.
+    ist.nativeOwned, ist.nativeSent = true, nil
+    local pp = { nativeOwned = true, nativeSent = true }
+    KCD2MP.npcPuppets["o_npc"] = pp
+    local n = KCD2MP_NpcNativePipeLost()
+    check("o: pipe reopened resets the figure and the copy", n == 2 and ist.nativeOwned == false and pp.nativeOwned == false and pp.nativeSent == nil, n)
+    KCD2MP.npcPuppets["o_npc"] = nil
+    check("o: no Lua errors", #ERRS == 0, ERRS[1])
 end
 
 -- Summary, in the shared driver's contract (Test-NpcSmoothSynthetic.ps1 reads

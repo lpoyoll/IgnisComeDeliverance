@@ -56,3 +56,18 @@ public class IcdCatchUpTests
         Assert.Equal(A.Release, D(true, 20_000, thr: 0, since: 95_000)); // turned off while holding
     }
 }
+
+// KCT fix (icd13): stale state frames in their own lanes are dropped, nothing else.
+public class IcdLaneRulesTests
+{
+    [Theory]
+    [InlineData(KcdMp.Wire.Protocol.NpcAnimDown, 2_999, false)]
+    [InlineData(KcdMp.Wire.Protocol.NpcAnimDown, 3_001, true)]
+    [InlineData(KcdMp.Wire.Protocol.ActivityHostDown, 14_000, false)]
+    [InlineData(KcdMp.Wire.Protocol.ActivityHostDown, 330_000, true)]
+    [InlineData(KcdMp.Wire.Protocol.ActivityExtraDown, 16_000, true)]
+    [InlineData(KcdMp.Wire.Protocol.NpcStateDown, 600_000, false)]
+    [InlineData(KcdMp.Wire.Protocol.ConvDown, 600_000, false)]
+    public void Only_old_state_frames_are_dropped(byte type, long waitMs, bool drop) =>
+        Assert.Equal(drop, IcdLaneRules.TooOld(type, waitMs));
+}
