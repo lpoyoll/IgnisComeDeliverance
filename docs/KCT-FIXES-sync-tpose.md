@@ -159,3 +159,20 @@ its list identical to the agent's `Wo154MenuRules.Settings`.
 
 The ~130 engineering switches (`mp_...` commands) are not on this page: they are for testing a fix, not for playing
 (see docs/SWITCH-AUDIT.md).
+
+## icd9: quiet console made safe
+
+Found in a live join (2026-11-08): the quiet console's probe reached kcd.log as `<Lua> [KCD2-MP] MP-QUIET probe ...` --
+`System.Log` writes a `<Lua> ` prefix -- and the agent never confirmed it, so quiet mode switched itself off as designed.
+That prefix is the danger: the agent's event channel accepts `[KCD2-MP-EVT]` only at the start of a line
+(`LogTailGameTransport`, "event tag not at line start, ignored"). Had quiet mode engaged, every event the mod sends the
+agent would have been dropped. Now:
+
+- only the mod's chat lines (`[KCD2-MP] ...`) are ever written the quiet way; `[KCD2-MP-EVT]` and `[KCD2-MP-DATA]` are
+  never touched (tested);
+- the probe waits for a loaded world (both live probes fired mid-load, during a join, when the agent's log reader was far
+  behind) and allows 15 s for the agent's confirm (was 5 s).
+
+The same evening's join itself worked end to end: the joiner's launcher Join auto-connected from the main menu, the
+host's world arrived in 6 s, the load took 118 s (106 s of it the game reading the save), and the joiner was placed 3.4 m
+beside the host.

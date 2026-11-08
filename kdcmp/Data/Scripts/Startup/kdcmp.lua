@@ -257,9 +257,9 @@ function KCD2MP_QuietStart()
     quietExec("log_Verbosity 1")
     System.Log("[KCD2-MP] MP-QUIET probe " .. q.nonce)
     local nonce = q.nonce
-    Script.SetTimer(5000, function()
+    Script.SetTimer(15000, function()
         local qq = KCD2MP.quiet
-        if qq.state == "probing" and qq.nonce == nonce then quietRestore(qq, "the probe did not reach kcd.log within 5 s") end
+        if qq.state == "probing" and qq.nonce == nonce then quietRestore(qq, "the agent did not confirm the probe within 15 s") end
     end)
     return true
 end
@@ -271,7 +271,9 @@ function KCD2MP_QuietConfirm(nonce)
     q.always = always
     System.LogAlways = function(s)
         s = tostring(s)
-        if string.sub(s, 1, 8) == "[KCD2-MP" and not KCD2MP_QuietImportant(s) then return log(s) end
+        -- only the mod's chat lines: System.Log writes "<Lua> " before a line, and the agent reads [KCD2-MP-EVT] (its event
+        -- channel) and [KCD2-MP-DATA] ONLY at the start of a line -- rerouted, every event would be lost
+        if string.sub(s, 1, 10) == "[KCD2-MP] " and not KCD2MP_QuietImportant(s) then return log(s) end
         return always(s)
     end
     mp_log("MP-QUIET on -- kcd.log keeps every line; the console shows only errors, warnings and the mod's important lines (mp_quiet off to see everything)")
@@ -284,7 +286,13 @@ function KCD2MP_QuietSchedule()   -- no timer of its own: the label loop (KCD2MP
 end
 function KCD2MP_QuietTick()
     local q = KCD2MP.quiet
-    if q.startAt and os.clock() >= q.startAt then q.startAt = nil; KCD2MP_QuietStart() end
+    if not (q.startAt and os.clock() >= q.startAt) then return end
+    -- only in a loaded world: during a load (a join's), the agent's log reader runs far behind and the probe was never seen
+    local inWorld = false
+    pcall(function() inWorld = player ~= nil and player.GetWorldPos ~= nil and player:GetWorldPos() ~= nil end)
+    if not inWorld then q.startAt = os.clock() + 5; return end
+    q.startAt = nil
+    KCD2MP_QuietStart()
 end
 -- mp_quiet on|off (default on); bare = report
 function KCD2MP_QuietSet(arg)

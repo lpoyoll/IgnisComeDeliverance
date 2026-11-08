@@ -337,7 +337,9 @@ do
     System.LogAlways("an engine line")
     local function has(t, s) for _, l in ipairs(t) do if l:find(s, 1, true) then return true end end return false end
     check("(h3) a routine line: in the file, not on the console", has(FILE, "routine line") and not has(CONSOLE, "routine line"))
-    check("(h3) a data line: in the file, not on the console", has(FILE, "KCD2-MP-DATA") and not has(CONSOLE, "KCD2-MP-DATA"))
+    check("(h3) a data line is never rerouted (the agent reads it at the line's start)", has(CONSOLE, "KCD2-MP-DATA"))
+    System.LogAlways("[KCD2-MP-EVT] v1 7 w159 load 2 x")
+    check("(h3) an event line is never rerouted (the agent's event channel, read at the line's start)", has(CONSOLE, "[KCD2-MP-EVT] v1 7 w159"))
     check("(h3) a failure: on the console too", has(CONSOLE, "own_release failed"))
     check("(h3) the engine's own lines are untouched", has(CONSOLE, "an engine line"))
     for _, t in ipairs(TIMERS) do t.f() end   -- the 5 s timer after a confirm: nothing
@@ -349,8 +351,8 @@ do
     fileFollowsConsole = true; FILE = {}; TIMERS = {}
     check("(h3) mp_quiet on: probing again", KCD2MP_QuietSet("on") == true and KCD2MP.quiet.state == "probing")
     check("(h3) ...the probe is not in the file", probe() == nil)
-    for _, t in ipairs(TIMERS) do if t.ms == 5000 then t.f() end end
-    check("(h3) no confirm in 5 s: unavailable, verbosity restored", KCD2MP.quiet.state == "unavailable" and CV.log_Verbosity == "3")
+    for _, t in ipairs(TIMERS) do if t.ms == 15000 then t.f() end end
+    check("(h3) no confirm in 15 s: unavailable, verbosity restored", KCD2MP.quiet.state == "unavailable" and CV.log_Verbosity == "3")
     check("(h3) ...and LogAlways is the engine's own again", System.LogAlways ~= nil and (function() CONSOLE = {}; mp_log("x routine"); return has(CONSOLE, "x routine") end)())
     CV.log_WriteToFileVerbosity = "1"; KCD2MP.quiet = { want = true, state = "off" }; fileFollowsConsole = false
     KCD2MP_QuietStart()
