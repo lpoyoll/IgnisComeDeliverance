@@ -269,8 +269,43 @@ check("(g) every MP-/QUEST-/NPC- line ends with t=<s>.<ms>", stamped > 0 and uns
 -- (h) clock offset beside the ping
 KCD2MP_SetClockOffset(4750, 30, 5)
 KCD2MP_ShowPing(12)
-check("(h) ping text shows the offset in seconds", KCD2MP.pingText == "Ping: 12 ms  clock +4.75 s", KCD2MP.pingText)
+check("(h) ping text shows the offset in seconds", KCD2MP.pingText == "Connection: Good  ping 12 ms  jitter 0 ms  clock +4.75 s", KCD2MP.pingText)
 noErrs("(h)")
+
+-- ---------------------------------------------------------------------------
+-- (h2) KCT QoL: the connection line's grade, jitter, loss and lag
+KCD2MP_SetClockOffset(200, 30, 5)
+KCD2MP_IcdConnReset()
+NOW = NOW + 2; KCD2MP_ShowPing(60, 0, 1, 0)
+check("(h2) a good link: Good, ping, jitter, loss; a small clock offset is not shown",
+    KCD2MP.pingText == "Connection: Good  ping 60 ms  jitter 0 ms  loss 0%", KCD2MP.pingText)
+NOW = NOW + 2; KCD2MP_ShowPing(60, 0, 1, -1)
+check("(h2) loss unknown (a direct link): not shown", KCD2MP.pingText:find("loss", 1, true) == nil, KCD2MP.pingText)
+NOW = NOW + 2; KCD2MP_ShowPing(300, 0, 1, 0)
+check("(h2) one bad ping: Poor at once", KCD2MP.pingText:find("^Connection: Poor  ping 300 ms") ~= nil, KCD2MP.pingText)
+NOW = NOW + 2; KCD2MP_ShowPing(60, 0, 1, 0)
+check("(h2) one good ping after it: still Poor (no flicker)", KCD2MP.pingText:find("^Connection: Poor") ~= nil, KCD2MP.pingText)
+for i = 1, 6 do NOW = NOW + 2; KCD2MP_ShowPing(60, 0, 1, 0) end
+check("(h2) good for a while: Good again", KCD2MP.pingText:find("^Connection: Good") ~= nil, KCD2MP.pingText)
+KCD2MP_IcdConnReset()
+for _, p in ipairs({ 40, 120, 40, 120 }) do NOW = NOW + 2; KCD2MP_ShowPing(p, 0, 1, 0) end
+check("(h2) a ping swinging 40 <-> 120 ms: jitter 80 ms, Fair", KCD2MP.pingText:find("jitter 80 ms", 1, true) ~= nil
+    and KCD2MP.pingText:find("^Connection: Fair") ~= nil, KCD2MP.pingText)
+KCD2MP_IcdConnReset()
+NOW = NOW + 2; KCD2MP_ShowPing(50, 0, 1, 12)
+check("(h2) 12% loss: Poor, and said", KCD2MP.pingText:find("^Connection: Poor") ~= nil and KCD2MP.pingText:find("loss 12%", 1, true) ~= nil, KCD2MP.pingText)
+KCD2MP_IcdConnReset()
+NOW = NOW + 2; KCD2MP_ShowPing(50, 1500, 0, 0)
+check("(h2) the game 1.5 s behind: Poor, and said", KCD2MP.pingText:find("^Connection: Poor") ~= nil
+    and KCD2MP.pingText:find("your game 1.5 s behind", 1, true) ~= nil, KCD2MP.pingText)
+NOW = NOW + 2; KCD2MP_ShowPing(300)
+NOW = NOW + 60; KCD2MP_ShowPing(50, 0, 1, 0)
+check("(h2) after a 60 s gap the history starts over: Good at once", KCD2MP.pingText:find("^Connection: Good") ~= nil
+    and KCD2MP.pingText:find("jitter 0 ms", 1, true) ~= nil, KCD2MP.pingText)
+check("(h2) the old one-argument call still works", (function() KCD2MP_ShowPing(70); return KCD2MP.pingText:find("ping 70 ms", 1, true) ~= nil end)())
+check("(h2) grade rules", KCD2MP_IcdConnGrade(119, 39, 1, 499) == 1 and KCD2MP_IcdConnGrade(120, 0, 0, 0) == 2
+    and KCD2MP_IcdConnGrade(0, 0, 2, 0) == 2 and KCD2MP_IcdConnGrade(0, 120, 0, 0) == 3 and KCD2MP_IcdConnGrade(0, 0, -1, 1000) == 3)
+noErrs("(h2)")
 
 -- ---------------------------------------------------------------------------
 -- (i) peer cutscene state in the local line

@@ -26,6 +26,8 @@ the cause of each bug: [docs/KCT-FIXES-sync-tpose.md](docs/KCT-FIXES-sync-tpose.
 - **Corpses standing up** on the joiner's screen now lie down.
 - **Smoother movement:** walkers no longer freeze and flip between idle and walk; the partner no longer surges
   ahead and snaps back; ghosts are no longer lifted out of cellars.
+- **Connection line in game:** the top-left line now grades the link (Good / Fair / Poor) and shows ping, jitter,
+  packet loss and, when it matters, how far behind your game is.
 - **Launcher:** opens on two plain choices, **Host a game** and **Join a friend**, with the steps for each.
 - **Name:** IgnisComeDeliverance (window, installer, shortcuts, About box).
 

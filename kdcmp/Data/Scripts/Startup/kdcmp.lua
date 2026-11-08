@@ -302,15 +302,61 @@ end
 -- ===== Ping Display =====
 -- Called by C# every ~2s after Pong. Stored for render loop to draw via DrawLabel.
 -- Game.ShowNotification adds unwanted "@" decorators so we use DrawLabel instead.
-function KCD2MP_ShowPing(ms, queueLagMs, inFront)
+-- KCT QoL (IgnisComeDeliverance): the connection line says how good the link is, not only its ping.
+--   "Connection: Good  ping 63 ms  jitter 8 ms  loss 0%"  (+ "  your game 1.2 s behind" / "  clock +4.75 s" only when they matter)
+-- The grade: Poor at >= 250 ms ping, >= 1 s behind, >= 120 ms jitter or >= 10% loss (the WO-157 thresholds); Fair at >= 120 ms,
+-- >= 0.5 s, >= 40 ms or >= 2%; Good otherwise. A worse grade shows at once; a better one only after 3 samples (~6 s) in a row,
+-- so one good pong in a bad patch does not flicker it. Jitter: the median step between the last 8 pings. Loss: Steam's own
+-- delivery quality, sent by the agent (-1 = not known, e.g. a direct TCP link, which cannot lose packets; then not shown).
+KCD2MP.icdConn = KCD2MP.icdConn or { pings = {}, grade = nil, better = 0 }
+KCD2MP.ICD_GRADE_NAMES = { "Good", "Fair", "Poor" }
+function KCD2MP_IcdConnGrade(ms, jitterMs, lossPct, lagMs)
+    ms, jitterMs = tonumber(ms) or 0, tonumber(jitterMs) or 0
+    lossPct, lagMs = tonumber(lossPct) or -1, tonumber(lagMs) or 0
+    if ms >= 250 or lagMs >= 1000 or jitterMs >= 120 or lossPct >= 10 then return 3 end
+    if ms >= 120 or lagMs >= 500 or jitterMs >= 40 or lossPct >= 2 then return 2 end
+    return 1
+end
+function KCD2MP_IcdConnSample(ms, lagMs, lossPct)
+    local c = KCD2MP.icdConn
+    local now = os.clock()
+    if c.at and now - c.at > 30 then KCD2MP_IcdConnReset(); c = KCD2MP.icdConn end   -- a new connection (or a long load): start over
+    c.at = now
+    table.insert(c.pings, tonumber(ms) or 0)
+    while #c.pings > 8 do table.remove(c.pings, 1) end
+    local steps = {}   -- the median step: a ping that keeps swinging, not one spike (its two steps are outvoted)
+    for i = 2, #c.pings do steps[#steps + 1] = math.abs(c.pings[i] - c.pings[i - 1]) end
+    table.sort(steps)
+    local jitter = 0
+    if #steps > 0 then
+        local m = (#steps + 1) / 2
+        jitter = math.floor((steps[math.floor(m)] + steps[math.ceil(m)]) / 2 + 0.5)
+    end
+    local g = KCD2MP_IcdConnGrade(ms, jitter, lossPct, lagMs)
+    if c.grade == nil or g >= c.grade then c.grade, c.better = g, 0
+    else
+        c.better = c.better + 1
+        if c.better >= 3 then c.grade, c.better = g, 0 end
+    end
+    c.jitter, c.loss, c.lag = jitter, tonumber(lossPct) or -1, tonumber(lagMs) or 0
+    return c.grade, jitter
+end
+function KCD2MP_IcdConnReset() KCD2MP.icdConn = { pings = {}, grade = nil, better = 0 } end
+
+function KCD2MP_ShowPing(ms, queueLagMs, inFront, lossPct)
     KCD2MP.ping = ms
     -- WO-202 III.2: an agent that takes the pong where it arrives says so with the queue's own lag and whether the game is in front
     local wc = KCD2MP.w157 and KCD2MP.w157.conn
     if wc then wc.agentLag = tonumber(queueLagMs); wc.inFront = tonumber(inFront) end
     if KCD2MP_W157ConnSample then pcall(KCD2MP_W157ConnSample, ms) end   -- WO-157 3.2
+    local lag = tonumber(queueLagMs) or 0
+    local grade, jitter = KCD2MP_IcdConnSample(ms, lag, lossPct)
+    local loss = tonumber(lossPct) or -1
     local off = KCD2MP.clockOffsetMs
-    KCD2MP.pingText = string.format("Ping: %d ms", ms)
-        .. (off and string.format("  clock %+.2f s", off / 1000) or "")
+    KCD2MP.pingText = string.format("Connection: %s  ping %d ms  jitter %d ms", KCD2MP.ICD_GRADE_NAMES[grade], tonumber(ms) or 0, jitter)
+        .. (loss >= 0 and string.format("  loss %d%%", math.floor(loss + 0.5)) or "")
+        .. (lag >= 500 and string.format("  your game %.1f s behind", lag / 1000) or "")
+        .. ((off and math.abs(off) >= 1000) and string.format("  clock %+.2f s", off / 1000) or "")
 end
 
 -- WO-98 Phase 1: the agent's clock-offset estimate (relay clock minus this
@@ -27714,7 +27760,7 @@ end
 --     skip-time keys; the agent's log-tail edge; frames that stood still over a second), dead, knocked out.
 -- The four new switches (console commands too; each logs WO154-TOGGLE):
 --   mp_name_badges on|off   (default on)   the partner's name (and health) above his figure
---   mp_ping_line on|off     (default on)   the ping and clock line, top left
+--   mp_ping_line on|off     (default on)   the connection line (grade, ping, jitter, loss), top left
 --   mp_clean_screen on|off  (default off)  hides EVERYTHING the mod draws: every mp_draw_row row, the ping
 --       line, the name badges, the mod's toasts (all still logged). The menu still opens and its first row
 --       says so. Kept: the dice board of a match being played (it is the game being played).
@@ -27800,7 +27846,7 @@ do
     -- mp_ping_line on|off (default on)
     function KCD2MP_W154SetPingLine(arg)
         return M.setBool("pingLine", "mp_ping_line", "ping_line", arg,
-            "the ping and clock line in the top left corner", "no ping line")
+            "the connection line in the top left corner (grade, ping, jitter, loss)", "no ping line")
     end
 
     -- mp_clean_screen on|off (default off)
@@ -27982,7 +28028,7 @@ do
           help = "Shows your partner's name (and health) above their figure." },
         { id = "ping_line", group = "Display", label = "Ping and clock line", kind = "onoff", save = "PingLine",
           cmd = "mp_ping_line", fn = "KCD2MP_W154SetPingLine", get = function() return M.pingLine end,
-          help = "Shows the ping and clock line in the top left corner." },
+          help = "Shows the connection line in the top left corner (grade, ping, jitter, loss)." },
         { id = "clean_screen", group = "Display", label = "Clean screen", kind = "onoff", save = "CleanScreen",
           cmd = "mp_clean_screen", fn = "KCD2MP_W154SetCleanScreen", get = function() return M.clean end,
           help = "Hides everything the mod draws -- its lines, names and messages. For screenshots and recording." },
@@ -29116,7 +29162,7 @@ local ok, err = pcall(function()
     -- WO-154 7b: the mod menu (Insert) and its four new switches. The menu calls these same functions.
     System.AddCCommand("mp_menu",         'KCD2MP_W154Menu(%line)',           "WO-154: the mod menu (Insert opens it, PgUp/PgDn choose, End changes) -- exactly what its keys do: mp_menu open|close|up|down|change|status|select <n|item>; bare = status")
     System.AddCCommand("mp_name_badges",  'KCD2MP_W154SetNameBadges(%line)',  "WO-154: your partner's name (and health) above his figure (default on): mp_name_badges on|off; bare = report")
-    System.AddCCommand("mp_ping_line",    'KCD2MP_W154SetPingLine(%line)',    "WO-154: the ping and clock line in the top left corner (default on): mp_ping_line on|off; bare = report")
+    System.AddCCommand("mp_ping_line",    'KCD2MP_W154SetPingLine(%line)',    "WO-154: the connection line in the top left corner (grade, ping, jitter, loss) (default on): mp_ping_line on|off; bare = report")
     System.AddCCommand("mp_clean_screen", 'KCD2MP_W154SetCleanScreen(%line)', "WO-154: hide everything the mod draws -- its lines, the ping line, the name badges, its messages -- for screenshots and recording (default off; the mod menu still opens): mp_clean_screen on|off; bare = report")
     System.AddCCommand("mp_fast_travel",  'KCD2MP_W154SetFastTravel(%line)',  "WO-154 (HOST -- the host's value is the session's): fast travel in a co-op session (default OFF: the engine's wh_pl_FastTravelEnabled is 0 on both machines while a partner is here, given back after): mp_fast_travel on|off; bare = report")
     do

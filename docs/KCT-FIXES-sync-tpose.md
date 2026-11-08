@@ -92,3 +92,22 @@ Needs Visual Studio's C++ tools (the DLL), the .NET 8 SDK and Inno Setup 6, then
   Side effect for developers: a hand-built pak dropped into an installed copy is replaced by the launcher; develop with
   a development build (no install manifest), which is never touched.
 - `Apply-DirectInstall.ps1` updates only an IgnisComeDeliverance install (its own InstallDir), never `%LOCALAPPDATA%\KCDMP`.
+
+## Connection line in game (QoL)
+
+The top-left line used to say only `Ping: 63 ms  clock +0.02 s`. It now says how good the link is:
+
+    Connection: Good  ping 63 ms  jitter 8 ms  loss 0%
+
+- **Grade:** Poor at 250 ms or more ping, 10% or more loss, 120 ms or more jitter, or the game 1 s or more behind (the
+  same limits as the existing "struggling" toast); Fair at 120 ms, 2%, 40 ms or 0.5 s; Good otherwise. A worse grade
+  shows at once, a better one only after about 6 s of better samples, so it doesn't flicker.
+- **Jitter:** the median change between the last 8 pings, so one spike doesn't count but a ping that keeps swinging does.
+- **Loss:** Steam's measured delivery quality (the worse of the two directions), sent by the agent with each ping. Not
+  shown on a direct (TCP) link, which can't lose packets.
+- **"your game 1.2 s behind"** appears only when this game, not the network, is late (in the background or busy).
+- **The clock offset** is shown only when it is 1 s or more.
+- Hidden as before by `mp_ping_line off` or `mp_clean_screen on`.
+
+Code: `KCD2MP_ShowPing` / `KCD2MP_IcdConnSample` / `KCD2MP_IcdConnGrade` in kdcmp.lua; `GameBridge.LinkLossPct` in
+GameBridge.Wo202Net.cs. Tests: tools/Test-WO98Synthetic.lua (h2), dotnet/KcdMp.Client.Tests/IcdConnTests.cs.

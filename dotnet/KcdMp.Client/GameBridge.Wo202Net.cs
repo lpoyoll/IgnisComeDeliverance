@@ -42,7 +42,8 @@ public partial class GameBridge
             int fg = Wo202GameInFront();
             Console.WriteLine($"[ping] {ms} ms (network){(lag >= 500 ? $" -- the game's queue is {lag} ms behind{(fg == 0 ? ", the game is in the background" : "")}" : "")}");
             _stats.OnPong(ms);
-            _ = ExecLuaAsync($"KCD2MP_ShowPing({ms}, {lag}, {fg})");   // never awaited here: the reader never waits on the game
+            int loss = IcdLinkLossPct();   // KCT QoL: Steam's measured packet loss for the connection line (-1 = not known)
+            _ = ExecLuaAsync($"KCD2MP_ShowPing({ms}, {lag}, {fg}, {loss})");   // never awaited here: the reader never waits on the game
             return true;
         }
         if (type == Protocol.ClockSyncDown && payload.Length == Protocol.ClockSyncDownPayloadLen)
@@ -54,6 +55,30 @@ public partial class GameBridge
             return true;
         }
         return false;
+    }
+
+    /// <summary>
+    /// KCT QoL: the link's packet loss in percent for the in-game connection line -- the worse of Steam's two delivery qualities
+    /// (ours and the partner's, 0..1) -- or -1 when there is no Steam link or Steam does not know yet (a direct TCP link loses nothing).
+    /// </summary>
+    private int IcdLinkLossPct()
+    {
+        try
+        {
+            if (_w213Link?.Steam is not { } sc || sc.RealTimeStatus() is not { } st) return -1;
+            return LinkLossPct(st.QualityLocal, st.QualityRemote);
+        }
+        catch { return -1; }
+    }
+
+    /// <summary>Loss in percent from Steam's delivery qualities (each 0..1, negative = unknown); -1 when neither is known.</summary>
+    public static int LinkLossPct(float qLocal, float qRemote)
+    {
+        float q = -1;
+        if (qLocal >= 0) q = qLocal;
+        if (qRemote >= 0 && (q < 0 || qRemote < q)) q = qRemote;
+        if (q < 0) return -1;
+        return (int)Math.Round(Math.Clamp(1f - q, 0f, 1f) * 100f);
     }
 
     /// <summary>How far behind the reader the frame processor is right now (ms; 0 when it keeps up).</summary>
