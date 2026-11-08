@@ -29,6 +29,14 @@
                                     a joiner with a character joins with it as soon as the host is ready.</span>
                             </span>
                         </label>
+                        <label class="coop-row">
+                            <input type="checkbox" @bind="Settings.CheckForUpdates" />
+                            <span class="coop-text">
+                                <span class="coop-label">Check for updates</span>
+                                <span class="kcd-hint">When the launcher opens, it looks for a newer IgnisComeDeliverance on GitHub and offers
+                                    to install it (checked against the release's checksum first). Both players need the same version.</span>
+                            </span>
+                        </label>
                     </div>
 
                     @foreach (var group in CoopOptions.Groups)
@@ -77,5 +85,6 @@
     {
         foreach (var o in CoopOptions.All) Values[o.Key] = o.Default;
         Settings.AutoConnect = true;
+        Settings.CheckForUpdates = true;
     }
 }

@@ -37,7 +37,12 @@
              OnJoin="@OpenJoinSteam"
              OnCheckSetup="@OpenSetupChecklist"
              OnRestoreSaves="@(() => showRestoreSaves = true)"
-             OnCoopOptions="@OpenCoopOptions" />
+             OnCoopOptions="@OpenCoopOptions"
+             UpdateTag="@(updateOffer is { } uo ? "icd" + uo.Icd : null)"
+             UpdateStatus="@updateStatus"
+             UpdateBusy="@updateBusy"
+             OnUpdate="@UpdateNowAsync"
+             OnUpdatePage="@OpenUpdatePage" />
 
     <div class="main-window @(isFilterOpen ? "shifted" : "") @(showDirectConnect ? "" : "hub-hidden")">
 

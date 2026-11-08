@@ -203,3 +203,17 @@ game does not answer. The one join that held was a load in which the loop happen
 - the heartbeat runs in its own loop that waits on nothing but the clock (`Wo204HeartbeatLoopAsync`), and logs
   `MP-JOIN joiner: told the host 'still loading' (...)` every 30 s;
 - the session loop no longer awaits its two DLL calls (one of each in flight at most).
+
+## icd11: the launcher updates itself; builds carry their release number
+
+**Updater** (`Pages/Home.Update.cs`, rules in `Models/UpdateRules.cs`; "Check for updates" in Co-op options, on). When the
+launcher opens it reads this fork's GitHub releases once; when a newer `icdN` has a Setup it shows a banner on the start
+screen ("A new version is available: icdN", What's new, UPDATE NOW). Update now refuses while the game or a session runs,
+downloads the Setup from this repository's own release download address only, checks its SHA-256 against GitHub's own
+digest of the uploaded file (or the release notes' `Setup:` hash) and its size, deletes it on any mismatch, and otherwise
+closes the launcher and runs the Setup once the launcher has gone. A release without a checksum is never offered.
+
+**Build ids.** Every build from icd1 to icd10 carried the same build id (`6e21f1d-2611071805`, a stale BUILD_ID in the build
+tree), so the handshake's "both players need the same build" could not tell them apart. From icd11 the id is
+`icdN-<commit>`; the updater reads N from it. A build before icd11 has no number and is never offered an update
+automatically -- install icd11 by hand once.

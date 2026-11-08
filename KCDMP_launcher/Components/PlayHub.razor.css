@@ -118,3 +118,19 @@
 /* over the bright campfire of the background art */
 .hub-notes, .hub-direct { text-shadow: 0 1px 3px rgba(var(--kcd-shadow-rgb), 1), 0 0 10px rgba(var(--kcd-shadow-rgb), 0.9); }
 .hub-sep { color: var(--kcd-muted); margin: 0 10px; }
+
+/* KCT QoL: the updater's banner */
+.hub-update {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 10px 18px;
+    background: rgba(var(--kcd-shadow-rgb), 0.88);
+    border: 1px solid var(--kcd-gold);
+    color: var(--kcd-parchment);
+    font-size: 16px;
+}
+.hub-update-text { flex: 1; }
+.hub-update-text b { color: var(--kcd-gold-bright); font-weight: normal; }
+.hub-update-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--kcd-gold); flex: none; }
+.hub-update .kcd-btn { padding: 8px 20px; }

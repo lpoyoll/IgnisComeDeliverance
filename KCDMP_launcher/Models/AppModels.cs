@@ -233,6 +233,9 @@ namespace KCDMP_launcher.Models
         // start fresh instead). Needs MenuTakeover. false = the CONNECT button as before.
         public bool AutoConnect { get; set; } = true;
 
+        // KCT QoL: the launcher checks this fork's GitHub releases once at start and offers a newer one (Home.Update.cs).
+        public bool CheckForUpdates { get; set; } = true;
+
         // WO-159: the bundled start save (a folder holding one save, or the file) a host's New adventure starts
         // from. Relative = next to the launcher, where Setup puts it.
         public string StartSavePath { get; set; } = "start-save";

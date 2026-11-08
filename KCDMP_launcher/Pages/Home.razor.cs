@@ -309,6 +309,7 @@ namespace KCDMP_launcher.Pages
                 objRef = DotNetObjectReference.Create(this);
                 await JSRuntime.InvokeVoidAsync("registerGlobalKeys", objRef);
                 await ApplyStyleProfile();
+                _ = CheckForUpdateAsync();   // KCT QoL: the updater (Home.Update.cs), once per start
 
                 await JSRuntime.InvokeVoidAsync("eval", @"
                 document.addEventListener('keydown', (e) => {

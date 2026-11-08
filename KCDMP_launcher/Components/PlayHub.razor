@@ -6,6 +6,25 @@
    still there, under "Direct connect (LAN / VPN)". *@
 
 <div class="play-hub">
+    @if (!string.IsNullOrEmpty(UpdateTag))
+    {
+        <div class="hub-update">
+            <span class="hub-update-dot"></span>
+            <span class="hub-update-text">
+                @if (string.IsNullOrEmpty(UpdateStatus))
+                {
+                    <span>A new version is available: <b>@UpdateTag</b>.</span>
+                }
+                else
+                {
+                    <span>@UpdateStatus</span>
+                }
+            </span>
+            <span class="hub-link" @onclick="OnUpdatePage">What's new</span>
+            <button class="kcd-btn primary" disabled="@UpdateBusy" @onclick="OnUpdate">UPDATE NOW</button>
+        </div>
+    }
+
     @if (!SetupReady)
     {
         <div class="hub-setup">
@@ -69,6 +88,11 @@
     [Parameter] public EventCallback OnCheckSetup { get; set; }
     [Parameter] public EventCallback OnRestoreSaves { get; set; }
     [Parameter] public EventCallback OnCoopOptions { get; set; }   // KCT QoL: the co-op options window
+    [Parameter] public string? UpdateTag { get; set; }       // KCT QoL: the updater's offer (null: up to date)
+    [Parameter] public string? UpdateStatus { get; set; }
+    [Parameter] public bool UpdateBusy { get; set; }
+    [Parameter] public EventCallback OnUpdate { get; set; }
+    [Parameter] public EventCallback OnUpdatePage { get; set; }
 
     private Task ToggleDirect() => ShowDirectChanged.InvokeAsync(!ShowDirect);
 }
