@@ -1305,6 +1305,7 @@ public partial class GameBridge(ClientConfig config)
         _httpForMenu = http;
         http.Decoupled = W207("queue_decouple");   // WO-207 B.3 (a twin's KCDMP_TEST_W207_OFF can turn it off from the start)
         _combat.FramesFirst = W207("queue_decouple");
+        IcdApplyPipeSwitches();   // KCT fix (icd14): the pipe's switches (a twin's KCDMP_TEST_W213_OFF from the start)
         while (!ct.IsCancellationRequested)
         {
             await WaitForGameAsync(ct);

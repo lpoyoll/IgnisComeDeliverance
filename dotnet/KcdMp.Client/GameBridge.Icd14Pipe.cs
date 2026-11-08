@@ -42,7 +42,8 @@ public partial class GameBridge
     /// </summary>
     private Task IcdSideAsync(string lane, int type, Func<Task> work)
     {
-        if (!W207("proc_side_queues") || !_icdSide.TryGetValue(lane, out var q) || _icdSideCt.IsCancellationRequested) return work();
+        if (!W213On("proc_side_queues") || (lane == "join" && !W213On("proc_side_join"))
+            || !_icdSide.TryGetValue(lane, out var q) || _icdSideCt.IsCancellationRequested) return work();
         q.Post(null, (type, work), Stopwatch.GetTimestamp());
         return Task.CompletedTask;
     }
@@ -75,7 +76,7 @@ public partial class GameBridge
         if (arrival <= 0) return false;
         long wait = (Stopwatch.GetTimestamp() - arrival) * 1000 / Stopwatch.Frequency;
         _procHealth.NoteProcessorWait(wait);
-        if (!W207("proc_drop_stale") || !IcdFrameRules.DropAtDequeue(type, wait)) return false;
+        if (!W213On("proc_drop_stale") || !IcdFrameRules.DropAtDequeue(type, wait)) return false;
         _procHealth.NoteDroppedStale(type);
         Wo207Trace.Dropped(type);
         long n = Interlocked.Increment(ref _icdStaleDropped);
@@ -93,7 +94,7 @@ public partial class GameBridge
     /// <summary>A frame for the anim or activity lane: into its coalescing lane (mp_lane_newest_per_npc), else false (the ordered channel).</summary>
     private bool IcdCoalescePost(bool anim, int type, byte[] payload, long arrival, uint stamp, CancellationToken ct)
     {
-        if (!W207("lane_newest_per_npc")) return false;
+        if (!W213On("lane_newest_per_npc")) return false;
         if (Interlocked.CompareExchange(ref _icdCoStarted, 1, 0) == 0)
         {
             _ = IcdCoalescedLaneAsync("anim", _icdAnimCo, true, ct);
@@ -149,10 +150,10 @@ public partial class GameBridge
     /// <summary>The pipe's switches from their W207 names (at the start, and on every mp_* change).</summary>
     private void IcdApplyPipeSwitches()
     {
-        _combat.OversizeGuard = W207("pipe_oversize_guard");
-        _combat.PollAgeLimit = W207("pipe_poll_age");
-        _combat.CallbackLane = W207("pipe_cb_lane");
-        _combat.ReplayConfigOnReconnect = W207("pipe_config_replay");
+        _combat.OversizeGuard = W213On("pipe_oversize_guard");
+        _combat.PollAgeLimit = W213On("pipe_poll_age");
+        _combat.CallbackLane = W213On("pipe_cb_lane");
+        _combat.ReplayConfigOnReconnect = W213On("pipe_config_replay");
     }
 
     // ---------------------------------------------------------------- MP-HEALTH every 10 s (the 4 Hz session tick)
