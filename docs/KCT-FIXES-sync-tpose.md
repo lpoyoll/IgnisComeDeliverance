@@ -245,3 +245,40 @@ further. Two fixes:
   for the DLL pipe; every frame behind them (positions included) waited too. They have their own lane now, and animation states older
   than 3 s / activity rows older than 15 s are dropped instead of replayed (the activity lane had reached 330 s). `MP-W207-STATS` shows
   `anim_lane_frames`, `anim_lane_max_wait_ms` and `lane_too_old`.
+
+## icd14 -- the desync review, fixed in one release
+
+From a code review plus a 32-minute field session (35,460 NPC fight events, 4,081 authority violations, 171,306 engine
+action-queue overflows / a 149 MB log, the joiner up to 73 s behind, the DLL pipe dropped by oversize requests). Every change is
+behind a runtime switch (default on unless noted); `mp_<name> off` restores the icd13 behaviour.
+
+- **DLL link** (GameBridge.Icd14Pipe.cs, CombatPipe.cs, pipe_server.cpp, main_thread.cpp, icd14_pipe_rules.h): oversize requests
+  refused by the agent and skipped (not fatal) by the DLL; every session config replayed on reconnect; the DLL serves up to 8
+  requests / 1.5 ms a frame; background polls expire after 1 s; the pipe reader never waits on callbacks; the frame processor never
+  awaits the DLL (damage, graves, actions, combat cues and joins in their own ordered lanes); stale one-off frames dropped (never joins,
+  deaths, damage, saves, quest, loot); anim/activity lanes keep each NPC's newest state.
+  Switches: pipe_oversize_guard, pipe_oversize_skip, pipe_pump_budget, pipe_config_replay, pipe_poll_age, pipe_cb_lane,
+  proc_side_queues, proc_side_join, proc_drop_stale, lane_newest_per_npc.
+- **NPC copies are puppets** (kdcmp.lua KCD2MP_NpcHold/Unhold registry, GameBridge.Icd14Npc.cs, wo141.cpp): copies are held and
+  AI-ignorant (no local fights) and their planner is not re-fed; one hold registry for every pause owner; conversations, guard stops,
+  scenes and corpses borrow the brain under hard limits; release only on the host's untrack or 6.5 s of silence, then frozen visible;
+  the host streams to 220 m (the joiner's sweep). The hold comes off for 3 s around a save.
+  Switches: mp_npc_hold, mp_copy_ai_off, mp_npc_handover, mp_npc_lease, mp_npc_band_match, pure_copy.
+- **World state corrected** (GameBridge.Icd14World.cs, Icd14World.cs, kdcmp.lua KCD2MP_Icd14*): quest state compared every 30 s and
+  safe State values written after 20 s of disagreement; the clock follows the host continuously (slew, hard set above 150 game s);
+  the joiner's local witnesses forget crimes (the host's record is the only one); an area snapshot of doors and bodies within 60 m with
+  retries. Switches: mp_icd_quest_push, mp_icd_clock_follow, mp_icd_crime_ledger, mp_icd_area_snapshot, mp_icd_corpse_revive (OFF).
+- **Lua queue, log reader, link lanes** (GameBridge.Icd14Lanes.cs, BatchQueue.cs, LogTailGameTransport.cs, LinkScheduler.cs,
+  SteamInbox.cs, StateOrderGuard.cs): edges expire by kind, eviction keeps positions; a timed-out batch's superseded statements are
+  dropped; recovery drains 8 batches; the log reader resumes where it stopped, skips engine spam before decoding, counts event gaps
+  (MP-EVT-GAP) and re-announces; activity rows and conversation camera samples are latest-wins; the Steam inbox is bounded; an older
+  NPC/figure state arriving after a newer one is dropped. Fixed the order-dependent Relay test.
+- **Diagnostics** (HealthHub.cs, GameBridge.IcdHealth.cs, tools/Analyze-Session.ps1): every part prints `MP-HEALTH area=<x> ...` every
+  10 s (agent: pipe, proc, lua, evt, link, world, agent; Lua: npc, world; native: native-pipe, native-npc); each agent sends its newest
+  lines to the partner every 30 s (W203 kind 14), logged as `MP-HEALTH-PEER`, so one machine's agent.log holds both machines' health.
+  `tools\Analyze-Session.ps1` turns the logs (live or an unpacked bundle) into a one-screen report: alerts, per-area numbers, symptom
+  counters and a per-minute timeline.
+
+Needs a live two-player test: AI.SetIgnorant on world NPCs and the game's own autosave timing; the DLL's per-frame request budget
+cost; handlers running beside the frame processor (joins); quest writes by path; clock hard sets; crime forgetting; snapshot after
+fast travel; the Steam message-flags offset.
