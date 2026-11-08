@@ -1305,6 +1305,7 @@ public partial class GameBridge(ClientConfig config)
         _httpForMenu = http;
         http.Decoupled = W207("queue_decouple");   // WO-207 B.3 (a twin's KCDMP_TEST_W207_OFF can turn it off from the start)
         _combat.FramesFirst = W207("queue_decouple");
+        Icd14ApplySwitches();   // KCT fix (icd14)
         while (!ct.IsCancellationRequested)
         {
             await WaitForGameAsync(ct);
@@ -4682,6 +4683,7 @@ public partial class GameBridge(ClientConfig config)
                 }
                 Wo213NoteIn(type, payload, arrival, wireBytes);   // WO-213 A.1/A.5: at the socket, before any queue of this agent
                 Wo138NoteArrival(type, payload);   // WO-138: the source's link is alive (the joiner's hold)
+                if (Icd14DropOlderState(type, payload)) continue;   // KCT fix (icd14): an older state of a body than one already read (the other lane)
                 Wo147NotePositionAtRead(type, payload, arrival);   // WO-147: the leash's positions, stamped as they arrive
                 Wo147NoteNpcAtRead(type, payload, arrival);        // the backlog fix: the newest sample of each NPC/avatar, as read
                 Volatile.Write(ref _w202LastReadMs, W147StampMs(arrival));   // WO-202 III.2: the queue's lag is measured against this

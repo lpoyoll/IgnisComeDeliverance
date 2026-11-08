@@ -233,6 +233,7 @@ internal static class SteamNative
         public const int Conn = 12;      // HSteamNetConnection
         public const int PeerIdentity = 16; // SteamNetworkingIdentity (136)
         public const int Channel = 192;  // int
+        public const int Flags = 196;    // int: k_nSteamNetworkingSend_* (received: only the reliable bit) -- KCT fix (icd14)
     }
 
     // ESteamNetworkingConnectionState

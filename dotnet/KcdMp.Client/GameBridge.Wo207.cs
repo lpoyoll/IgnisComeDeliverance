@@ -35,6 +35,7 @@ public partial class GameBridge
     /// the mod every 5 s (the session runs).</summary>
     private void Wo207Tick(long n)
     {
+        if (n % 40 == 5) Icd14HealthTick();   // KCT fix (icd14): MP-HEALTH every 10 s
         if (n % 20 == 1) _ = ExecLuaAsync(Wo207KeepAwakeLua(true));
         if (n % 4 == 2) Wo207NpcTrigTick();   // D.2
         if (n % 4 != 0 || LivePartners().Count == 0) return;
@@ -128,6 +129,7 @@ public partial class GameBridge
         Console.WriteLine($"MP-W207 cfg {name}={val}");
         if (name == "queue_decouple" && _httpForMenu is { } http) http.Decoupled = val == "on";
         if (name == "queue_decouple") _combat.FramesFirst = val == "on";
+        if (Icd14W207Names.Contains(name)) Icd14ApplySwitches();   // KCT fix (icd14)
         if (name == "joiner_npc_triggers") _w207NpcTrigDue = true;   // D.2: on sends the list again, off forgets it
         if (name == "skirmish_keep") _ = Wo207PushSkirmishKeepAsync(val == "on");   // the fight crashes: the DLL holds it (op 15)
         if (name == "plan_in_fight") _ = Wo207PushNativeSwitchAsync(16, "mp_plan_in_fight", val == "on");   // the joiner's fight crash (op 16)

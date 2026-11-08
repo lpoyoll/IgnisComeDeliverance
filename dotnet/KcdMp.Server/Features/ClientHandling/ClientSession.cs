@@ -180,10 +180,12 @@ public class ClientSession
         _sessions = sessions;
         _clientHandler = clientHandler;
         IsLoopback = conn.IsLoopback;
+        if (conn.Steam is { } inbox) inbox.InboxStateCap = W213Switch.TwinOff("steam_inbox_bound") ? 0 : KcdMp.Steam.SteamInbox.DefaultStateCap;   // KCT fix (icd14)
         // WO-213 C: the scheduler (state latest-wins, events first and in order); the 0.63.9 queue when its twin turns it off
         if (!W213Switch.TwinOff("link_sched"))
         {
-            var opts = new LinkSchedOptions { Budget = !W213Switch.TwinOff("link_budget") };
+            var opts = new LinkSchedOptions { Budget = !W213Switch.TwinOff("link_budget"),
+                                              CoalesceEvents = !W213Switch.TwinOff("link_event_coalesce"), EventAgeLimits = !W213Switch.TwinOff("link_event_age") };   // KCT fix (icd14)
             _sched = new LinkScheduler(opts);
             if (!W213Switch.TwinOff("npc_bands")) _sched.BandOf = BandOf;
             ILinkPath path = conn.Path ?? (conn.Steam is { } sc ? new KcdMp.Steam.SteamLinkPath(sc) : new StreamLinkPath(_stream));

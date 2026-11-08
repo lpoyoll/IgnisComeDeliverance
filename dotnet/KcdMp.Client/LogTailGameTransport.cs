@@ -963,27 +963,55 @@ public sealed class LogTailGameTransport : IGameTransport
 
     // -------------------------------------------------------------------------
 
-    /// <summary>WO-124: the line [start, start+len) is the event line already delivered before its terminator arrived.</summary>
-    private static bool IsEarlyDelivered(string text, int start, int len, string? early) =>
-        early is not null && text.AsSpan(start, len).TrimEnd('\r').SequenceEqual(early.AsSpan());
+    // ---- KCT fix (icd14): the tail's switches (W207 evt_resume / evt_skip_spam / evt_early_fast / evt_seq_check / evt_handler_task) ----
+
+    /// <summary>A reopen of the same file resumes where the tail stopped, a new file (renamed / replaced / truncated) is read from its
+    /// beginning, and a replacement is noticed every second even when the file never got shorter. Off: every open at the end; a
+    /// rotation only noticed by a shrink.</summary>
+    public bool ResumeByIdentity { get; set; } = true;
+    /// <summary>Engine spam (LogLineFilter) is skipped on its bytes, never decoded. Off: every line decoded and scanned.</summary>
+    public bool SkipSpam { get; set; } = true;
+    /// <summary>An unterminated event line is delivered after 50 ms unchanged. Off: after 300 ms.</summary>
+    public bool EarlyEventFast { get; set; } = true;
+    /// <summary>The event seq is checked: a gap is counted, logged (MP-EVT-GAP) and answered with the mod's re-announce (rate-limited).</summary>
+    public bool EventSeqCheck { get; set; } = true;
+    /// <summary>GameEvent handlers run on their own task, in order -- a slow one never stalls the tail. Off: on the tail loop.</summary>
+    public bool EventHandlerTask { get; set; } = true;
+
+    /// <summary>MP-HEALTH area=evt's counters.</summary>
+    public EvtHealth Health { get; } = new();
+    public EventSeqTracker EventSeq { get; } = new();
+    public string HealthLine() => Health.TakeLine(EventSeq);
+
+    /// <summary>What a gap asks of the mod: its puppets' ids again (WO-147's re-announce; the agent re-guards them). At most every 30 s.</summary>
+    public const string ReannounceLua = "if KCD2MP_W147ReannouncePuppets then KCD2MP_W147ReannouncePuppets(\"evt-gap\") end";
+    private long _lastReannounceMs = long.MinValue / 2, _lastGapLogMs = long.MinValue / 2;
+    private int _gapLogsInWindow;
+
+    private const int SwitchCheckMs = 1000;
 
     private async Task TailLoopAsync(CancellationToken ct)
     {
-        var decoder = Encoding.UTF8.GetDecoder();
         var buffer = new byte[64 * 1024];
-        var chars = new char[64 * 1024];
-        var partial = new StringBuilder();
+        var acc = new byte[128 * 1024];   // the bytes read and not yet consumed: complete lines, then the unterminated rest
+        int accLen = 0;
+        var chars = new char[8 * 1024];
         // WO-124: CryEngine writes a log line's terminator only when the NEXT
         // line is written (observed: the last line of a quiet kcd.log has no
         // CR LF). In a world the log never goes quiet; at the main menu it
         // does, and a mod event could sit unread until something else logs.
-        // An EVENT line left unchanged for 300 ms is taken as complete (the mod
-        // writes each one with a single System.LogAlways), and its terminator,
-        // when it comes, does not deliver it twice.
+        // An EVENT line left unchanged for a moment is taken as complete (the
+        // mod writes each one with a single System.LogAlways), and its
+        // terminator, when it comes, does not deliver it twice.
         string? earlyDone = null;
-        DateTime partialSince = DateTime.MinValue;
+        long partialSince = 0;
 
         FileStream? fs = null;
+        LogFileId openId = default;
+        bool firstOpen = true;
+        LogFileId? savedId = null;
+        long savedOffset = 0;
+        long lastSwitchCheck = Environment.TickCount64;
         try
         {
             while (!ct.IsCancellationRequested)
@@ -997,23 +1025,40 @@ public sealed class LogTailGameTransport : IGameTransport
                         // block the game's own writes.
                         fs = new FileStream(_logPath, FileMode.Open, FileAccess.Read,
                             FileShare.ReadWrite | FileShare.Delete);
-                        fs.Seek(0, SeekOrigin.End); // only new lines matter
-                        partial.Clear();
-                        decoder.Reset();
+                        openId = ResumeByIdentity ? LogFileId.Of(fs.SafeFileHandle, _logPath) : default;
+                        var (how, at) = LogTailRules.OpenAt(ResumeByIdentity, firstOpen, savedId, savedOffset, openId, fs.Length);
+                        firstOpen = false;
+                        fs.Seek(at, SeekOrigin.Begin);   // the first open: the end -- only new lines matter
+                        if (how == TailStart.Resume) Interlocked.Increment(ref Health.ReopenResumes);
+                        else
+                        {
+                            if (how == TailStart.Beginning)
+                            {
+                                Interlocked.Increment(ref Health.NewFileStarts);
+                                Console.WriteLine($"MP-EVT-TAIL a new {Path.GetFileName(_logPath)} (another file, or the old one written again from the start): read from its beginning");
+                            }
+                            accLen = 0;
+                            earlyDone = null;
+                        }
+                        lastSwitchCheck = Environment.TickCount64;
                     }
                     catch
                     {
+                        fs?.Dispose();
+                        fs = null;
                         await Task.Delay(500, ct);
                         continue;
                     }
                 }
 
                 // Rotation or truncation on game restart: the file got shorter
-                // than where we are, so our offset is meaningless. Start over.
+                // than where we are, so our offset is meaningless. Start over
+                // (icd14: from the new content's beginning).
                 try
                 {
                     if (fs.Length < fs.Position)
                     {
+                        savedId = openId; savedOffset = long.MaxValue;   // the same identity, shorter: written again -- its beginning
                         fs.Dispose();
                         fs = null;
                         continue;
@@ -1021,6 +1066,7 @@ public sealed class LogTailGameTransport : IGameTransport
                 }
                 catch
                 {
+                    savedId = openId; savedOffset = SafePosition(fs);
                     fs.Dispose();
                     fs = null;
                     continue;
@@ -1029,18 +1075,32 @@ public sealed class LogTailGameTransport : IGameTransport
                 int read;
                 try { read = await fs.ReadAsync(buffer.AsMemory(0, buffer.Length), ct); }
                 catch (OperationCanceledException) { break; }
-                catch { fs.Dispose(); fs = null; continue; }
+                catch { savedId = openId; savedOffset = SafePosition(fs); fs.Dispose(); fs = null; continue; }
 
                 if (read == 0)
                 {
-                    if (partial.Length > 0 && earlyDone is null && (DateTime.UtcNow - partialSince).TotalMilliseconds >= 300)
+                    // icd14: renamed away and a new file made (or replaced) -- the old handle never shrinks, it just goes silent. Checked
+                    // once a second; the old file is read to its end first (this is its end), then the new one from its beginning.
+                    if (ResumeByIdentity && Environment.TickCount64 - lastSwitchCheck >= SwitchCheckMs)
                     {
-                        string pending = partial.ToString();
-                        if (pending.StartsWith(EventTag, StringComparison.Ordinal))
+                        lastSwitchCheck = Environment.TickCount64;
+                        if (LogTailRules.Replaced(openId, LogFileId.AtPath(_logPath)))
                         {
-                            earlyDone = pending;
-                            ProcessLine(pending.AsSpan());
+                            Interlocked.Increment(ref Health.Replaced);
+                            Console.WriteLine($"MP-EVT-TAIL {Path.GetFileName(_logPath)} was replaced (renamed away, a new one made): the old one read to its end, the new one from its beginning");
+                            savedId = openId; savedOffset = long.MaxValue;   // anything but this identity at its end: the beginning
+                            fs.Dispose();
+                            fs = null;
+                            continue;
                         }
+                    }
+                    int earlyMs = EarlyEventFast ? 50 : 300;
+                    if (accLen > 0 && earlyDone is null && Environment.TickCount64 - partialSince >= earlyMs
+                        && acc.AsSpan(0, accLen).StartsWith(EventTagBytes))
+                    {
+                        string pending = Encoding.UTF8.GetString(acc, 0, accLen);
+                        earlyDone = pending;
+                        ProcessLine(pending.AsSpan());
                     }
                     // Caught up. Poll well inside the emit interval so a fresh
                     // line is picked up promptly without spinning a core.
@@ -1048,29 +1108,132 @@ public sealed class LogTailGameTransport : IGameTransport
                     continue;
                 }
 
-                int charCount = decoder.GetChars(buffer, 0, read, chars, 0);
-                partial.Append(chars, 0, charCount);
+                Health.Scanned(read);
+                if (accLen + read > acc.Length)
+                {
+                    if (accLen + read > MaxPartialBytes) { accLen = 0; earlyDone = null; }   // a "line" of megabytes: no line of ours, dropped
+                    else Array.Resize(ref acc, Math.Max(acc.Length * 2, accLen + read));
+                }
+                Buffer.BlockCopy(buffer, 0, acc, accLen, read);
+                accLen += read;
 
                 // Consume whole lines only; anything after the last newline is
                 // an incomplete write and stays buffered.
-                int start = 0;
-                string text = partial.ToString();
-                for (int i = 0; i < text.Length; i++)
+                int start = ConsumeLines(acc, accLen, ref chars, ref earlyDone);
+                if (start > 0)
                 {
-                    if (text[i] != '\n') continue;
-                    if (!IsEarlyDelivered(text, start, i - start, earlyDone)) ProcessLine(text.AsSpan(start, i - start));   // WO-124
-                    earlyDone = null;
-                    start = i + 1;
+                    Buffer.BlockCopy(acc, start, acc, 0, accLen - start);
+                    accLen -= start;
                 }
-
-                partial.Clear();
-                if (start < text.Length)
-                    partial.Append(text, start, text.Length - start);
-                partialSince = DateTime.UtcNow;
+                partialSince = Environment.TickCount64;
             }
         }
         catch (OperationCanceledException) { }
         finally { fs?.Dispose(); }
+    }
+
+    private const int MaxPartialBytes = 8 * 1024 * 1024;
+    private static readonly byte[] EventTagBytes = Encoding.UTF8.GetBytes(EventTag);
+
+    private static long SafePosition(FileStream fs) { try { return fs.Position; } catch { return 0; } }
+
+    /// <summary>Every complete line in acc[0, accLen); returns how many bytes they took (the rest is an unterminated line).</summary>
+    private int ConsumeLines(byte[] acc, int accLen, ref char[] chars, ref string? earlyDone)
+    {
+        int start = 0;
+        while (true)
+        {
+            int nl = acc.AsSpan(start, accLen - start).IndexOf((byte)'\n');
+            if (nl < 0) return start;
+            var line = acc.AsSpan(start, nl);
+            if (line.Length > 0 && line[^1] == (byte)'\r') line = line[..^1];
+            ConsumeLine(line, ref chars, ref earlyDone);
+            start += nl + 1;
+        }
+    }
+
+    /// <summary>One complete line (bytes, without its terminator): counted, skipped on its bytes when it is spam, else decoded into the
+    /// reused char buffer and processed.</summary>
+    private void ConsumeLine(ReadOnlySpan<byte> line, ref char[] chars, ref string? earlyDone)
+    {
+        Interlocked.Increment(ref Health.LinesRead);
+        if (LogLineFilter.IsModLine(line)) Interlocked.Increment(ref Health.ModLines);
+        else if (SkipSpam && LogLineFilter.Skip(line)) { Interlocked.Increment(ref Health.LinesSkipped); earlyDone = null; return; }
+        int need = Encoding.UTF8.GetMaxCharCount(line.Length);
+        if (need > chars.Length) chars = new char[Math.Max(need, chars.Length * 2)];
+        int n = Encoding.UTF8.GetChars(line, chars);
+        var text = chars.AsSpan(0, n);
+        // WO-124: the event line already delivered before its terminator arrived
+        if (earlyDone is null || !text.SequenceEqual(earlyDone.AsSpan().TrimEnd('\r'))) ProcessLine(text);
+        earlyDone = null;
+    }
+
+    // ---- KCT fix (icd14): the events' own task ----
+
+    private System.Threading.Channels.Channel<(string Name, string Arg)>? _evtChannel;
+    private readonly object _evtStart = new();
+    private long _evtQueued;
+
+    private void DispatchEvent(string name, string arg)
+    {
+        if (!EventHandlerTask) { InvokeEvent(name, arg); return; }
+        var ch = _evtChannel;
+        if (ch is null)
+            lock (_evtStart)
+            {
+                if (_evtChannel is null)
+                {
+                    _evtChannel = System.Threading.Channels.Channel.CreateUnbounded<(string, string)>(new() { SingleReader = true, SingleWriter = true });
+                    var reader = _evtChannel.Reader;
+                    _ = Task.Run(() => EventConsumerAsync(reader, _cts.Token), CancellationToken.None);
+                }
+                ch = _evtChannel;
+            }
+        EvtHealth.Max(ref Health.HandlerQueueMax, Interlocked.Increment(ref _evtQueued));
+        if (!ch.Writer.TryWrite((name, arg))) { Interlocked.Decrement(ref _evtQueued); InvokeEvent(name, arg); }
+    }
+
+    private async Task EventConsumerAsync(System.Threading.Channels.ChannelReader<(string Name, string Arg)> reader, CancellationToken ct)
+    {
+        try
+        {
+            await foreach (var (name, arg) in reader.ReadAllAsync(ct))
+            {
+                Interlocked.Decrement(ref _evtQueued);
+                InvokeEvent(name, arg);
+            }
+        }
+        catch (OperationCanceledException) { }
+    }
+
+    private void InvokeEvent(string name, string arg)
+    {
+        long t0 = Environment.TickCount64;
+        try { GameEvent?.Invoke(name, arg); }
+        catch (Exception ex) { Console.WriteLine($"[event] handler for '{name}' threw: {ex.Message}"); }
+        EvtHealth.Max(ref Health.HandlerMsMax, Environment.TickCount64 - t0);
+    }
+
+    /// <summary>icd14: an event's seq against the last one's; a gap is counted, logged (at most 10 lines a minute) and answered with the
+    /// mod's re-announce at most every 30 s.</summary>
+    private void CheckEventSeq(long seq)
+    {
+        if (EventSeq.Next(seq) is not { } gap) return;
+        long now = Environment.TickCount64;
+        if (now - _lastGapLogMs >= 60_000) { _lastGapLogMs = now; _gapLogsInWindow = 0; }
+        if (++_gapLogsInWindow <= 10)
+            Console.WriteLine($"MP-EVT-GAP from={gap.From} to={gap.To} (missing={gap.To - gap.From + 1} total_gaps={EventSeq.Gaps} total_missing={EventSeq.Missing})");
+        if (now - _lastReannounceMs >= 30_000)
+        {
+            _lastReannounceMs = now;
+            _ = ReannounceAsync();
+        }
+    }
+
+    private async Task ReannounceAsync()
+    {
+        try { await _http.ExecuteAsync(ReannounceLua); }
+        catch (Exception ex) { Console.WriteLine($"MP-EVT-GAP the re-announce was not sent: {ex.GetType().Name}"); }
     }
 
     /// <summary>
@@ -1178,9 +1341,9 @@ public sealed class LogTailGameTransport : IGameTransport
     /// <summary>
     /// Parses "v1 &lt;seq&gt; &lt;name&gt; &lt;arg...&gt;" and raises <see cref="GameEvent"/>.
     ///
-    /// The handler runs on the tail loop's thread, so subscribers must not block.
-    /// A throwing subscriber is swallowed: losing one event is bad, but killing
-    /// the tail loop would silently stop all position updates too.
+    /// KCT fix (icd14): the handlers run on the events' own task, in order (EventHandlerTask; off: on the tail loop's thread), so a
+    /// slow subscriber no longer stalls the tail. A throwing subscriber is swallowed: losing one event is bad, but killing
+    /// the loop would silently stop every later event too.
     /// </summary>
     private void ProcessEventLine(ReadOnlySpan<char> rest)
     {
@@ -1195,8 +1358,9 @@ public sealed class LogTailGameTransport : IGameTransport
         string arg = n > 3 ? rest[fields[3]].ToString().Trim() : string.Empty;
 
         EventsReceived++;
-        try { GameEvent?.Invoke(name, arg); }
-        catch (Exception ex) { Console.WriteLine($"[event] handler for '{name}' threw: {ex.Message}"); }
+        // KCT fix (icd14): the seq was parsed and never checked -- a lost event went unnoticed
+        if (EventSeqCheck && long.TryParse(rest[fields[1]], NumberStyles.Integer, CultureInfo.InvariantCulture, out long seq)) CheckEventSeq(seq);
+        DispatchEvent(name, arg);
     }
 
     /// <summary>Splits on runs of spaces without allocating.</summary>

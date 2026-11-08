@@ -74,7 +74,7 @@ public class Wo153Tests
     [Fact]
     public void A_failed_batch_goes_back_in_front_in_order_and_a_replaced_state_is_not_resent()
     {
-        var q = new BatchQueue();
+        var q = new BatchQueue { ReplayLevelBehind = false };   // the 0.63 order (icd14's lua_replay off; Icd14LuaQueueTests has it on)
         q.Add(E(Toast("one"))); q.Add(E(Ghost("0", 1))); q.Add(E(Toast("two"))); q.Add(E(Ghost("1", 1)));
         var sent = q.TakeBatch(10_000, 0);
         // while it was out, a newer sample of ghost 0 and a new edge arrived

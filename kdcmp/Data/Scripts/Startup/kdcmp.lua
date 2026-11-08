@@ -34061,6 +34061,8 @@ do
         conv_pipe_first = "mp_conv_pipe_first", conv_options_early = "mp_conv_options_early", conv_hold = "mp_conv_cam_hold",   -- WO-160 owns mp_conv_hold
         listen_map = "mp_listen_map", listen_once = "mp_listen_once", skirmish_keep = "mp_skirmish_keep",
         plan_in_fight = "mp_plan_in_fight",
+        lua_edge_ttl = "mp_lua_edge_ttl", lua_evict = "mp_lua_evict", lua_replay = "mp_lua_replay", lua_recovery_drain = "mp_lua_recovery_drain",   -- KCT fix (icd14)
+        evt_resume = "mp_evt_resume", evt_skip_spam = "mp_evt_skip_spam", evt_early_fast = "mp_evt_early_fast", evt_seq_check = "mp_evt_seq_check", evt_handler_task = "mp_evt_handler_task",   -- KCT fix (icd14)
     }
     W207.HELP = {
         skip_end_exact = "C.3: (joiner) a shared sleep or wait ends on the host's clock at once (its end, plus the real time since), not after a slow pull-in",
@@ -34605,6 +34607,7 @@ do
         catch_up = "mp_catch_up",
         line_latency = "mp_line_latency",
         link_toast = "mp_link_toast",
+        link_event_coalesce = "mp_link_event_coalesce", link_event_age = "mp_link_event_age", steam_inbox_bound = "mp_steam_inbox_bound", state_order = "mp_state_order",   -- KCT fix (icd14)
     }
     W213.HELP = {
         link_sched = "C: (both) a body's newer state replaces its older unsent one; events first, in order (next connection)",

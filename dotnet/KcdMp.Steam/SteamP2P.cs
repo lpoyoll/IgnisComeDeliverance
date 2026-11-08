@@ -83,7 +83,8 @@ public sealed class SteamP2PListener : IDisposable
 public sealed class SteamP2PConnection : IDisposable
 {
     private readonly SteamSession _session;
-    private readonly Channel<byte[]> _inbox = Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
+    // KCT fix (icd14): bounded for state messages only (SteamInbox; was an unbounded channel)
+    private readonly SteamInbox _inbox = new();
     private readonly TaskCompletionSource<bool> _connected = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private volatile int _state = SteamNative.StateConnecting;
     private int _closedFlag;
@@ -159,12 +160,15 @@ public sealed class SteamP2PConnection : IDisposable
                 IntPtr m = buf[i];
                 IntPtr data = Marshal.ReadIntPtr(m, SteamNative.Msg.Data);
                 int size = Marshal.ReadInt32(m, SteamNative.Msg.Size);
+                // icd14: only the state lane sends unreliably (each message one whole state frame); a received message's flags carry
+                // just the reliable bit
+                bool state = (Marshal.ReadInt32(m, SteamNative.Msg.Flags) & SteamNative.SendReliable) == 0;
                 var bytes = new byte[size];
                 if (size > 0) Marshal.Copy(data, bytes, 0, size);
                 SteamNative.SteamAPI_SteamNetworkingMessage_t_Release(m);
                 MessagesReceived++;
                 BytesReceived += size;
-                _inbox.Writer.TryWrite(bytes);
+                _inbox.TryWrite(bytes, state);
             }
             if (n < buf.Length) return;
         }
@@ -211,8 +215,13 @@ public sealed class SteamP2PConnection : IDisposable
         }
     }
 
-    public ValueTask<byte[]> ReceiveAsync(CancellationToken ct) => _inbox.Reader.ReadAsync(ct);
-    internal ChannelReader<byte[]> Inbox => _inbox.Reader;
+    public ValueTask<byte[]> ReceiveAsync(CancellationToken ct) => _inbox.ReadAsync(ct);
+    internal SteamInbox Inbox => _inbox;
+    /// <summary>KCT fix (icd14): state messages dropped from a full inbox (the oldest first), and the inbox's deepest point.</summary>
+    public long InboxStateDropped => Interlocked.Read(ref _inbox.StateDropped);
+    public int InboxMaxDepth => _inbox.MaxDepth;
+    /// <summary>KCT fix (icd14): how many waiting state messages the inbox keeps (0 = unbounded: the switch off).</summary>
+    public int InboxStateCap { get => _inbox.StateCap; set => _inbox.StateCap = value; }
 
     public SteamLinkStatus? RealTimeStatus()
     {
@@ -351,7 +360,7 @@ public sealed class SteamP2PConnection : IDisposable
         // linger=true: a Close right after a final Send still delivers it, like a TCP FIN after the last write.
         SteamNative.SteamAPI_ISteamNetworkingSockets_CloseConnection(_session.Sockets, Handle, 0, why, true);
         _connected.TrySetResult(false);
-        _inbox.Writer.TryComplete();
+        _inbox.Complete();
         _session.Forget(this);
     }
 
