@@ -71,7 +71,7 @@ public static partial class Protocol
     {
         QuestHostChange => "change", QuestHostResult => "result", QuestHostCheckpoint => "checkpoint",
         QuestHostHold => "hold", QuestHostMode => "mode", QuestHostConverse => "converse",
-        QuestHostReplayAck => "replay-ack", QuestHostItemCount => "item-count", _ => $"unknown-{k}",
+        QuestHostReplayAck => "replay-ack", QuestHostItemCount => "item-count", QuestHostUntrack => "untrack", _ => $"unknown-{k}",
     };
 
     public static string QuestAskName(byte k) => k switch

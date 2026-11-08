@@ -87,6 +87,17 @@ int wo213_tests(int* passed) {
         WCHECK(posture_hold_sitting(true, false, 24.0f, 0.0f, 17.0, &none) && !none.drifted, "no position read: the hold stays");
     }
 
+    // ---- KCT fix (icd14) A pure_copy: a host copy's planner is not fed
+    {
+        WCHECK((kBitsDefault & kBitPureCopy) && twin_off_bits("pure_copy") == kBitPureCopy, "pure_copy: on by default, its own twin name");
+        WCHECK(neutral_rewrite(false, false, true, true, 0.5) && !neutral_rewrite(false, true, true, true, 0.5),
+               "the twin (pure_copy off): rewritten whenever the body's activity changed, as WO-201 B9");
+        WCHECK(neutral_rewrite(true, false, false, false, 0.0), "pure: a copy never written gets its loaded state made what it is, once");
+        WCHECK(!neutral_rewrite(true, false, true, true, 60.0), "pure: the body's activity changed, the loaded state is the one written -- nothing asked");
+        WCHECK(!neutral_rewrite(true, false, false, true, 5.0) && neutral_rewrite(true, false, false, true, kPureCopyRewriteS + 0.1),
+               "pure: a replaced loaded state (a load, the game's placement) is made neutral again, at most every 10 s");
+    }
+
     // ---- KCT catch_up: a held body replays what it missed at 1.2x instead of jumping
     {
         WCHECK((kBitsDefault & kBitCatchUp) && twin_off_bits("catch_up") == kBitCatchUp, "catch_up: on by default, its own twin name");

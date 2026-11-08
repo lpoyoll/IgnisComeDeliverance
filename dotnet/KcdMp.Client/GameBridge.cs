@@ -6508,6 +6508,7 @@ public partial class GameBridge(ClientConfig config)
 
             case "npc_track": Wo138OnTrackLine(arg); break;    // WO-138: the rescan set for the DLL's sender
             case "w138_cfg": Wo138OnCfgLine(arg); break;       // WO-138: the sender's settings
+            case "npc_untrack": Icd14OnUntrackLine(arg); break; // KCT fix (icd14) D: the host dropped an NPC from its tracked set
             case "w138_dialog": Wo138OnDialogLine(arg); break; // WO-138: the host's dialogue edge (a pause reason)
             case "w144_clock": Wo144OnClockLine(arg); break;   // WO-144 3.3: this world's clock stands / runs
             case "w144_avatar": _ = Wo144OnAvatarKeyAsync(arg); break;   // WO-144 2.1: which soul is the live avatar's

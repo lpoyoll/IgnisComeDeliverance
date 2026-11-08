@@ -12,6 +12,7 @@
 #include "wo208.h"
 #include "wo213.h"
 #include "wo214.h"
+#include "wo211.h"
 #include "wo163_rules.h"
 #include "fault_guard.h"
 #include "npc_scan.h"   // WO-144 2.3: body_kind (a horse or an animal is entity-written)
@@ -74,7 +75,8 @@ constexpr uint32_t kRecalcKeepGround = 0x21;         // bit 1 (recalc bounds) | 
 constexpr uint32_t kUnusedFloat     = 0xFFBFFFFFu;   // the physics "unused" float marker
 constexpr uint32_t kUnusedInt       = 0x80000000u;
 
-constexpr double kSilenceS      = 4.0;    // Lua releases a puppet at 3 s; the DLL stops a hair later on its own
+constexpr double kSilenceS      = 7.0;    // KCT fix (icd14) D: >= the Lua lease (3 x the 2 s heartbeat + 0.5 s = 6.5 s); was 4.0 against Lua's 3 s
+constexpr double kHealthS       = 10.0;   // KCT fix (icd14): the MP-HEALTH area=native-npc period
 constexpr double kStreamForgetS = 15.0;   // an unbound stream entry is forgotten after this much silence
 constexpr int    kRingDepth     = 32;     // KCT: 32 (was 16) so a 30 Hz figure keeps its delay plus a catch-up (~0.7 s); Lua keeps 3 (enough at 100 ms samples); a faster stream (a ghost, ~30 Hz) needs (delay + allowance)/period + 2
 constexpr double kClockResetS   = 5.0;    // a source silent this long gets a fresh offset estimate (a reconnect reuses relay ids)
@@ -134,6 +136,8 @@ std::atomic<bool> g_holdAll{false};      // WO-138: the host is paused, hold eve
 std::atomic<bool> g_snapFix{true};       // WO-166 C4: mp_snap_fix
 std::atomic<bool> g_walkFromHost{true};   // WO-201 B10: mp_walk_from_host
 std::atomic<uint32_t> c_extrapFrames{0}, c_extrapEnds{0}, c_silenceKept{0};
+std::atomic<uint32_t> c_silenceDrops{0};   // KCT fix (icd14): bodies dropped for a silent stream (MP-HEALTH silence_drops)
+double g_healthAt = -1; uint32_t g_healthSd = 0, g_healthOv = 0, g_healthTc = 0;   // KCT fix (icd14): the MP-HEALTH window
 std::atomic<uint32_t> c_catchFrames{0}, c_catchResumes{0};   // KCT catch_up: frames rendered with the clock held back; blends back from a hold
 constexpr double kExtrapMaxS = 2.0;        // WO-201 B10: a gap shorter than this is walked through on the host's last speed
 constexpr double kSilenceMovingS = 10.0;   // WO-201 B10: a copy that was moving is not dropped for silence before this
@@ -386,6 +390,7 @@ std::unordered_set<uint32_t> g_driftBlocked;   // WO-209: bodies whose hold ende
 void drop(std::unordered_map<std::string, Puppet>::iterator it, uint8_t reason, bool tell) {
     logf("MP-NPCWRITE npc=%s event=drop reason=%s eid=0x%X writes=%llu", it->second.name.c_str(), reason_name(reason),
          it->second.eid, static_cast<unsigned long long>(it->second.writes));
+    if (reason == kSilence) c_silenceDrops.fetch_add(1, std::memory_order_relaxed);   // KCT fix (icd14)
     motion::body_released(it->second.key.c_str(), it->second.eid);   // WO-121: gait/combat hand the body back
     if (tell) notify_drop(reason, it->second.name);
     if (reason == kNotLiving) {   // WO-147: remembered for the hit gate (a ragdoll is a moment, not a release)
@@ -1404,6 +1409,14 @@ void tick() {
     g_statWriting.store(writing);
     g_statBound.store(static_cast<uint16_t>(g_bound.size()));
     if (writing) g_statFrames.fetch_add(1, std::memory_order_relaxed);
+    // KCT fix (icd14): MP-HEALTH area=native-npc, every kHealthS (the dashboard's native half; the counts are this window's)
+    if (g_healthAt < 0) g_healthAt = now;
+    if (now - g_healthAt >= kHealthS) {
+        const uint32_t sd = c_silenceDrops.load(std::memory_order_relaxed), ov = wo211::overflow_reseat_count(), tc = motion::turn_cleared_count();
+        logf("MP-HEALTH area=native-npc window_s=%.1f bound=%zu writing=%u silence_drops=%u overflow_reseats=%u stuck_turnangle_clears=%u silence_s=%.1f",
+             now - g_healthAt, g_bound.size(), static_cast<unsigned>(writing), sd - g_healthSd, ov - g_healthOv, tc - g_healthTc, kSilenceS);
+        g_healthAt = now; g_healthSd = sd; g_healthOv = ov; g_healthTc = tc;
+    }
 
     if (!g_bound.empty() || g_cost.frames) {
         const double us = (now_s() - now) * 1e6;

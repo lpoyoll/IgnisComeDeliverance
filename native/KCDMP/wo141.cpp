@@ -24,6 +24,8 @@
 #include "pe_exports.h"
 #include "respawn_actions.h"
 #include "wo138.h"
+#include "wo213.h"
+#include "wo213_rules.h"
 
 #include <windows.h>
 #include <atomic>
@@ -832,7 +834,8 @@ std::atomic<uint32_t> c_neutralAlways{0}, c_neutralSame{0};
 // same stance, new objects) made the planner see a changed demand each time and re-plan: the look pose was queued again on every
 // copy, ~20,000 queue overflows in 10 minutes ("Agent is stuck"). Written again only when the body's activity changed or the
 // loaded state no longer holds these elements (a load, the game's own placement).
-struct NeutralMark { R::Activity a; void* s0 = nullptr; void* s3 = nullptr; };
+struct NeutralMark { R::Activity a; void* s0 = nullptr; void* s3 = nullptr; double at = 0; };
+std::atomic<uint32_t> c_pureSkipped{0};   // KCT fix (icd14) A: neutral writes a pure copy did not get
 std::unordered_map<std::string, NeutralMark> g_neutralMark;
 bool loaded_slots(void* ctx, void** s0, void** s3) {
     *s0 = *s3 = nullptr;
@@ -869,26 +872,30 @@ void reconcile_tick(double now) {
                     void* ctx = ctx_of_eid(d.eid);
                     void* s0 = nullptr; void* s3 = nullptr;
                     auto mk = g_neutralMark.find(it->first);
-                    const bool same = ctx && mk != g_neutralMark.end() && R::same_body(cur, mk->second.a) && loaded_slots(ctx, &s0, &s3) &&
-                                      s0 == mk->second.s0 && s3 == mk->second.s3;
-                    if (same) c_neutralSame.fetch_add(1, std::memory_order_relaxed);
-                    else if (build_loaded(d.eid, cur, nullptr, d.name.c_str(), nullptr, &ctx, true) == kApOk && ctx) {
+                    const bool marked = mk != g_neutralMark.end();
+                    const bool slotsSame = ctx && marked && loaded_slots(ctx, &s0, &s3) && s0 == mk->second.s0 && s3 == mk->second.s3;
+                    const bool same = slotsSame && R::same_body(cur, mk->second.a);
+                    // KCT fix (icd14) A (pure_copy): a host copy's planner is not fed -- once, then only a replaced loaded state, paced
+                    const bool pure = wo213::on(wo213rules::kBitPureCopy);
+                    if (!wo213rules::neutral_rewrite(pure, same, slotsSame, marked, marked ? now - mk->second.at : 1e9)) {
+                        (same ? c_neutralSame : c_pureSkipped).fetch_add(1, std::memory_order_relaxed);
+                    } else if (build_loaded(d.eid, cur, nullptr, d.name.c_str(), nullptr, &ctx, true) == kApOk && ctx) {
                         c_neutralAlways.fetch_add(1, std::memory_order_relaxed);
-                        NeutralMark m; m.a = cur;
+                        NeutralMark m; m.a = cur; m.at = now;
                         loaded_slots(ctx, &m.s0, &m.s3);
                         g_neutralMark[it->first] = m;
                     }
                     // WO-201 B23: the night/day dress is the host's value (WO-164 N's row flag) -- the neutral rule asked for nothing, so a
                     // copy that undressed for bed stayed undressed all day. The host's body dressed and this copy still in its night
                     // undress: dressed from what the body is now (paced 20 s, re-read after).
-                    if (g_wakeDress.load() && !d.hostNight && d.a.stance != R::kLying && now - d.dressCheckAt >= 5.0) {   // KCT: the HOST's stance (a copy loaded in bed was never dressed)
+                    if (!pure && g_wakeDress.load() && !d.hostNight && d.a.stance != R::kLying && now - d.dressCheckAt >= 5.0) {   // KCT: the HOST's stance (a copy loaded in bed was never dressed)
                         d.dressCheckAt = now;
                         void* wc = ctx_of_eid(d.eid);
                         void* el = wc ? equipment_element(wc) : nullptr;
                         if (!el) { d.copyNight = false; d.dressElem = nullptr; }
                         else if (el != d.dressElem) { d.dressElem = el; d.copyNight = in_sleep_outfit(wc); }
                     }
-                    if (g_wakeDress.load() && !d.hostNight && d.a.stance != R::kLying && d.copyNight && now >= d.dressNextAt) {
+                    if (!pure && g_wakeDress.load() && !d.hostNight && d.a.stance != R::kLying && d.copyNight && now >= d.dressNextAt) {
                         d.dressNextAt = now + 20.0;
                         uint8_t dres = 0;
                         const uint8_t dr = apply_now(d.eid, cur, &dres, nullptr, d.name.c_str());

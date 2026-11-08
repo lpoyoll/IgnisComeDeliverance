@@ -19,6 +19,7 @@ bool on(uint32_t bit);   // wo211_rules.h kBit*: the agent's word, less the benc
 
 // C: the owner's counters (wo208.cpp reports here)
 void note_overflow_reseat(bool owned, bool installed);
+uint32_t overflow_reseat_count();   // KCT fix (icd14): MP-HEALTH area=native-npc overflow_reseats (every reseat asked for an over-full queue)
 void note_handover_queue_full();
 
 const char* build_id();   // 0.2: this DLL's build id (BUILD_ID at build time; "dev" without one)
