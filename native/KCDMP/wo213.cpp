@@ -7,6 +7,7 @@
 #include "wo163.h"
 #include "log.h"
 #include "npc_drive.h"
+#include "icd14_pipe_rules.h"
 #include <windows.h>
 #include <atomic>
 #include <cstdio>
@@ -18,7 +19,7 @@ namespace {
 
 using namespace wo213rules;
 
-std::atomic<uint32_t> g_bits{kBitsDefault};
+std::atomic<uint32_t> g_bits{kBitsDefault | icd14pipe::kBitsDefault};   // KCT fix (icd14): the pipe's two switches ride the word too
 std::atomic<bool> g_configured{false};
 Bands g_bands{};   // written and read on the main thread (pipe ops and the frame hook both run there)
 

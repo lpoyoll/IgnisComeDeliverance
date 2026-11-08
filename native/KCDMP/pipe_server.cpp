@@ -42,6 +42,7 @@
 #include "wo163.h"
 #include "wo203.h"
 #include "wo213.h"
+#include "icd14_pipe_rules.h"
 #include "wo201.h"
 #include "buffs.h"
 #include "instance.h"
@@ -52,6 +53,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -71,6 +73,7 @@ std::atomic<bool>   g_running{false};
 std::atomic<bool>   g_connected{false};
 HANDLE              g_pipe = INVALID_HANDLE_VALUE;
 uint8_t             g_seq = 0;
+std::atomic<uint32_t> c_oversizeSkipped{0};   // KCT fix (icd14): requests skipped for their size (the connection kept)
 
 // The pipe is duplex and both directions are in use at once: the serve loop
 // parks in a read while the game thread pushes hits out. On a *synchronous*
@@ -601,22 +604,54 @@ bool run_sync_bounded(const std::function<void(T&)>& work, const char* what, T& 
 void serve(HANDLE h) {
     g_connected = true;
     logf("PIPE: agent connected");
+    // KCT fix (icd14): every disconnect says why (the agent's log says its side: CombatPipe.Drop)
+    char why[160] = "the listener stopped";
 
     while (g_running) {
         BYTE head[3];
-        if (!read_all(h, head, 3)) break;
+        if (!read_all(h, head, 3)) {
+            const DWORD e = GetLastError();
+            std::snprintf(why, sizeof why, "%s (read of a request head failed, error %lu)",
+                          e == ERROR_BROKEN_PIPE ? "the agent closed the pipe" : "the pipe broke", e);
+            break;
+        }
         const uint8_t  type = head[0];
         const uint16_t len  = static_cast<uint16_t>(head[1] | (head[2] << 8));
 
         // Bound the payload before allocating: the pipe is local, but a
         // malformed length should not turn into a huge allocation. WO-118:
         // the sample batch alone may run to kNpcSamplesMaxLen.
-        if (len > 1024 && !(type == kNpcSamples && len <= kNpcSamplesMaxLen)) {
+        // KCT fix (icd14) (pipe_oversize_skip): an oversize request no longer breaks the connection (each break released every body
+        // this DLL writes) -- its body is read in chunks and thrown away, and the agent is told (kReasonOversize). Past the hard cap
+        // (garbage, not a request) the connection still goes.
+        BYTE body[kNpcSamplesMaxLen];
+        const auto size = icd14pipe::classify(type, len, kNpcSamples, kNpcSamplesMaxLen, wo213::on(icd14pipe::kBitOversizeSkip));
+        if (size == icd14pipe::Size::Disconnect) {
             logf("PIPE: payload of %u bytes is out of range; dropping the connection", len);
+            std::snprintf(why, sizeof why, "an out-of-range payload: type 0x%02X, %u bytes", type, len);
             break;
         }
-        BYTE body[kNpcSamplesMaxLen];
-        if (len && !read_all(h, body, len)) break;
+        if (size == icd14pipe::Size::Discard) {
+            uint32_t left = len;
+            bool readOk = true;
+            int op0 = -1;   // the body's first byte (the op of a multiplexed type), for the log
+            while (left > 0 && readOk) {
+                const uint32_t n = left < icd14pipe::kDiscardChunk ? left : icd14pipe::kDiscardChunk;
+                readOk = read_all(h, body, n);
+                if (readOk && op0 < 0) op0 = body[0];
+                left -= n;
+            }
+            if (!readOk) { std::snprintf(why, sizeof why, "the pipe broke while an oversize body (type 0x%02X, %u bytes) was read", type, len); break; }
+            const uint8_t dseq = g_seq++;
+            const uint32_t n = c_oversizeSkipped.fetch_add(1, std::memory_order_relaxed) + 1;
+            main_thread::note_oversize_skipped();
+            if (n <= 20 || n % 100 == 0)
+                logf("PIPE: request 0x%02X (op %u) of %u bytes is over the %u-byte limit -- body skipped, failure replied (reason %u), the connection kept [n=%u]",
+                     type, static_cast<unsigned>(op0 < 0 ? 0 : op0), len, icd14pipe::kMaxPayload, icd14pipe::kReasonOversize, n);
+            send_result(h, false, dseq, icd14pipe::kReasonOversize);
+            continue;
+        }
+        if (len && !read_all(h, body, len)) { std::snprintf(why, sizeof why, "the pipe broke while a request body (type 0x%02X, %u bytes) was read", type, len); break; }
 
         const uint8_t seq = g_seq++;
         kcdmp::crash::note_pipe(type, len ? body[0] : 0, len);   // WO-202 I.1: the crash report's last requests
@@ -1491,7 +1526,7 @@ void serve(HANDLE h) {
     }
 
     g_connected = false;
-    logf("PIPE: agent disconnected");
+    logf("PIPE: agent disconnected (reason: %s; %u oversize request(s) skipped this process)", why, c_oversizeSkipped.load());
     // WO-118: no agent, no stream -- every native binding is dropped.
     npcdrive::on_pipe_closed();
     main_thread::post([] { kcdmp::wo132::on_pipe_closed(); });   // WO-132: engaged copies let go (main-thread state)

@@ -4630,6 +4630,7 @@ public partial class GameBridge(ClientConfig config)
     /// </summary>
     private async Task ReceiveLoopAsync(Stream stream, CancellationToken ct)
     {
+        IcdStartSideLanes(ct);   // KCT fix (icd14): the processor's DLL calls on their own lanes (GameBridge.Icd14.cs)
         var frames = Channel.CreateUnbounded<InFrame>(new UnboundedChannelOptions { SingleReader = true });
         _frameWriter = frames.Writer;   // WO-136: the load hold replays held frames through here
         var processor = ProcessFramesAsync(frames.Reader, ct);
@@ -4697,11 +4698,19 @@ public partial class GameBridge(ClientConfig config)
                 if (Wo147IsLeashFrame(type)) { leashLane.Writer.TryWrite(new InFrame(type, payload, arrival, stamp)); continue; }
                 if (type == Protocol.ConvDown && W207("conv_lane")) { convLane.Writer.TryWrite(new InFrame(type, payload, arrival, stamp)); continue; }   // WO-207 A.1
                 if ((type == Protocol.ActivityHostDown || type == Protocol.ActivityExtraDown) && W207("queue_decouple"))   // WO-207 B.3
-                { actLane.Writer.TryWrite(new InFrame(type, payload, arrival, stamp)); continue; }
+                {
+                    // KCT fix (icd14) (mp_lane_newest_per_npc): only each NPC's newest waiting activity row (GameBridge.Icd14.cs)
+                    if (!IcdCoalescePost(false, type, payload, arrival, stamp, ct)) actLane.Writer.TryWrite(new InFrame(type, payload, arrival, stamp));
+                    continue;
+                }
                 // KCT fix (icd13): the host's NPC animation states wait for the DLL pipe (~300 ms each on the field's joiner); in the one
                 // processor every frame behind them waited too and the joiner fell 30-73 s behind. Their own lane, like the activities.
                 if (type == Protocol.NpcAnimDown && W207("queue_decouple"))
-                { animLane.Writer.TryWrite(new InFrame(type, payload, arrival, stamp)); continue; }
+                {
+                    // KCT fix (icd14) (mp_lane_newest_per_npc): only each NPC's newest waiting animation state
+                    if (!IcdCoalescePost(true, type, payload, arrival, stamp, ct)) animLane.Writer.TryWrite(new InFrame(type, payload, arrival, stamp));
+                    continue;
+                }
                 FeedNativeAtRead(type, payload, arrival);
                 if (W202("net_game_queue") && Wo202Coalesce(frames.Writer, type, payload, arrival, stamp)) continue;   // WO-202 III.1: a waiting state is replaced
                 Wo207Queue(frames.Writer, new InFrame(type, payload, arrival, stamp), type);   // WO-207 B.1
@@ -4803,6 +4812,7 @@ public partial class GameBridge(ClientConfig config)
                     if (Wo140DropSeparate(frame.Type)) continue;   // WO-140: nothing of the host's world reaches a joiner in its own
                     if (Wo206DropStale(frame)) continue;   // WO-206 E: a world write from an older world epoch (a load since it was sent)
                     if (Wo207DropStale(frame)) continue;   // WO-207 B.2: a combat moment already older than its use, dropped before any handler
+                    if (IcdDropStaleAtDequeue(frame.Type, frame.Arrival)) continue;   // KCT fix (icd14): any droppable event this old (IcdFrameRules)
                     int type       = frame.Type;
                     var payload    = frame.Payload;
                     int payloadLen = payload.Length;
@@ -4922,7 +4932,11 @@ public partial class GameBridge(ClientConfig config)
                             {
                                 OnNpcRequestIn(a);
                             }
-                            else if (await DispatchWo121ActionAsync(a, ct))
+                            else
+                            // KCT fix (icd14): the dispatch waits for the DLL (the rows, the resync burst): on the action lane, in order
+                            await IcdSideAsync("action", Wo207Trace.ActionKindBase + (int)a.Kind, async () =>
+                            {
+                            if (await DispatchWo121ActionAsync(a, ct))
                             {
                                 // WO-121: attack / jump / block / dodge rows, NPC rows, the host lever.
                             }
@@ -4949,6 +4963,7 @@ public partial class GameBridge(ClientConfig config)
                             // Named as a drop rather than left looking applied.
                             Console.WriteLine(FormattableString.Invariant(
                                 $"MP-ACTION section=inbound ghost={a.SourceGhostId} kind={a.Kind} phase={a.Phase} seq={a.Seq} gen={a.Gen} {detail} dispatch=dropped-no-receiver"));
+                            });
                         }
                         else
                         {
@@ -4960,7 +4975,8 @@ public partial class GameBridge(ClientConfig config)
                     else if (Protocol.IsJoinDown(type, payloadLen))
                     {
                         // WO-123: the join channel (request, offer, chunks, acks, done, abort, ready, status).
-                        await Wo123OnFrameAsync(type, payload, ct);
+                        // KCT fix (icd14): its handlers call the DLL -- on the join lane, in order (never dropped)
+                        await IcdSideAsync("join", type, () => Wo123OnFrameAsync(type, payload, ct));
                     }
                     else if (type == Protocol.WorldSavedDown && payloadLen == Protocol.WorldSavedDownPayloadLen)
                     {
@@ -5046,7 +5062,7 @@ public partial class GameBridge(ClientConfig config)
                         await ApplyPeerPauseAsync(ghostId, paused: false, ct);
                         // WO-113: a gone peer's mirror gravestones go with them;
                         // the owner re-announces on its next connect.
-                        try { await _combat.MirrorGraveAsync(2, ghostId, 0, 0, 0, 0, ct); } catch { }
+                        await IcdSideAsync("grave", type, async () => { try { await _combat.MirrorGraveAsync(2, ghostId, 0, 0, 0, 0, ct); } catch { } });   // KCT fix (icd14): the grave lane, in order
                         // WO-211 A.1.5: a partner in this world keeps its figure, marked reconnecting, for the hold's window (Wo211HostFigureTick)
                         if (!Wo211HoldFigure(ghostId, w211InWorld)) { try { await ExecLuaAsync($"KCD2MP_RemoveGhost(\"{ghostId}\")"); } catch { } }
                         await Wo123OnPeerGoneAsync(ghostId);   // WO-123: a joiner gone mid-join resumes the host
@@ -5071,6 +5087,9 @@ public partial class GameBridge(ClientConfig config)
                         float health   = ReadFloat(payload, 21);
                         bool  suppress = (payload[25] & Protocol.DamageFlagSuppressHitReaction) != 0;
 
+                        // KCT fix (icd14): the DLL's apply on the damage lane, in order; the processor goes on
+                        await IcdSideAsync("damage", type, async () =>
+                        {
                         bool applied = config.GuidDamageFallbackEnabled
                                     && await _combat.ApplyDamageAsync(soul, stamina, health, suppress, ct, nonLethal: Wo131JoinerActive);   // WO-147
                         // WO-100.5 Phase 4: the receiving half of the same
@@ -5087,6 +5106,7 @@ public partial class GameBridge(ClientConfig config)
                             // real hit in this world -- the "Henry is attacking an
                             // innocent NPC" moment. No-op when aggro is disabled.
                             _ = TriggerReactiveAggroAsync(sourceId, ct);
+                        });
                     }
                     else if (type == Protocol.NpcDamageDown
                              && payloadLen >= 1 + 1 + 1 + Protocol.NpcDamageFixedTail
