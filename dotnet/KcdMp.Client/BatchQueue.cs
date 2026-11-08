@@ -144,6 +144,7 @@ public sealed class BatchQueue
         {
             Remove(old);
             Superseded++;
+            if (old.Value.Sends > 0) ReplaysDroppedSuperseded++;   // KCT fix (icd14): a timed-out batch's Level statement waiting to replay
         }
         var node = _q.AddLast(e);
         _queuedEncoded += e.Encoded;

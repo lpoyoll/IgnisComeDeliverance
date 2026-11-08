@@ -1066,7 +1066,7 @@ public sealed class LogTailGameTransport : IGameTransport
                 }
                 catch
                 {
-                    savedId = openId; savedOffset = SafePosition(fs);
+                    savedId = openId; savedOffset = SafePosition(fs!);
                     fs.Dispose();
                     fs = null;
                     continue;

@@ -41,7 +41,7 @@ public sealed class LuaHealth
     public static string Line(int queued, long sent, long timeouts, long replaysDropped, long[] expiredByClass, long evicted, long drains, (double P50, double P95) answer) =>
         string.Create(CultureInfo.InvariantCulture,
             $"MP-HEALTH area=lua queued={queued} sent_batches={sent} batch_timeouts={timeouts} replays_dropped_superseded={replaysDropped} " +
-            $"edges_expired_by_kind=feedback:{expiredByClass[(int)EdgeClass.Feedback]},normal:{expiredByClass[(int)EdgeClass.Normal]},world:{expiredByClass[(int)EdgeClass.World]} " +
+            $"edges_expired={expiredByClass.Sum()} edges_expired_by_kind=feedback:{expiredByClass[(int)EdgeClass.Feedback]},normal:{expiredByClass[(int)EdgeClass.Normal]},world:{expiredByClass[(int)EdgeClass.World]} " +
             $"evicted={evicted} recovery_drains={drains} answer_ms_p50={answer.P50:F0} answer_ms_p95={answer.P95:F0}");
 }
 
