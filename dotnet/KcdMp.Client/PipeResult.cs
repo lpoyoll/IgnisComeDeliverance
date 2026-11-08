@@ -54,6 +54,8 @@ public enum PipeReason : byte
     UnknownCommand = 18,
     /// <summary>WO-214 D.2: the copy's animation owner (WO-208) shows its actions -- the row was not played (0.64.0 said EngineRefused).</summary>
     OwnerOwns = 19,
+    /// <summary>KCT fix (icd14): the DLL read the request's body, threw it away for its size and kept the connection (native icd14_pipe_rules.h).</summary>
+    Oversize = 20,
 
     // ---- agent-side reasons. Deliberately above the native range so the two
     // vocabularies can never collide as either side grows. ----
@@ -70,6 +72,10 @@ public enum PipeReason : byte
     Expired = 204,
     /// <summary>Discarded: out of order, or already applied.</summary>
     StaleOrDuplicate = 205,
+    /// <summary>KCT fix (icd14): never written -- the payload is over what the DLL takes for its type (PipeRules.MaxPayload).</summary>
+    OversizeRefused = 206,
+    /// <summary>KCT fix (icd14): a background poll that waited at the gate past its age limit, dropped before it was sent (the next one asks again).</summary>
+    StaleDropped = 207,
     /// <summary>A pre-WO-100 DLL: it applied or refused, but did not say which kind.</summary>
     Unknown = 255,
 }
@@ -108,6 +114,9 @@ public readonly record struct PipeResult(bool Ok, PipeReason Reason)
         PipeReason.InboxFull           => "inbox-full",
         PipeReason.Expired             => "expired",
         PipeReason.StaleOrDuplicate    => "stale-or-duplicate",
+        PipeReason.Oversize            => "oversize",
+        PipeReason.OversizeRefused     => "oversize-refused",
+        PipeReason.StaleDropped        => "stale-dropped",
         PipeReason.Unknown             => "unknown",
         _                              => $"reason-{(byte)Reason}",
     };

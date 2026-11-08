@@ -435,12 +435,71 @@ public sealed class CombatPipe : IAsyncDisposable
             }
 
             _warnedUnavailable = false;
-            Interlocked.Increment(ref _connectGeneration);   // KCT fix (icd13): a reconnect is told to Lua (GameBridge.NativeHeartbeatAsync)
-            Console.WriteLine("[combat] connected to KCDMP.dll");
+            int gen = Interlocked.Increment(ref _connectGeneration);   // KCT fix (icd13): a reconnect is told to Lua (GameBridge.NativeHeartbeatAsync)
+            Console.WriteLine($"[combat] connected to KCDMP.dll (connection {gen})");
             _reader = Task.Run(ReadLoopAsync);
+            // KCT fix (icd14) (mp_pipe_config_replay): the DLL forgot every switch and config with the old connection (its pipe-closed
+            // handlers stand each feature down). The last of each goes again now, under the gate this call already holds -- before any
+            // other call reaches the new connection.
+            if (gen > 1)
+            {
+                Health.NoteReconnect();
+                if (ReplayConfigOnReconnect) await ReplayStickyLockedAsync(gen, ct);
+            }
             return true;
         }
         finally { _gate.Release(); }
+    }
+
+    /// <summary>KCT fix (icd14): the switches' and configs' last payloads, in the order each was first sent (held: the gate).</summary>
+    public PipeStickyConfig Sticky { get; } = new();
+
+    /// <summary>KCT fix (icd14): the counters of the <c>MP-HEALTH area=pipe</c> line.</summary>
+    public PipeHealth Health { get; } = new();
+
+    /// <summary>KCT fix (icd14) (mp_pipe_config_replay): every reconnect re-sends the session's configs. False: the twin (only Lua is told).</summary>
+    public bool ReplayConfigOnReconnect { get; set; } = true;
+
+    /// <summary>KCT fix (icd14) (mp_pipe_oversize_guard): a payload over the DLL's limit is refused here and never written.</summary>
+    public bool OversizeGuard { get; set; } = true;
+
+    /// <summary>KCT fix (icd14) (mp_pipe_poll_age): a background poll older than its period at the gate is dropped; its reply deadline is 1 s.</summary>
+    public bool PollAgeLimit { get; set; } = true;
+
+    /// <summary>KCT fix (icd14) (mp_pipe_cb_lane): the reader hands unsolicited events to their own task instead of awaiting them.</summary>
+    public bool CallbackLane { get; set; } = true;
+
+    /// <summary>
+    /// KCT fix (icd14): a background loop's own period (ms) for the calls it makes -- the poll's age limit at the gate (0 = the
+    /// read-only requests' default, <see cref="PipeRules.DefaultPollAgeMs"/>). Setting it marks any call as a poll.
+    /// </summary>
+    public static readonly AsyncLocal<int> PollPeriodMs = new();
+
+    private async Task ReplayStickyLockedAsync(int gen, CancellationToken ct)
+    {
+        var all = Sticky.Snapshot();
+        if (all.Count == 0) { Console.WriteLine($"[combat] reconnect {gen}: no session config to replay yet"); return; }
+        int ok = 0, failed = 0;
+        foreach (var (type, payload) in all)
+        {
+            try
+            {
+                var (body, fail) = await ExchangeLockedAsync(type, payload, PipeRules.ReplyTypeFor(type), PipeRules.PollReplyDeadline, ct);
+                if (body is not null) ok++;
+                else
+                {
+                    failed++;
+                    if (fail is PipeReason.NoAnswer or PipeReason.NotConnected) break;   // the DLL is not there: the rest would wait for nothing
+                }
+            }
+            catch (Exception ex) when (ex is IOException or ObjectDisposedException or ChannelClosedException)
+            {
+                Console.WriteLine($"[combat] reconnect {gen}: the config replay stopped ({ex.GetType().Name}: {ex.Message})");
+                break;
+            }
+        }
+        Health.NoteReplayed(ok);
+        Console.WriteLine($"[combat] reconnect {gen}: replayed {ok} of {all.Count} session config(s) to KCDMP.dll, {failed} not taken [{string.Join(',', all.Select(a => $"0x{a.Type:X2}/{(a.Payload.Length > 0 ? a.Payload[0] : -1)}"))}]");
     }
 
     /// <summary>Apply damage from a remote peer to the soul with this SharedSoulGuid.</summary>
@@ -956,41 +1015,11 @@ public sealed class CombatPipe : IAsyncDisposable
     /// <summary>Round-trip check that the DLL is alive and pumping frames.</summary>
     public async Task<bool> PingAsync(CancellationToken ct = default)
     {
-        if (!await EnsureConnectedAsync(ct)) return false;
-        await _gate.WaitAsync(ct);
-        try
-        {
-            while (_replies.Reader.TryRead(out _)) StaleRepliesDropped++;
-            await WriteFrameAsync(Ping, [], ct);
-            using var slice = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            slice.CancelAfter(ReplyDeadline);
-            try
-            {
-                var reply = await _replies.Reader.ReadAsync(slice.Token);
-                // A Ping consumes a sequence number in the DLL even though it
-                // answers with Pong rather than Result, so the expectation has
-                // to advance with it or every later reply looks misordered.
-                if (_expectedSeq is byte want) _expectedSeq = (byte)(want + 1);
-                return reply.Type == Pong;
-            }
-            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-            {
-                TimedOut++;
-                return false;
-            }
-        }
-        catch (ChannelClosedException)
-        {
-            // WO-154 6.6: the reader lost the pipe (the game quit) while this waited, and its Drop completed the
-            // channel; it is already dropped (a Drop here could close a connection made since)
-            return false;
-        }
-        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
-        {
-            Drop();
-            return false;
-        }
-        finally { _gate.Release(); }
+        // KCT fix (icd14): through the same gate, lines and priorities as every other call (it used to take the gate past both lines:
+        // a ping jumped every frame's waiting call). A Ping consumes a sequence number in the DLL though it answers with a bare Pong:
+        // SendAndAwaitAsync advances the expectation for it.
+        var (body, _) = await SendAndAwaitAsync(Ping, [], Pong, ct);
+        return body is not null;
     }
 
     // ---- WO-138 (native wo138.h) ---------------------------------------------
@@ -1678,17 +1707,29 @@ public sealed class CombatPipe : IAsyncDisposable
     public async Task<byte[]?> Wo173DownPollAsync(IReadOnlyList<string> names, CancellationToken ct = default)
     {
         if (names.Count is 0 or > 32) return null;
-        var parts = new List<byte> { (byte)names.Count };
+        var encoded = new List<byte[]>(names.Count);
         foreach (var n in names)
         {
             var nb = Encoding.ASCII.GetBytes(n);
             if (nb.Length is 0 or > 63) return null;
-            parts.Add((byte)nb.Length); parts.AddRange(nb);
+            encoded.Add(nb);
         }
-        var r = await Wo163Async(21, parts.ToArray(), ct);
-        if (r is not { Ok: true } x || x.Payload.Length != 1 + names.Count || x.Payload[0] != names.Count) return null;
-        return x.Payload.AsSpan(1).ToArray();
+        // KCT fix (icd14): 32 names of up to 63 bytes run to 2 KB -- over the DLL's 1024-byte request, which used to cost the whole
+        // connection. Asked in batches that fit (the answer is per name, in order, so the batches' answers simply follow each other).
+        var all = new List<byte>(names.Count);
+        foreach (var batch in PipeBatches.ByLength(encoded, Wo173DownPollBatchBytes))
+        {
+            var parts = new List<byte> { (byte)batch.Count };
+            foreach (var nb in batch) { parts.Add((byte)nb.Length); parts.AddRange(nb); }
+            var r = await Wo163Async(21, parts.ToArray(), ct);
+            if (r is not { Ok: true } x || x.Payload.Length != 1 + batch.Count || x.Payload[0] != batch.Count) return null;
+            all.AddRange(x.Payload.AsSpan(1).ToArray());
+        }
+        return all.ToArray();
     }
+
+    /// <summary>KCT fix (icd14): one WO-173 down poll's names part (count byte + [len][name]...), under the 1024-byte request with the op byte.</summary>
+    public const int Wo173DownPollBatchBytes = 1000;
 
     /// <summary>WO-167 op 13: the native half's counters.</summary>
     public async Task<string?> Wo167StatusAsync(CancellationToken ct = default)
@@ -2142,10 +2183,50 @@ public sealed class CombatPipe : IAsyncDisposable
     private static void WriteSoulGuid(Guid soul, Span<byte> dest) =>
         soul.TryWriteBytes(dest);
 
+    // KCT fix (icd14) (mp_pipe_cb_lane): the unsolicited events' handlers (local hits, downed / respawned / graves, local actions, pvp
+    // hits, native drops, trace-done) used to be awaited on the reader: a slow handler held every reply behind it, and every caller at
+    // the gate with them. They run on this one task now, in the DLL's order; the reader only enqueues.
+    private readonly Channel<(Func<Task> Work, string What)> _callbacks =
+        Channel.CreateUnbounded<(Func<Task>, string)>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
+    private long _callbackDepth;
+    private int _callbackLoopStarted;
+
+    private ValueTask RunCallbackAsync(Func<Task> work, string what)
+    {
+        if (!CallbackLane) return new ValueTask(RunOneCallbackAsync(work, what));   // the twin: awaited on the reader, as before
+        if (Interlocked.CompareExchange(ref _callbackLoopStarted, 1, 0) == 0) _ = Task.Run(CallbackLoopAsync);
+        Health.NoteCallbackDepth(Interlocked.Increment(ref _callbackDepth));
+        if (!_callbacks.Writer.TryWrite((work, what))) { Interlocked.Decrement(ref _callbackDepth); return new ValueTask(RunOneCallbackAsync(work, what)); }
+        return ValueTask.CompletedTask;
+    }
+
+    private static async Task RunOneCallbackAsync(Func<Task> work, string what)
+    {
+        try { await work(); }
+        catch (Exception ex) { Console.WriteLine($"{what}: {ex.Message}"); }
+    }
+
+    private async Task CallbackLoopAsync()
+    {
+        try
+        {
+            await foreach (var (work, what) in _callbacks.Reader.ReadAllAsync())
+            {
+                Interlocked.Decrement(ref _callbackDepth);
+                await RunOneCallbackAsync(work, what);
+            }
+        }
+        catch (Exception ex) { Console.WriteLine($"[combat] the callback lane stopped: {ex.GetType().Name}: {ex.Message}"); }
+    }
+
+    /// <summary>KCT fix (icd14): unsolicited events waiting for their handler now.</summary>
+    public long CallbackQueueDepth => Interlocked.Read(ref _callbackDepth);
+
     /// <summary>Route frames: replies to the waiting command, hits to the callback.</summary>
     private async Task ReadLoopAsync()
     {
         var myPipe = _pipe;   // WO-153 3: the pipe THIS reader serves (a reconnect has a new one)
+        string? readEndWhy = null;   // KCT fix (icd14): the disconnect says why
         try
         {
             while (_pipe?.IsConnected == true)
@@ -2165,68 +2246,55 @@ public sealed class CombatPipe : IAsyncDisposable
                     bool  byPlayer = body.Length >= 26 && body[25] != 0;   // WO-121
                     bool  judge   = body.Length >= 27 && body[26] != 0;   // WO-210 E.2
                     if (died) Console.WriteLine($"[npcdeath] DLL reports a FATAL local hit on {soul} (hp -{health:F1})");
+                    // KCT fix (icd14) (mp_pipe_cb_lane): the unsolicited events' handlers run on their own task, in the DLL's order --
+                    // awaited here, every reply behind a slow handler waited (and with it every caller at the gate)
                     if (OnLocalHit is { } handler)
-                    {
-                        try { await handler(soul, stamina, health, died, byPlayer, judge); }
-                        catch (Exception ex) { Console.WriteLine($"[combat] local hit not sent: {ex.Message}"); }
-                    }
+                        await RunCallbackAsync(() => handler(soul, stamina, health, died, byPlayer, judge), "[combat] local hit not sent");
                 }
                 else if (type == LocalDowned && body.Length >= 2)
                 {
                     // WO-113: unsolicited, like LocalHit -- never a reply.
                     if (OnLocalDowned is { } h)
                     {
-                        try { await h(body[0] != 0, body[1]); }
-                        catch (Exception ex) { Console.WriteLine($"[respawn] downed not handled: {ex.Message}"); }
+                        bool dOn = body[0] != 0; byte dKind = body[1];
+                        await RunCallbackAsync(() => h(dOn, dKind), "[respawn] downed not handled");
                     }
                 }
                 else if (type == LocalRespawned && body.Length >= 13)
                 {
                     if (OnLocalRespawned is { } h)
                     {
-                        try
-                        {
-                            await h(BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(0)),
-                                    BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(4)),
-                                    BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(8)), body[12]);
-                        }
-                        catch (Exception ex) { Console.WriteLine($"[respawn] respawned not handled: {ex.Message}"); }
+                        float rx = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(0)), ry = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(4)),
+                              rz = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(8));
+                        byte rk = body[12];
+                        await RunCallbackAsync(() => h(rx, ry, rz, rk), "[respawn] respawned not handled");
                     }
                 }
                 else if (type == LocalGrave && body.Length >= 21)
                 {
                     if (OnLocalGrave is { } h)
                     {
-                        try
-                        {
-                            await h(body[0] != 0, BinaryPrimitives.ReadUInt64LittleEndian(body.AsSpan(1)),
-                                    BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(9)),
-                                    BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(13)),
-                                    BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(17)));
-                        }
-                        catch (Exception ex) { Console.WriteLine($"[grave] local grave not handled: {ex.Message}"); }
+                        bool gAdd = body[0] != 0;
+                        ulong gId = BinaryPrimitives.ReadUInt64LittleEndian(body.AsSpan(1));
+                        float gx = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(9)), gy = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(13)),
+                              gz = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(17));
+                        await RunCallbackAsync(() => h(gAdd, gId, gx, gy, gz), "[grave] local grave not handled");
                     }
                 }
                 else if (type == LocalAction && LocalActionFrame.TryParse(body, out var la))
                 {
                     // WO-121: unsolicited, never a reply.
                     if (OnLocalAction is { } h)
-                    {
-                        try { await h(la); }
-                        catch (Exception ex) { Console.WriteLine($"[wo121] local action not sent: {ex.Message}"); }
-                    }
+                        await RunCallbackAsync(() => h(la), "[wo121] local action not sent");
                 }
                 else if (type == PvpHitOut && body.Length == 14)
                 {
                     if (OnPvpHit is { } h)
                     {
-                        try
-                        {
-                            await h(BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(0)),
-                                    BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(4)),
-                                    BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(8)), body[12], body[13]);
-                        }
-                        catch (Exception ex) { Console.WriteLine($"[wo121] pvp hit not sent: {ex.Message}"); }
+                        uint pv = BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(0));
+                        float pst = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(4)), php = BinaryPrimitives.ReadSingleLittleEndian(body.AsSpan(8));
+                        byte pfl = body[12], pmat = body[13];
+                        await RunCallbackAsync(() => h(pv, pst, php, pfl, pmat), "[wo121] pvp hit not sent");
                     }
                 }
                 else if (type == NpcAvatarHit && body.Length >= 18 && body.Length == 18 + body[17])
@@ -2326,16 +2394,18 @@ public sealed class CombatPipe : IAsyncDisposable
                     // WO-118: unsolicited, never a reply.
                     if (OnNpcDropped is { } h)
                     {
-                        try { await h(body[0], System.Text.Encoding.UTF8.GetString(body, 2, body[1])); }
-                        catch (Exception ex) { Console.WriteLine($"[npcwrite] drop not handled: {ex.Message}"); }
+                        byte dr = body[0];
+                        string dn = System.Text.Encoding.UTF8.GetString(body, 2, body[1]);
+                        await RunCallbackAsync(() => h(dr, dn), "[npcwrite] drop not handled");
                     }
                 }
                 else if (type == NpcTraceDone && body.Length >= 5 && body.Length == 5 + body[4])
                 {
                     if (OnNpcTraceDone is { } h)
                     {
-                        try { await h(BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(0)), System.Text.Encoding.UTF8.GetString(body, 5, body[4])); }
-                        catch (Exception ex) { Console.WriteLine($"[npctrace] trace-done not handled: {ex.Message}"); }
+                        uint tr = BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(0));
+                        string tp = System.Text.Encoding.UTF8.GetString(body, 5, body[4]);
+                        await RunCallbackAsync(() => h(tr, tp), "[npctrace] trace-done not handled");
                     }
                 }
                 else if (!_replies.Writer.TryWrite((type, body)))
@@ -2350,21 +2420,21 @@ public sealed class CombatPipe : IAsyncDisposable
         catch (Exception ex) when (ex is IOException or ObjectDisposedException)
         {
             // Normal on shutdown or if the game exits. KCT fix (icd13): said, so a mid-session break says why.
-            Console.WriteLine($"[combat] pipe read ended: {ex.GetType().Name}: {ex.Message}");
+            readEndWhy = $"pipe read ended: {ex.GetType().Name}: {ex.Message}"; Console.WriteLine($"[combat] {readEndWhy}");
         }
         catch (Exception ex)
         {
             // Anything else would otherwise become an unobserved task exception:
             // the reader stops and the agent goes quiet with no output at all,
             // which is indistinguishable from the DLL never writing.
-            Console.WriteLine($"[combat] reader stopped: {ex.GetType().Name}: {ex.Message}");
+            readEndWhy = $"reader stopped: {ex.GetType().Name}: {ex.Message}"; Console.WriteLine($"[combat] {readEndWhy}");
         }
         Console.WriteLine("[combat] pipe reader exited");
         // WO-153 3: the reader is the first to know the DLL is gone (the game ended). Before, only a later WRITE found it,
         // the waiting caller sat out its full 5 s deadline ("no answer to 0x28 after 5000 ms") and the loss was declared
         // 4.3-4.6 s late, in every one of the 12 field runs. The connection is dropped now, once, so every caller fails at
         // once -- but only if this reader's pipe is still the current one.
-        if (myPipe is not null && ReferenceEquals(_pipe, myPipe)) Drop();
+        if (myPipe is not null && ReferenceEquals(_pipe, myPipe)) Drop(readEndWhy ?? "the pipe reader exited");
     }
 
     private async Task<bool> SendAsync(byte type, byte[] payload, CancellationToken ct)
@@ -2535,12 +2605,62 @@ public sealed class CombatPipe : IAsyncDisposable
         byte type, byte[] payload, byte wantType, CancellationToken ct)
     {
         if (Wo210PipeBlock.Blocks(type, type == Wo163 && payload.Length > 0 ? payload[0] : -1)) return (null, PipeReason.NotConnected);   // WO-210 H.3's bisect only
+        // KCT fix (icd14) (mp_pipe_oversize_guard): refused here, never written -- the DLL used to break the whole connection for it
+        if (OversizeGuard && PipeRules.IsOversize(type, payload.Length))
+        {
+            Health.NoteOversizeRefused();
+            long n = Health.OversizeRefused;
+            if (n <= 20 || n % 100 == 0)
+                Console.WriteLine($"[combat] request 0x{type:X2} (op {(payload.Length > 0 ? payload[0] : -1)}) of {payload.Length} bytes is over the DLL's {PipeRules.MaxPayload(type)}-byte limit -- not sent (reason oversize-refused) [window n={n}]");
+            return (null, PipeReason.OversizeRefused);
+        }
         if (!await EnsureConnectedAsync(ct)) return (null, PipeReason.NotConnected);
+
+        // KCT fix (icd14): a background poll (no relay frame behind it, not the priority path) has an age limit at the gate and a 1 s
+        // reply deadline; a frame's call keeps 5 s and is never dropped
+        bool frameDriven = Wo207Trace.Kind.Value != 0 || Priority.Value;
+        int pollPeriod = PollPeriodMs.Value;
+        bool poll = PollAgeLimit && !frameDriven && (pollPeriod > 0 || PipeRules.IsPoll(type, payload.Length > 0 ? payload[0] : -1));
 
         long gateAt = Environment.TickCount64;
         bool line = await EnterGateAsync(ct);
         long sentAt = Environment.TickCount64;
+        Health.GateWait.Add(sentAt - gateAt);
         try
+        {
+            if (poll && PipeRules.PollTooOld(sentAt - gateAt, pollPeriod))
+            {
+                Health.NoteStale();
+                return (null, PipeReason.StaleDropped);
+            }
+            return await ExchangeLockedAsync(type, payload, wantType, poll ? PipeRules.PollReplyDeadline : ReplyDeadline, ct);
+        }
+        catch (ChannelClosedException)
+        {
+            // WO-154 6.6: the field's "tick failed: ChannelClosedException" at every game exit -- the reader lost the
+            // pipe while this command waited for its answer and completed the channel (WO-153's Drop on the reader's
+            // exit). The connection is already dropped: not connected, said once by the reader, nothing thrown.
+            return (null, PipeReason.NotConnected);
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+        {
+            Drop($"0x{type:X2} failed on the pipe: {ex.GetType().Name}: {ex.Message}");
+            return (null, PipeReason.NotConnected);
+        }
+        finally
+        {
+            _gate.Release();
+            if (line) _line.Release();
+            Wo207Trace.Pipe(Wo207Trace.Kind.Value, (type << 8) | (payload.Length > 0 ? payload[0] : 0), sentAt - gateAt, Environment.TickCount64 - sentAt);   // WO-207 B.1: the gate's wait, the round trip (by frame type and its first byte: the op of a multiplexed type)
+        }
+    }
+
+    /// <summary>
+    /// KCT fix (icd14): one request and its reply, the gate already held (SendAndAwaitAsync; the reconnect's config replay). Throws the
+    /// pipe's IOException / ObjectDisposedException / ChannelClosedException to the caller.
+    /// </summary>
+    private async Task<(byte[]? Body, PipeReason Fail)> ExchangeLockedAsync(byte type, byte[] payload, byte wantType, TimeSpan replyDeadline, CancellationToken ct)
+    {
         {
             // Drop anything left over from an earlier command that timed out.
             // Without this the first read below returns that command's answer
@@ -2553,10 +2673,12 @@ public sealed class CombatPipe : IAsyncDisposable
             }
 
             await WriteFrameAsync(type, payload, ct);
+            Health.NoteSent();
+            Sticky.Record(type, payload);   // KCT fix (icd14): a set-and-forget config is replayed on a reconnect
 
             // Bounded wait with an explicit give-up, and the waited time is
             // reported on expiry (WO-100 Phase 4 item 2).
-            var deadline = MonoClock.UtcNow + ReplyDeadline;
+            var deadline = MonoClock.UtcNow + replyDeadline;
             var started  = MonoClock.UtcNow;
             while (true)
             {
@@ -2564,6 +2686,7 @@ public sealed class CombatPipe : IAsyncDisposable
                 if (left <= TimeSpan.Zero)
                 {
                     TimedOut++;
+                    Health.NoteTimeout();
                     // WO-110 R12 (docs/WO-109-audit.md R12): the DLL numbers
                     // every frame it READS, so the reply to this timed-out
                     // command -- if it ever comes -- carries exactly the seq we
@@ -2574,7 +2697,7 @@ public sealed class CombatPipe : IAsyncDisposable
                     if (_expectedSeq is byte w) _expectedSeq = (byte)(w + 1);
                     Console.WriteLine($"[combat] no answer to 0x{type:X2} after " +
                                       $"{(MonoClock.UtcNow - started).TotalMilliseconds:F0} ms " +
-                                      $"(deadline {ReplyDeadline.TotalMilliseconds:F0} ms, timeouts {TimedOut}; seq advanced past the missing reply)");
+                                      $"(deadline {replyDeadline.TotalMilliseconds:F0} ms, timeouts {TimedOut}; seq advanced past the missing reply)");
                     return (null, PipeReason.NoAnswer);
                 }
 
@@ -2583,6 +2706,24 @@ public sealed class CombatPipe : IAsyncDisposable
                 (byte Type, byte[] Body) reply;
                 try { reply = await _replies.Reader.ReadAsync(slice.Token); }
                 catch (OperationCanceledException) when (!ct.IsCancellationRequested) { continue; }
+
+                // KCT fix (icd14): the Ping's answer is a bare Pong (no body, no seq) -- it still consumed a sequence number in the DLL
+                if (wantType == Pong)
+                {
+                    if (reply.Type != Pong) { StaleRepliesDropped++; continue; }
+                    if (_expectedSeq is byte wp) _expectedSeq = (byte)(wp + 1);
+                    Health.NoteReply();
+                    return (reply.Body, PipeReason.Ok);
+                }
+                // KCT fix (icd14): the DLL skipped this request for its size and kept the connection (a typed reply never comes)
+                if (reply.Type == Result && wantType != Result && reply.Body.Length >= 3
+                    && reply.Body[2] == (byte)PipeReason.Oversize
+                    && (_expectedSeq is not byte wo || reply.Body[1] == wo))
+                {
+                    _expectedSeq = (byte)(reply.Body[1] + 1);
+                    Health.NoteOversizeByDll();
+                    return (null, PipeReason.Oversize);
+                }
 
                 // WO-118: a DLL older than this command answers 0x81 with
                 // reason UnknownCommand (WO-110 R12) instead of the typed reply.
@@ -2618,33 +2759,18 @@ public sealed class CombatPipe : IAsyncDisposable
                     Console.WriteLine($"[combat] reply seq={seq} is ahead of the expected {want} -- resyncing");
                 }
                 _expectedSeq = (byte)(seq + 1);
+                Health.NoteReply();
                 return (reply.Body, PipeReason.Ok);
             }
         }
-        catch (ChannelClosedException)
-        {
-            // WO-154 6.6: the field's "tick failed: ChannelClosedException" at every game exit -- the reader lost the
-            // pipe while this command waited for its answer and completed the channel (WO-153's Drop on the reader's
-            // exit). The connection is already dropped: not connected, said once by the reader, nothing thrown.
-            return (null, PipeReason.NotConnected);
-        }
-        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
-        {
-            Drop();
-            return (null, PipeReason.NotConnected);
-        }
-        finally
-        {
-            _gate.Release();
-            if (line) _line.Release();
-            Wo207Trace.Pipe(Wo207Trace.Kind.Value, (type << 8) | (payload.Length > 0 ? payload[0] : 0), sentAt - gateAt, Environment.TickCount64 - sentAt);   // WO-207 B.1: the gate's wait, the round trip (by frame type and its first byte: the op of a multiplexed type)
-        }
     }
 
-    private static readonly TimeSpan ReplyDeadline = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan ReplyDeadline = PipeRules.FrameReplyDeadline;
 
     private async Task WriteFrameAsync(byte type, byte[] payload, CancellationToken ct)
     {
+        // KCT fix (icd14): the last guard before the wire -- a 16-bit length can never carry more (SendAndAwaitAsync refuses past the DLL's limit)
+        if (payload.Length > ushort.MaxValue) throw new ArgumentException($"pipe payload of {payload.Length} bytes cannot be framed", nameof(payload));
         var frame = new byte[3 + payload.Length];
         frame[0] = type;
         BinaryPrimitives.WriteUInt16LittleEndian(frame.AsSpan(1), (ushort)payload.Length);
@@ -2682,7 +2808,7 @@ public sealed class CombatPipe : IAsyncDisposable
     /// <summary>KCT fix (icd13): how many times the pipe has connected; a change after the first means the DLL dropped every body it wrote.</summary>
     public int ConnectGeneration => Volatile.Read(ref _connectGeneration);
 
-    private void Drop()
+    private void Drop(string why = "unspecified")
     {
         bool had = _pipe is not null;   // WO-144 5: one line per lost connection, not one per caller
         _pipe?.Dispose();
@@ -2693,7 +2819,7 @@ public sealed class CombatPipe : IAsyncDisposable
         _replies.Writer.TryComplete();
         _replies = NewReplyChannel();
         _expectedSeq = null;
-        if (had) Console.WriteLine("[combat] lost the connection to KCDMP.dll");
+        if (had) Console.WriteLine($"[combat] lost the connection to KCDMP.dll (reason: {why}; connection {ConnectGeneration})");   // KCT fix (icd14): every disconnect says why
     }
 
     public ValueTask DisposeAsync()
@@ -2701,6 +2827,7 @@ public sealed class CombatPipe : IAsyncDisposable
         _pipe?.Dispose();
         _pipe = null;
         _replies.Writer.TryComplete();
+        _callbacks.Writer.TryComplete();   // KCT fix (icd14): the callback lane ends
         _gate.Dispose();
         _line.Dispose();
         return ValueTask.CompletedTask;

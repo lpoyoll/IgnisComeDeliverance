@@ -7,6 +7,8 @@
 #include "frame_meter.h"
 #include "iat_hook.h"
 #include "log.h"
+#include "icd14_pipe_rules.h"
+#include "wo213.h"
 
 #include <windows.h>
 #include <algorithm>
@@ -53,6 +55,12 @@ std::vector<std::shared_ptr<Repeating>> g_repeating;
 std::condition_variable                 g_drained;
 std::atomic<unsigned long long>         g_frames{0};
 std::atomic<float>                      g_lastDt{0.0f};   // WO-138
+// KCT fix (icd14): one-shot items queued and not yet taken (the pump's wait reads it without the lock); the pump's state and its
+// MP-HEALTH line (main thread only); requests the pipe threw away for their size (the pipe's thread)
+std::atomic<uint32_t>                   g_queuedN{0};
+icd14pipe::LingerGate                   g_linger;
+icd14pipe::Health                       g_pumpHealth;
+std::atomic<uint32_t>                   g_oversizeSkipped{0};
 DWORD                                   g_main_thread_id = 0;
 
 // One-shot work (the pipe's commands, posted fixes): the calls into the game inside it
@@ -157,7 +165,7 @@ void hooked_update(void* self, float dt) {
     std::vector<std::shared_ptr<Repeating>> repeating;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        if (!g_queue.empty()) batch.swap(g_queue);
+        if (!g_queue.empty()) { batch.swap(g_queue); g_queuedN.store(0, std::memory_order_release); }
         repeating = g_repeating;
     }
     const bool cost = g_costOn.load(std::memory_order_relaxed);
@@ -176,7 +184,7 @@ void hooked_update(void* self, float dt) {
     }
 
     double batchUs = 0;
-    const uint32_t items = static_cast<uint32_t>(batch.size());
+    uint32_t items = static_cast<uint32_t>(batch.size());
     if (!batch.empty()) {
         const double b0 = now_us();
         for (auto& work : batch) {
@@ -184,8 +192,40 @@ void hooked_update(void* self, float dt) {
         }
         batchUs = now_us() - b0;
         g_drained.notify_all();
+        // KCT fix (icd14) (pipe_pump_budget): the agent's calls are one request, one reply, and the pipe thread waits for each one's
+        // task -- so the DLL took one request a frame. While this frame has budget left, wait a moment for the agent's next request
+        // (the pipe thread posts it the moment it reads it) and run it here, in order; up to kPumpMaxItems or kPumpBudgetUs. A spin on
+        // the clock, never a sleep: a sub-millisecond sleep can last a whole timer tick (15.6 ms) on Windows. The queue's handoff is
+        // the same as before (post() under g_mutex, the swap under it, the work run outside it); only the count is read unlocked.
+        if (wo213::on(icd14pipe::kBitPumpBudget) && icd14pipe::gate_open(g_linger)) {
+            while (icd14pipe::may_linger(items, batchUs)) {
+                const double until = now_us() + icd14pipe::linger_us(batchUs);
+                while (g_queuedN.load(std::memory_order_acquire) == 0 && now_us() < until) YieldProcessor();
+                std::vector<std::function<void()>> more;
+                {
+                    std::lock_guard<std::mutex> lock(g_mutex);
+                    if (!g_queue.empty()) { more.swap(g_queue); g_queuedN.store(0, std::memory_order_release); }
+                }
+                const bool found = !more.empty();
+                icd14pipe::gate_note(g_linger, found);
+                icd14pipe::note_linger(g_pumpHealth, found);
+                if (!found) { batchUs = now_us() - b0; break; }
+                for (auto& work : more) run_guarded(g_queuedSite, &work);
+                items += static_cast<uint32_t>(more.size());
+                g_drained.notify_all();
+                batchUs = now_us() - b0;
+            }
+        }
     }
     const double t2 = now_us();
+    // KCT fix (icd14): MP-HEALTH area=native-pipe every 10 s (kcdmp-native.log)
+    icd14pipe::note_frame(g_pumpHealth, items, items > 0 && icd14pipe::budget_hit(items, batchUs));
+    if (g_pumpHealth.startS == 0) icd14pipe::restart(g_pumpHealth, t2 / 1e6);
+    else if (icd14pipe::due(g_pumpHealth, t2 / 1e6)) {
+        char hb[400];
+        if (icd14pipe::format(g_pumpHealth, g_oversizeSkipped.exchange(0), wo213::on(icd14pipe::kBitPumpBudget), hb, sizeof hb) > 0) logf("%s", hb);
+        icd14pipe::restart(g_pumpHealth, t2 / 1e6);
+    }
     fault::tick(t2 / 1e6);                 // WO-151: the 60 s FAULT-SUM line
     note_frame_rate(t1, t2 - t1);          // WO-151: the 60 s FRAME line
     if (cost) note_cost(t1 - t0, t2 - t1, batchUs, items, t2);
@@ -262,7 +302,10 @@ void post_repeating(const char* name, std::function<void()> work) {
 void post(std::function<void()> work) {
     std::lock_guard<std::mutex> lock(g_mutex);
     g_queue.push_back(std::move(work));
+    g_queuedN.fetch_add(1, std::memory_order_release);   // KCT fix (icd14): the pump's wait sees it without the lock
 }
+
+void note_oversize_skipped() { g_oversizeSkipped.fetch_add(1, std::memory_order_relaxed); }
 
 bool run_sync(std::function<void()> work, unsigned timeout_ms) {
     return run_sync(std::move(work), timeout_ms, nullptr);

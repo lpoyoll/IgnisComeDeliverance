@@ -34605,6 +34605,17 @@ do
         catch_up = "mp_catch_up",
         line_latency = "mp_line_latency",
         link_toast = "mp_link_toast",
+        -- KCT fix (icd14): the DLL link and the frame processor (the agent's GameBridge.Icd14Pipe.cs / CombatPipe; the DLL's two bits)
+        pipe_oversize_guard = "mp_pipe_oversize_guard",
+        pipe_oversize_skip = "mp_pipe_oversize_skip",
+        pipe_pump_budget = "mp_pipe_pump_budget",
+        pipe_config_replay = "mp_pipe_config_replay",
+        pipe_poll_age = "mp_pipe_poll_age",
+        pipe_cb_lane = "mp_pipe_cb_lane",
+        proc_side_queues = "mp_proc_side_queues",
+        proc_side_join = "mp_proc_side_join",
+        proc_drop_stale = "mp_proc_drop_stale",
+        lane_newest_per_npc = "mp_lane_newest_per_npc",
     }
     W213.HELP = {
         link_sched = "C: (both) a body's newer state replaces its older unsent one; events first, in order (next connection)",

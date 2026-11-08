@@ -27,6 +27,9 @@ void uninstall();
 // Queue work for the next frame. Thread-safe, returns immediately.
 void post(std::function<void()> work);
 
+// KCT fix (icd14): the pipe threw a request away for its size (counted in the MP-HEALTH area=native-pipe line). Thread-safe.
+void note_oversize_skipped();
+
 // Run work on every tick, for the lifetime of the process. Used by the
 // outbound sampler, which needs a per-frame heartbeat rather than a one-shot.
 // The name labels the task in the MAIN-COST line (mp_main_cost: every 10 s what this

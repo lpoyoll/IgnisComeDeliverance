@@ -53,6 +53,7 @@ int wo210_tests(int* passed);              // wo210_tests.cpp (WO-210: the switc
 int wo211_tests(int* passed);              // wo211_tests.cpp (WO-211: the UI-dispatch guard, the overflow reseat, build ids)
 int wo214_tests(int* passed);              // wo214_tests.cpp (WO-214: one bind, the owner's base, combat end)
 int wo213_tests(int* passed);              // wo213_tests.cpp (WO-213: bands, the play-out delay, late postures)
+int icd14_pipe_tests(int* passed);         // icd14_pipe_tests.cpp (KCT fix icd14: oversize requests, the pump budget)
 int wo203_tests(int* passed);              // wo203_tests.cpp (WO-203: every area's rules, one file per area)
 int wo197_tests(int* passed);              // wo197_tests.cpp (WO-197: the recoil and clinch polls, the kept main actions, the pair request)
 int wo194_tests(int* passed);              // wo194_tests.cpp (WO-194: the hold, its release, the time gate, the FastForward stop)
@@ -485,6 +486,14 @@ int main() {
     {
         int fp = 0;
         const int ff = wo151_tests(&fp);
+        g_pass += fp;
+        g_fail += ff;
+    }
+
+    // KCT fix (icd14): oversize pipe requests kept on the connection, the main thread's pump budget, the native-pipe health line
+    {
+        int fp = 0;
+        const int ff = icd14_pipe_tests(&fp);
         g_pass += fp;
         g_fail += ff;
     }

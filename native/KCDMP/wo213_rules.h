@@ -35,7 +35,8 @@ inline uint32_t twin_off_bits(const char* list) {
     struct N { const char* n; uint32_t b; };
     static const N k[] = {{"npc_bands", kBitNpcBands}, {"playout_adaptive", kBitPlayoutAdaptive}, {"posture_hold_late", kBitPostureHoldLate},
                           {"posture_no_pos", kBitPostureNoPos}, {"figure_playout", kBitFigurePlayout}, {"figure_band", kBitFigureBand},
-                          {"catch_up", kBitCatchUp}};
+                          {"catch_up", kBitCatchUp},
+                          {"pipe_oversize_skip", 0x1000u}, {"pipe_pump_budget", 0x2000u}};   // KCT fix (icd14): icd14_pipe_rules.h's bits
     uint32_t b = 0;
     if (!list) return 0;
     const char* p = list;
