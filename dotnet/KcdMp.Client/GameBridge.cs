@@ -4630,7 +4630,7 @@ public partial class GameBridge(ClientConfig config)
     /// </summary>
     private async Task ReceiveLoopAsync(Stream stream, CancellationToken ct)
     {
-        IcdStartSideLanes(ct);   // KCT fix (icd14): the processor's DLL calls on their own lanes (GameBridge.Icd14.cs)
+        IcdStartSideLanes(ct);   // KCT fix (icd14): the processor's DLL calls on their own lanes (GameBridge.Icd14Pipe.cs)
         var frames = Channel.CreateUnbounded<InFrame>(new UnboundedChannelOptions { SingleReader = true });
         _frameWriter = frames.Writer;   // WO-136: the load hold replays held frames through here
         var processor = ProcessFramesAsync(frames.Reader, ct);
@@ -4699,7 +4699,7 @@ public partial class GameBridge(ClientConfig config)
                 if (type == Protocol.ConvDown && W207("conv_lane")) { convLane.Writer.TryWrite(new InFrame(type, payload, arrival, stamp)); continue; }   // WO-207 A.1
                 if ((type == Protocol.ActivityHostDown || type == Protocol.ActivityExtraDown) && W207("queue_decouple"))   // WO-207 B.3
                 {
-                    // KCT fix (icd14) (mp_lane_newest_per_npc): only each NPC's newest waiting activity row (GameBridge.Icd14.cs)
+                    // KCT fix (icd14) (mp_lane_newest_per_npc): only each NPC's newest waiting activity row (GameBridge.Icd14Pipe.cs)
                     if (!IcdCoalescePost(false, type, payload, arrival, stamp, ct)) actLane.Writer.TryWrite(new InFrame(type, payload, arrival, stamp));
                     continue;
                 }
