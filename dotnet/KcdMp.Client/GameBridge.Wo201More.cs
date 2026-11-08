@@ -1,4 +1,4 @@
-﻿// Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 namespace KcdMp.Client;
@@ -45,6 +45,7 @@ public partial class GameBridge
         Wo213Tick(n);                                     // WO-213 A: the link's numbers every 10 s, Steam's every 2 s
         Wo214Tick(n);                                     // WO-214: the native word every 2 s, its status every 30 s
         IcdHealthTick(n);                                 // KCT fix (icd14): MP-HEALTH area=pipe / area=proc every 10 s
+        Icd14Tick(n);                                     // KCT fix (icd14): the host's quest push every 30 s, MP-HEALTH lines
     }
 
     private void Wo201OnEventMore(string name, string? arg)

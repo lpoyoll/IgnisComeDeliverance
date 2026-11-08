@@ -138,6 +138,7 @@ public partial class GameBridge
         double hostRatio = ratio1000 / 1000.0;
         double myNow = mine + (MonoClock.UtcNow - _lastPollUtc).TotalSeconds * _w200Ratio;
         double err = myNow - host;   // game seconds this clock is ahead of the host's
+        if (await Icd14ClockAsync(host, hostRatio, err, mine)) return;   // KCT fix (icd14): a hard set over the threshold, or a hold
         double want = W201("clock_catchup") ? Wo201Rules.CatchUpRatio(hostRatio, err, ref _w201CatchingUp) : Wo200Rules.SlewRatio(hostRatio, err);   // WO-201 B13
         await Wo200RatioAsync(want, FormattableString.Invariant($"{err:+0;-0} game s from the host's"));
     }

@@ -106,6 +106,11 @@ public partial class GameBridge
                 Wo206OnMarker(m); break;
             case Protocol.W203FigureHand:   // WO-214 F
                 Wo214OnFigureHand(src, m); break;
+            case Protocol.W203IcdQuestPush: Icd14OnQuestPush(m); break;            // KCT fix (icd14)
+            case Protocol.W203IcdQuestWant: Icd14OnQuestWant(src, m); break;
+            case Protocol.W203IcdQuestEntries: Icd14OnQuestEntries(m); break;
+            case Protocol.W203IcdSnapAsk: Icd14OnSnapAsk(src, m); break;
+            case Protocol.W203IcdSnapPart: Icd14OnSnapPart(m); break;
             default:
                 Interlocked.Increment(ref _w203SideUnknown); break;
         }

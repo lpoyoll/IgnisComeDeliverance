@@ -228,8 +228,8 @@ do
     KCD2MP.w175.lockHeld = true
     KCD2MP_W175AfterLoad("settle")
     -- four timers since WO-177: WO-175's chain, WO-176's figure check, WO-177's corpse census and calm-NPC list (all re-armed by the same after-load hook)
-    -- WO-178 0.c: + the draw probe's timer (5)
-    check("L7: after a load: state reset, the chain runs, w175_check load", KCD2MP.w175.lockHeld == false and #TIMERS == 5 and countEvt("w175_check", "load", mark) == 1, #TIMERS)
+    -- WO-178 0.c: + the draw probe's timer (5); KCT fix (icd14): + the icd14 snapshot / crime chain (6)
+    check("L7: after a load: state reset, the chain runs, w175_check load", KCD2MP.w175.lockHeld == false and #TIMERS == 6 and countEvt("w175_check", "load", mark) == 1, #TIMERS)
     KCD2MP_W175SetHealth("off"); mark = #LOG
     KCD2MP_W175AfterLoad("settle")
     check("L8: mp_save_health off: no file check asked", countEvt("w175_check", "load", mark) == 0)
