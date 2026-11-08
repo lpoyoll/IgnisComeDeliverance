@@ -36,8 +36,8 @@ int wo214_tests(int* passed) {
     WCHECK(!bind_noop(false, true, 7, &ent, 7, &ent), "the twin (one_bind off): every bind binds afresh, as 0.64.0");
     WCHECK(!silence_drops(true, 4.5, false) && !silence_drops(true, 29.0, false) && silence_drops(true, 30.5, false),
            "a silent stream's body holds: two lost heartbeats (4.5 s) never drop it, only 30 s forgets it");
-    WCHECK(silence_drops(false, 4.5, false) && !silence_drops(false, 4.5, true) && !silence_drops(false, 3.5, false),
-           "the twin: 0.64.0's 4 s drop (a moving body kept to 10 s by WO-201's own rule)");
+    WCHECK(silence_drops(false, 7.5, false) && !silence_drops(false, 7.5, true) && !silence_drops(false, 4.5, false) && !silence_drops(false, 6.5, false),
+           "the twin: dropped only past the Lua lease, 7 s (KCT fix icd14 D; a moving body kept to 10 s by WO-201's own rule)");
     WCHECK(resume_blends(true, 4.0) && resume_blends(true, 8.0) && !resume_blends(true, 2.1) && !resume_blends(false, 8.0),
            "a stream back after the old drop time (4 s) starts from where the body stands, a 2 s heartbeat renders as before; the twin: nothing");
 

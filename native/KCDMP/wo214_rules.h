@@ -55,9 +55,12 @@ inline bool turned(float yaw, float sentYaw, bool on) { return on && (wrap_pi(ya
 // it stands; only a stream silent this long is forgotten (the host has not sent the body since: it left the host's range, or the world).
 constexpr double kSilenceOldS = 4.0;
 constexpr double kBoundForgetS = 30.0;
+// KCT fix (icd14) D: with one_bind off a silent body is dropped only past the Lua lease (3 x the 2 s heartbeat + 0.5 s), never before
+// Lua decides: the old 4 s dropped it while Lua still held the copy.
+constexpr double kLeaseDropS = 7.0;
 inline bool silence_drops(bool on, double silentS, bool keepMoving) {
     if (on) return silentS > kBoundForgetS;
-    return !keepMoving && silentS > kSilenceOldS;
+    return !keepMoving && silentS > kLeaseDropS;
 }
 // A body whose stream comes back after a silence this long starts from where it stands (the blend), not from a jump to the stream --
 // the old writer's drop time: a heartbeat-fed body (2 s) renders as before, a body the old writer would have dropped and bound afresh

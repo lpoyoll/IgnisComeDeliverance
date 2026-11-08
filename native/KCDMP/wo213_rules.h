@@ -28,14 +28,26 @@ constexpr uint32_t kBitPostureNoPos = 0x08;    // E.3 posture_no_pos
 constexpr uint32_t kBitFigurePlayout = 0x10;   // E.5 figure_playout (the figures on the same play-out as NPCs)
 constexpr uint32_t kBitFigureBand = 0x20;      // D.4 figure_band (the local player's state read each frame, served to the pipe at once)
 constexpr uint32_t kBitCatchUp = 0x40;       // KCT catch_up: a held body replays what it missed at 1.2x instead of jumping, and blends back from a hold
-constexpr uint32_t kBitsDefault = kBitNpcBands | kBitPlayoutAdaptive | kBitPostureHoldLate | kBitPostureNoPos | kBitFigurePlayout | kBitFigureBand | kBitCatchUp;
+// KCT fix (icd14) A: a host copy is a pure puppet -- its loaded NPC state (the planner's demand) is not rewritten from the body each time
+// the body's activity changes (WO-200 II.4's neutral write), only once and then when the loaded state itself was replaced (a load, the
+// game's own placement), at most every kPureCopyRewriteS (the WO-201 B23 night/day dress fix still runs: it is visible, rare and paced)
+constexpr uint32_t kBitPureCopy = 0x80;
+constexpr double kPureCopyRewriteS = 10.0;
+constexpr uint32_t kBitsDefault = kBitNpcBands | kBitPlayoutAdaptive | kBitPostureHoldLate | kBitPostureNoPos | kBitFigurePlayout | kBitFigureBand | kBitCatchUp | kBitPureCopy;
+// KCT fix (icd14) A: the neutral write's decision for a host copy. same = the loaded state still holds what the last write left AND the
+// body's activity is the one it described; slotsSame = the loaded state still holds what the last write left; marked = written before
+inline bool neutral_rewrite(bool pure, bool same, bool slotsSame, bool marked, double sinceLastS) {
+    if (!pure) return !same;
+    if (!marked) return true;
+    return !slotsSame && sinceLastS >= kPureCopyRewriteS;
+}
 
 // The bench's twin names (KCDMP_TEST_W213_OFF=name,name -- the same variable the agent and the relay read).
 inline uint32_t twin_off_bits(const char* list) {
     struct N { const char* n; uint32_t b; };
     static const N k[] = {{"npc_bands", kBitNpcBands}, {"playout_adaptive", kBitPlayoutAdaptive}, {"posture_hold_late", kBitPostureHoldLate},
                           {"posture_no_pos", kBitPostureNoPos}, {"figure_playout", kBitFigurePlayout}, {"figure_band", kBitFigureBand},
-                          {"catch_up", kBitCatchUp},
+                          {"catch_up", kBitCatchUp}, {"pure_copy", kBitPureCopy},
                           {"pipe_oversize_skip", 0x1000u}, {"pipe_pump_budget", 0x2000u}};   // KCT fix (icd14): icd14_pipe_rules.h's bits
     uint32_t b = 0;
     if (!list) return 0;

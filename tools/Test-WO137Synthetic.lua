@@ -126,6 +126,7 @@ end
 mkEntityLate = mkEntity
 
 local function reset()
+    if KCD2MP.npcHold then KCD2MP.npcHold.held = {}; KCD2MP.npcHold.lent = {}; KCD2MP.npcHold.untracked = {}; KCD2MP.npcHold.takenCorpse = {}; KCD2MP.npcHold.saveUntil = nil end   -- KCT fix (icd14): a fresh suspend registry per scenario
     KCD2MP.npcPuppets = {}; KCD2MP.npcTracked = {}; KCD2MP.dragging = {}; KCD2MP.dragWatch = {}
     KCD2MP._npcPaused = {}; KCD2MP._npcResumePending = {}; KCD2MP._npcEverPaused = {}
     KCD2MP.npcPuppetRunning = false; KCD2MP._npcPuppetAliveAt = nil; KCD2MP._npcPuppetRetired = {}

@@ -81,6 +81,7 @@ pcall = function(f, ...)
 end
 
 -- @@KDCMP@@
+KCD2MP.npcHold.lease = false   -- KCT fix (icd14) D: this suite pins the pre-lease 3 s silence release (mp_npc_lease off); Test-Icd14NpcSynthetic.lua covers the lease
 
 -- Part 2: scenarios.
 
@@ -134,6 +135,7 @@ local function mkEntity(name, x, y, z)
 end
 
 local function reset()
+    if KCD2MP.npcHold then KCD2MP.npcHold.held = {}; KCD2MP.npcHold.lent = {}; KCD2MP.npcHold.untracked = {}; KCD2MP.npcHold.takenCorpse = {}; KCD2MP.npcHold.saveUntil = nil end   -- KCT fix (icd14): a fresh suspend registry per scenario
     if KCD2MP.npcSilence then KCD2MP.npcSilence.tickAt = nil; KCD2MP.npcSilence.agentAt = -1e9; KCD2MP.npcSilence.silent = {} end   -- WO-147: each scenario starts from a fresh puppet chain (a tick that last ran in another scenario's time reads as a freeze)
     KCD2MP.wo102.authorityHost = true; KCD2MP.wo102.authorityPause = true
     KCD2MP.wo102.npcScanNative = false; KCD2MP.wo102.posNative = false
@@ -264,6 +266,7 @@ do
     tick("f3", 3, 0)
     KCD2MP.wo1025.resumeDwellS = 0
     KCD2MP.npcPuppets["f3"] = nil; KCD2MP._npcPaused["f3"] = nil          -- bookkeeping lost it (the case the sweep exists for)
+    KCD2MP.npcHold.held["f3"] = nil                                         -- KCT fix (icd14): the registry lost it too
     CMDS = {}
     local n = KCD2MP_ResumeAllPaused("mp_resume_all")
     check("f: lever switched OFF", KCD2MP.wo102.authorityPause == false)

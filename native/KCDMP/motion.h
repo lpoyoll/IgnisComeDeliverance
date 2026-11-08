@@ -140,6 +140,7 @@ void* actor_of(uint32_t eid);                    // the C_Actor of an entity id 
 void set_ko_hold(uint32_t eid, bool on);
 // WO-201 follow-up B9: a standing copy's stale TurnAngle is cleared before its AI-movement action picks idle / turn (mp_copy_no_idle_turn, bit 16)
 void set_copy_no_idle_turn(bool on);
+uint32_t turn_cleared_count();   // KCT fix (icd14): a still copy's stale TurnAngle cleared (the paused NPC's old movement request)
 int noturn_status(char* out, int n);
 bool skel_desired_param(void* ent, uint32_t id, float* out);   // research read (WO190-LOCO)
 bool skel_layer_scale(void* ent, int layer, float* out);        // research read (WO190-LOCO)

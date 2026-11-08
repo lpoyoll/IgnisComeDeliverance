@@ -75,7 +75,8 @@ public partial class GameBridge
             uint bits = (W213On("npc_bands") ? 1u : 0) | (W213On("playout_adaptive") ? 2u : 0) | (W213On("posture_hold_late") ? 4u : 0)
                       | (W213On("posture_no_pos") ? 8u : 0) | (W213On("figure_playout") ? 16u : 0) | (W213On("figure_band") ? 32u : 0)
                       | (W213On("catch_up") ? 64u : 0)   // KCT catch_up
-                      | (W213On("pipe_oversize_skip") ? 0x1000u : 0) | (W213On("pipe_pump_budget") ? 0x2000u : 0);   // KCT fix (icd14): native icd14_pipe_rules.h
+                      | (W213On("pipe_oversize_skip") ? 0x1000u : 0) | (W213On("pipe_pump_budget") ? 0x2000u : 0)   // KCT fix (icd14): native icd14_pipe_rules.h
+                      | (W213On("pure_copy") ? 128u : 0);   // KCT fix (icd14) A: a host copy's planner is not fed (the mod's mp_copy_pure)
             var body = new byte[4 + 14];
             BitConverter.TryWriteBytes(body.AsSpan(0), bits);
             var b = W213Rules.Bands(Environment.GetEnvironmentVariable("KCDMP_W213_BANDS"));
@@ -483,7 +484,7 @@ public static class W213Rules
 
     /// <summary>Every WO-213 switch the agent knows (the native ones go to the DLL in its word).</summary>
     public static readonly string[] SwitchNames = ["link_sched", "state_unreliable", "steam_cfg", "link_budget", "npc_bands", "npc_compact", "figure_band",
-        "playout_adaptive", "posture_hold_late", "posture_no_pos", "figure_playout", "line_latency", "link_toast", "catch_up",
+        "playout_adaptive", "posture_hold_late", "posture_no_pos", "figure_playout", "line_latency", "link_toast", "catch_up", "pure_copy",
         // KCT fix (icd14): the DLL link (GameBridge.Icd14Pipe.cs, CombatPipe; the two native ones ride the word, bits 0x1000 / 0x2000)
         "pipe_oversize_guard", "pipe_oversize_skip", "pipe_pump_budget", "pipe_config_replay", "pipe_poll_age", "pipe_cb_lane",
         "proc_side_queues", "proc_side_join", "proc_drop_stale", "lane_newest_per_npc",

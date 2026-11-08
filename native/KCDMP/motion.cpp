@@ -2317,6 +2317,7 @@ bool skel_layer_scale(void* ent, int layer, float* out) {
 }
 
 // WO-201 follow-up B9 (wo201's config bit 16): mp_copy_no_idle_turn.
+uint32_t turn_cleared_count() { return c_turnCleared.load(std::memory_order_relaxed); }   // KCT fix (icd14): MP-HEALTH stuck_turnangle_clears
 void set_copy_no_idle_turn(bool on) {
     if (g_cfgNoTurn.exchange(on) != on)
         logf("WO201-NOTURN mp_copy_no_idle_turn %s (armed=%d cleared=%u seen=%u)", on ? "on" : "off", g_noTurn ? 1 : 0, c_turnCleared.load(), c_turnSeen.load());

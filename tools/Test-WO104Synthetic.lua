@@ -130,6 +130,7 @@ tostring = function(v)
 end
 
 -- @@KDCMP@@
+KCD2MP.npcHold.lease = false   -- KCT fix (icd14) D: this suite pins the pre-lease 3 s silence release (mp_npc_lease off); Test-Icd14NpcSynthetic.lua covers the lease
 
 -- Part 2: scenarios.
 

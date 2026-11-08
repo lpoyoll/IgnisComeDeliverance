@@ -188,6 +188,7 @@ void note_overflow_reseat(bool owned, bool installed) {
     if (installed) c_ovInstalled.fetch_add(1);
 }
 void note_handover_queue_full() { c_hoQueueFull.fetch_add(1); }
+uint32_t overflow_reseat_count() { return c_ovOwned.load() + c_ovNotOwned.load(); }   // KCT fix (icd14)
 
 const char* build_id() {
     static const char* const s = build_id_ok(KCDMP_BUILD_ID) ? KCDMP_BUILD_ID : "dev";

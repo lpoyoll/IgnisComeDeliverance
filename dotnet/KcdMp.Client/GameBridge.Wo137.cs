@@ -351,6 +351,9 @@ public partial class GameBridge
                     if (!W137Joiner) { Wo137Veto("replay-ack-not-joined"); return; }
                     _ = Wo200OnAckAsync(m.Text);
                     return;
+                case Protocol.QuestHostUntrack:   // KCT fix (icd14) D: the host stopped tracking this NPC
+                    Icd14OnHostUntrack(m.Text);
+                    return;
                 case Protocol.QuestHostItemCount:   // WO-200 I.3: the host's count of one quest-item class
                     Wo200OnHostItemCount(m.Text);
                     return;

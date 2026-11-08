@@ -19,7 +19,8 @@ public partial class GameBridge
     private void Wo174OnSaveInitiated(string line)
     {
         Interlocked.Increment(ref _w174Saves);
-        _ = ExecLuaAsync("if KCD2MP_W174Clean then KCD2MP_W174Clean(\"save\") end");
+        _ = ExecLuaAsync("if KCD2MP_W174Clean then KCD2MP_W174Clean(\"save\") end"
+                       + " if KCD2MP_NpcBeforeSave then KCD2MP_NpcBeforeSave(\"game\") end");   // KCT fix (icd14) A: no copy AI flag into the save
     }
 
     private void Wo174OnEvent(string? arg)

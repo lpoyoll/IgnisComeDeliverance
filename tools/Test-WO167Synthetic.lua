@@ -152,6 +152,7 @@ local function host()
     KCD2MP.w137.joiner, KCD2MP.w137.active, KCD2MP.w137.host = false, true, true
 end
 local function reset()
+    if KCD2MP.npcHold then KCD2MP.npcHold.held = {}; KCD2MP.npcHold.lent = {}; KCD2MP.npcHold.untracked = {}; KCD2MP.npcHold.takenCorpse = {}; KCD2MP.npcHold.saveUntil = nil end   -- KCT fix (icd14): a fresh suspend registry per scenario
     for n in pairs(ENTS) do ENTS[n] = nil end
     ENTS["Dude"] = player
     PX, PY, PZ = 100, 100, 10
