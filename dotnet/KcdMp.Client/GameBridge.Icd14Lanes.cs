@@ -9,35 +9,32 @@ namespace KcdMp.Client;
 
 // KCT fix (icd14): the Lua command queue, the log tail and the link's lanes. Every mechanism ships on with its own switch; off is the
 // 0.63/icd13 behaviour.
-//   W207 (mp_* in the mod; w207_cfg):  lua_edge_ttl  lua_evict  lua_replay  lua_recovery_drain
-//                                      evt_resume  evt_skip_spam  evt_early_fast  evt_seq_check  evt_handler_task
-//   W213 (mp_* in the mod; w213_cfg):  link_event_coalesce  link_event_age  steam_inbox_bound  state_order
+//   W213 switches (mp_<name> on|off in the mod -> w213_cfg; the bench twin KCDMP_TEST_W213_OFF=name), all default on:
+//     the Lua queue:  lua_edge_ttl  lua_evict  lua_replay  lua_recovery_drain
+//     the log tail:   evt_resume  evt_skip_spam  evt_early_fast  evt_seq_check  evt_handler_task
+//     the link:       link_event_coalesce  link_event_age  steam_inbox_bound  state_order
 // Every 10 s (in a session): MP-HEALTH area=lua / area=evt / area=link (Icd14Health.cs).
 public partial class GameBridge
 {
-    internal static readonly string[] Icd14W207Names =
-        ["lua_edge_ttl", "lua_evict", "lua_replay", "lua_recovery_drain", "evt_resume", "evt_skip_spam", "evt_early_fast", "evt_seq_check", "evt_handler_task"];
-    internal static readonly string[] Icd14W213Names = ["link_event_coalesce", "link_event_age", "steam_inbox_bound", "state_order"];
-
     private readonly StateOrderGuard _icd14Order = new();
 
-    /// <summary>The switches onto the live objects (at the run's start, on every w207_cfg / w213_cfg, and with every health line).</summary>
+    /// <summary>The switches onto the live objects (at the run's start, on every w213_cfg, and with every health line).</summary>
     private void Icd14ApplySwitches()
     {
         if (_httpForMenu is { } h)
         {
-            h.EdgeTtlByClass = W207("lua_edge_ttl");
-            h.EvictExpendableFirst = W207("lua_evict");
-            h.ReplayLevelBehind = W207("lua_replay");
-            h.RecoveryDrain = W207("lua_recovery_drain");
+            h.EdgeTtlByClass = W213On("lua_edge_ttl");
+            h.EvictExpendableFirst = W213On("lua_evict");
+            h.ReplayLevelBehind = W213On("lua_replay");
+            h.RecoveryDrain = W213On("lua_recovery_drain");
         }
         if (_transport is LogTailGameTransport t)
         {
-            t.ResumeByIdentity = W207("evt_resume");
-            t.SkipSpam = W207("evt_skip_spam");
-            t.EarlyEventFast = W207("evt_early_fast");
-            t.EventSeqCheck = W207("evt_seq_check");
-            t.EventHandlerTask = W207("evt_handler_task");
+            t.ResumeByIdentity = W213On("evt_resume");
+            t.SkipSpam = W213On("evt_skip_spam");
+            t.EarlyEventFast = W213On("evt_early_fast");
+            t.EventSeqCheck = W213On("evt_seq_check");
+            t.EventHandlerTask = W213On("evt_handler_task");
         }
         if (_w213Writer is { } w)
         {
