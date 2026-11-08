@@ -142,6 +142,7 @@ namespace KCDMP_launcher.Pages
             string pushed = "";
             bool loadIssued = false, armedLogged = false, choicePosted = false, menuLoad = false, hostConnectTried = false;
             bool recapPending = false, recapSent = false;
+            double menuSinceS = double.NaN;   // KCT fix: since when this game is at its main menu (NaN: not there)
             // KCT QoL (AutoConnect): the launcher's Join was the "join" -- with a character to bring, wait for the host at once (no click in game)
             var (bringOk, _) = MenuTakeoverRule.JoinChoice(w159Saves?.Usable.Count ?? 0, w159Saves?.HiddenRegular ?? 0, w159Saves?.HiddenCopies ?? 0);
             if (MenuTakeoverRule.JoinerPreArm(settings.AutoConnect, hosting, bringOk, w159JoinState))
@@ -175,6 +176,7 @@ namespace KCDMP_launcher.Pages
                     var stage = follower?.State.Stage ?? GameStage.Starting;
                     if (stage != lastStage)
                     {
+                        menuSinceS = stage == GameStage.Menu ? now : double.NaN;   // KCT fix: when this game reached its menu
                         if (stage == GameStage.Menu) { loadIssued = false; pushed = ""; }   // back at the menu (a failed load too): draw again
                         lastStage = stage;
                     }
@@ -255,7 +257,8 @@ namespace KCDMP_launcher.Pages
                     }
 
                     // the joiner: CONNECT as soon as the host is ready (the WO-154 gate), then the first-join answer
-                    if (!hosting && w159Takeover && w159JoinState == "waiting" && launchStage == LaunchStage.WaitingForConnect && ConnectEnabled)
+                    if (!hosting && w159Takeover && MenuTakeoverRule.JoinerAutoConnect(w159JoinState == "waiting", launchStage == LaunchStage.WaitingForConnect, ConnectEnabled,
+                            follower is null && now >= 60 ? GameStage.Menu : stage, follower is null && now >= 60 ? 0 : menuSinceS, now))   // KCT fix: this game at its menu too
                     {
                         w159JoinState = "joining";
                         Log.Information("MP-W159 the host is ready: CONNECT for the menu's Join ({Choice})", w159JoinChoice);

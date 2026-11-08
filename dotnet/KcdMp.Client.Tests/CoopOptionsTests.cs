@@ -89,3 +89,21 @@ public class HostingLaunchTests
     public void Only_a_launch_to_this_PCs_own_running_relay_is_the_hosts(bool relay, string? steam, string ip, int port, int hostPort, bool expected) =>
         Assert.Equal(expected, ConnectGateRule.IsHostingLaunch(relay, steam, ip, port, hostPort));
 }
+
+public class JoinerAutoConnectTests
+{
+    [Theory]
+    [InlineData(GameStage.Starting, double.NaN, 40.0, false)]   // icd6's bug: the host was ready but this game was still starting -- no CONNECT
+    [InlineData(GameStage.Menu, 30.0, 31.0, false)]             // at the menu for 1 s: not settled yet
+    [InlineData(GameStage.Menu, 30.0, 33.5, true)]              // at the menu for 3.5 s: CONNECT
+    [InlineData(GameStage.Loading, double.NaN, 60.0, false)]    // loading something: never
+    [InlineData(GameStage.World, double.NaN, 60.0, false)]      // in a world of its own: never (a joiner joins from the menu)
+    public void A_waiting_joiner_connects_only_once_its_own_game_has_settled_at_the_menu(GameStage stage, double menuSince, double now, bool expected) =>
+        Assert.Equal(expected, MenuTakeoverRule.JoinerAutoConnect(true, true, true, stage, menuSince, now));
+
+    [Fact]
+    public void Nothing_without_the_host_ready_or_the_join_waiting() =>
+        Assert.False(MenuTakeoverRule.JoinerAutoConnect(true, true, false, GameStage.Menu, 0, 10)
+                  || MenuTakeoverRule.JoinerAutoConnect(false, true, true, GameStage.Menu, 0, 10)
+                  || MenuTakeoverRule.JoinerAutoConnect(true, false, true, GameStage.Menu, 0, 10));
+}

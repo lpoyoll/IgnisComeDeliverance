@@ -173,6 +173,19 @@ namespace KCDMP_launcher.Models
         public static bool JoinerPreArm(bool autoConnect, bool hosting, bool bringPossible, string joinState) =>
             autoConnect && !hosting && bringPossible && joinState == "idle";
 
+        /// <summary>KCT fix (icd6's auto-join): the joiner's game has sat at its main menu this long before CONNECT is pressed for it.</summary>
+        public const double JoinerMenuSettleS = 3;
+
+        /// <summary>
+        /// KCT fix: press CONNECT for a waiting joiner only once THIS game is at its main menu and has settled there, not merely once
+        /// the host is ready. icd6 pre-armed the launcher's Join from the start, so the host being ready already let CONNECT go
+        /// while the joiner's game was still starting (the DLL loaded with the game, its tick 33 s away, the 8 s check failed).
+        /// The game's own Join Game click used to guarantee the menu was there.
+        /// </summary>
+        public static bool JoinerAutoConnect(bool waiting, bool waitingForConnect, bool gateOpen, GameStage stage, double menuSinceS, double nowS) =>
+            waiting && waitingForConnect && gateOpen && stage == GameStage.Menu
+            && !double.IsNaN(menuSinceS) && nowS - menuSinceS >= JoinerMenuSettleS;
+
         public static bool HostAutoConnect(bool hosting, bool menuLoad, GameStage stage, double worldSinceS, double nowS, bool waitingForConnect, bool gateOpen) =>
             hosting && menuLoad && waitingForConnect && gateOpen && stage == GameStage.World
             && !double.IsNaN(worldSinceS) && nowS - worldSinceS >= ConnectGateRule.SettleS;

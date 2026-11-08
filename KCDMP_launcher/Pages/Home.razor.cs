@@ -457,6 +457,17 @@ namespace KCDMP_launcher.Pages
                 return;
             }
 
+            // KCT fix: the game runs once. A launch while it already runs (the last try's game, still open after an error) started a
+            // second KingdomCome.exe that quit at once: "Game process exited unexpectedly before injection." Say what to do instead.
+            if (GameAlreadyRunning() is int runningPid)
+            {
+                Log.Information("MP-LAUNCH refused: KingdomCome.exe already runs (pid {Pid})", runningPid);
+                UiService.ShowError(
+                    "Kingdom Come is still running (probably from your last try). The plugin can't be loaded into a game that is " +
+                    "already open, so close the game completely, then click " + (HostingLaunch(server) ? "Host" : "Join") + " again.");
+                return;
+            }
+
             if (string.IsNullOrEmpty(settings.GamePath) || !File.Exists(settings.GamePath))
             {
                 UiService.ShowError("Game Executable not found! Please check Settings.");
@@ -633,10 +644,9 @@ namespace KCDMP_launcher.Pages
                 if (!verdict)
                 {
                     UiService.ShowError(
-                        "The plugin loaded but never saw the game running -- you likely clicked Connect before " +
-                        "the save had fully loaded. It cannot retry from here: Windows will not reload an " +
-                        "already-loaded DLL into the same game process. Close the game, click Launch again, and " +
-                        "wait until you can move your character before clicking Connect.");
+                        "The plugin was loaded, but the game did not start running within 45 seconds. It can't be loaded into the same " +
+                        "game twice, so close the game completely, then click Host or Join again. (If you press CONNECT yourself, wait " +
+                        "until the game is at its menu, or your world has loaded, first.)");
                     launchStage = LaunchStage.Failed;
                     launchStatusMessage = "Injection did not take. Restart the game to try again.";
                     StateHasChanged();
@@ -767,7 +777,9 @@ namespace KCDMP_launcher.Pages
         {
             var dir = Path.GetDirectoryName(dllPath) ?? "";
             var logPath = Path.Combine(dir, "kcdmp-native.log");
-            var deadline = DateTime.UtcNow.AddSeconds(8);
+            // KCT fix: 45 s (was 8). The DLL waits for the game's first tick for up to 5 minutes; a game still starting or loading
+            // took 33 s (icd6's joiner), and the 8 s check turned a slow start into "never saw the game running".
+            var deadline = DateTime.UtcNow.AddSeconds(45);
             var attachMarker = $"pid={pid}";
 
             while (DateTime.UtcNow < deadline)
@@ -942,6 +954,19 @@ namespace KCDMP_launcher.Pages
                 hostedRelayProcess = null;
                 return true;
             }
+        }
+
+        /// <summary>KCT fix: a KingdomCome.exe already running (any build: the game runs once), its pid; null when none.</summary>
+        private static int? GameAlreadyRunning()
+        {
+            foreach (var p in Process.GetProcessesByName("KingdomCome"))
+            {
+                using (p)
+                {
+                    try { if (!p.HasExited) return p.Id; } catch (InvalidOperationException) { } catch (System.ComponentModel.Win32Exception) { }
+                }
+            }
+            return null;
         }
 
         /// <summary>KCT fix: this launch goes to this PC's own running relay (Models/ConnectGate.cs IsHostingLaunch).</summary>
