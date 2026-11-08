@@ -2851,6 +2851,7 @@ local function mp_npc_ring_push(p, x, y, z, rot, at)
     if last then
         local sdx, sdy = x - last.x, y - last.y
         if sdx*sdx + sdy*sdy > 25.0 then
+            if KCD2MP.npcHold then KCD2MP.npcHold.stats.snaps = KCD2MP.npcHold.stats.snaps + 1 end   -- KCT fix (icd14): MP-HEALTH snaps_gt5m
             ring = {}
             p.ring = ring
             p.cx, p.cy, p.cz, p.cr = x, y, z, rot
@@ -4665,7 +4666,7 @@ end
 local function npc_hold_engage_enemy(e)
     if not (KCD2MP.w147 and KCD2MP.w147.hostileEngage) then return false end
     local enemy = false
-    pcall(function() enemy = e.soul ~= nil and e.soul:IsPublicEnemy() == true end)
+    if e.soul and type(e.soul.IsPublicEnemy) == "function" then pcall(function() enemy = e.soul:IsPublicEnemy() == true end) end
     if not enemy and KCD2MP_W136IsAnimalClass then enemy = KCD2MP_W136IsAnimalClass(e.class) == true end
     return enemy
 end
@@ -4674,7 +4675,7 @@ local function npc_hold_set_ai(name, h, off, why)
     local H = KCD2MP.npcHold
     if (h.ai == true) == off then return end
     local e = npc_hold_body(name)
-    if not e then h.ai = false; return end
+    if not (e and AI and type(AI.SetIgnorant) == "function") then h.ai = false; return end
     local ok, err = pcall(function() AI.SetIgnorant(e.id, off and 1 or 0) end)
     if off then
         h.ai = ok
@@ -4766,7 +4767,7 @@ function KCD2MP_NpcReleaseAll(name, why)
     local h = H.held[name]
     H.held[name] = nil
     if h then npc_hold_set_ai(name, h, false, "release-all") end
-    if h and h.n > 0 then npc_hold_log(string.format("MP-NPC-HOLD release-all npc=%s why=%s reasons_dropped=%d", name, tostring(why), h.n)) end
+    if h and h.n > 0 then npc_hold_log(string.format("MP-NPC-HOLD release-all npc=%s cause=%s reasons_dropped=%d", name, tostring(why), h.n)) end
     return npc_hold_phys(name, false)
 end
 
@@ -4841,7 +4842,7 @@ function KCD2MP_NpcHandoverEnd(name, kind, why)
         npc_hold_apply_ai(name, h)
         H.stats.takenBack = H.stats.takenBack + 1
     end
-    npc_hold_log(string.format("MP-NPC-HANDOVER end npc=%s kind=%s why=%s held_s=%.1f taken_back=%s reasons=%s", name, kind, tostring(why),
+    npc_hold_log(string.format("MP-NPC-HANDOVER end npc=%s kind=%s cause=%s held_s=%.1f taken_back=%s reasons=%s", name, kind, tostring(why),
         os.clock() - at, tostring(back), table.concat(KCD2MP_NpcHeldReasons(name), ",")))
     return true
 end
@@ -4909,7 +4910,7 @@ function KCD2MP_NpcFreezeReleased(name, why)
     if not (H.on and H.lease) then return false end
     KCD2MP_NpcHold(name, "released")
     KCD2MP_NpcUnhold(name, "puppet")
-    npc_hold_log(string.format("MP-NPC-LEASE release npc=%s why=%s -- frozen in place, shown (re-adopted by the next packet; parked after %.0f s)", name, tostring(why), H.releasedVisibleS))
+    npc_hold_log(string.format("MP-NPC-LEASE release npc=%s cause=%s -- frozen in place, shown (re-adopted by the next packet; parked after %.0f s)", name, tostring(why), H.releasedVisibleS))
     return true
 end
 
@@ -4980,7 +4981,7 @@ function KCD2MP_NpcBeforeSave(why)
         end
         if shown > 0 then KCD2MP.w131.reassert = true end
     end
-    mp_log(string.format("MP-NPC-HOLD before-save why=%s ai_restored=%d parked_shown=%d -- nothing of the mod's goes into the save; re-applied in 3 s", tostring(why), n, shown))
+    mp_log(string.format("MP-NPC-HOLD before-save cause=%s ai_restored=%d parked_shown=%d -- nothing of the mod's goes into the save; re-applied in 3 s", tostring(why), n, shown))
     return n
 end
 
@@ -5011,7 +5012,7 @@ function KCD2MP_NpcHoldRestoreAll(why, keepStream)
     if not keepStream then H.takenCorpse, H.untracked = {}, {} end
     H.stats.aiRestoredOnEnd = H.stats.aiRestoredOnEnd + ai
     H.stats.restoreAll = H.stats.restoreAll + 1
-    if n > 0 then mp_log(string.format("MP-NPC-HOLD restore-all why=%s names=%d ai_restored=%d -- every hold, handover and AI flag given back", tostring(why), n, ai)) end
+    if n > 0 then mp_log(string.format("MP-NPC-HOLD restore-all cause=%s names=%d ai_restored=%d -- every hold, handover and AI flag given back", tostring(why), n, ai)) end
     return n
 end
 
@@ -5041,8 +5042,8 @@ function KCD2MP_NpcHoldAfterLoad(why)
         end
     end
     H.stats.reassert = H.stats.reassert + n
-    mp_log(string.format("MP-HEALTH area=npc after_load=1 reasserted=%d reasserted_by_reason=%s handovers_active=%d why=%s",
-        n, npc_hold_by_reason(), KCD2MP_NpcHandoversActive(), tostring(why)))
+    mp_log(string.format("MP-HEALTH area=npc after_load=1 reasserted=%d reasserted_by_reason=%s handovers_active=%d",
+        n, npc_hold_by_reason(), KCD2MP_NpcHandoversActive()))
     return n
 end
 
@@ -5066,7 +5067,7 @@ function KCD2MP_NpcHoldHealthLine()
     local viol = (KCD2MP._authStats and KCD2MP._authStats.violation) or 0
     return string.format("MP-HEALTH area=npc copies=%d copies_ai_off=%d holds_by_reason=%s handovers_active=%d handovers_timed_out=%d releases_untrack=%d releases_lease=%d readopts=%d snaps_gt5m=%d fight_events=%d authority_violations=%d ai_restored_on_save=%d ai_restored_on_end=%d",
         copies, aiOff, npc_hold_by_reason(), KCD2MP_NpcHandoversActive(), s.handoversTimedOut, s.releasesUntrack, s.releasesLease,
-        s.readopts, s.snaps, s.fightEvents, viol, s.aiRestoredOnSave, s.aiRestoredOnEnd)
+        s.readopts, s.snaps, (KCD2MP._stats and KCD2MP._stats.npcFightEvents) or s.fightEvents, viol, s.aiRestoredOnSave, s.aiRestoredOnEnd)
 end
 
 -- Once a second (KCD2MP_DwellTickFromInterp, which runs whatever the sync's state): orphans, handover limits, the save window,
@@ -5971,7 +5972,7 @@ function KCD2MP_JoinScanNpcs(add)
                 if dead or ridden or KCD2MP._npcPaused[name] then
                     w.npcSkipped = w.npcSkipped + 1
                 elseif add then
-                    local ok = pcall(System.ExecuteCommand, "wh_ai_PauseNPC " .. name)
+                    local ok = KCD2MP_NpcHold(name, "join")   -- KCT fix (icd14) B
                     if ok then
                         w.npcs[name] = os.clock()
                         w.npcN = w.npcN + 1
@@ -6078,7 +6079,7 @@ function KCD2MP_JoinResume(joinId, reason)
     for name in pairs(w.npcs) do
         if KCD2MP._npcPaused[name] then
             left = left + 1          -- the WO-102 lever took it over: its pause, its resume
-        elseif pcall(System.ExecuteCommand, "wh_ai_ResumeNPC " .. name) then
+        elseif KCD2MP_NpcUnhold(name, "join") then   -- KCT fix (icd14) B
             resumed = resumed + 1
         end
     end
@@ -6784,6 +6785,12 @@ KCD2MP.w131 = {
     lootBlock = true,         -- joiner: bodies and pockets of host-owned NPCs are the host's to loot
     perceive = true,          -- host, shared world: avatars are never AI-ignorant
 }
+
+-- KCT fix (icd14) E: the host's far band as sent -- covering the joiner's sweep (mp_npc_band_match, default on)
+function KCD2MP_W131FarBandM()
+    local w = KCD2MP.w131
+    return KCD2MP_NpcBandM(w.farBandM, w.guardRadiusM, KCD2MP.npcHold and KCD2MP.npcHold.bandMatch)
+end
 
 function KCD2MP_W131IsActive()
     local w = KCD2MP.w131
@@ -8012,7 +8019,7 @@ function KCD2MP_W136RideTake(name)
     if KCD2MP.w131 then KCD2MP.w131.parked[name] = nil end
     KCD2MP._npcResumePending[name] = nil
     mp_wo102_resume(name, "ridden")
-    pcall(System.ExecuteCommand, "wh_ai_ResumeNPC " .. tostring(name))
+    KCD2MP_NpcReleaseAll(name, "ridden")   -- KCT fix (icd14) B: the rider owns it
     local e = KCD2MP.w136.body(name)
     if e then pcall(function() e:Hide(0) end) end
     mp_log(string.format("WO136-RIDE take npc=%s puppet=%s parked=%s -- the rider owns the horse: unbound, its brain back, shown, the host's stream for it ignored",
@@ -8203,6 +8210,7 @@ KCD2MP.w137 = {
 -- mp_wo102_pause's gate: true = this body is a corpse (the host streams it dead,
 -- or it is dead here) and must not be paused.
 function KCD2MP_W137DeadBody(name, p)
+    if KCD2MP.npcHold and KCD2MP.npcHold.takenCorpse[name] then return false end   -- KCT fix (icd14) C: its handover is over
     local why = nil
     if p and (p.dead or p.deadHint) then why = "dead-on-host" end
     if not why then
@@ -8212,6 +8220,7 @@ function KCD2MP_W137DeadBody(name, p)
         if dead then why = "dead-here" end
     end
     if not why then return false end
+    if KCD2MP_NpcHandoverBegin then KCD2MP_NpcHandoverBegin(name, "corpse") end   -- KCT fix (icd14) C: its dead-body behaviour, for a while
     local w = KCD2MP.w137
     if not w.deadRefused[name] then
         w.deadRefused[name] = true
@@ -8224,7 +8233,7 @@ end
 -- From the puppet tick, for a body that is dead here or on the host.
 function KCD2MP_W137DeadTick(name, p, e, locallyDead)
     local w = KCD2MP.w137
-    if locallyDead and KCD2MP._npcPaused[name] then
+    if locallyDead and KCD2MP._npcPaused[name] and not (KCD2MP.npcHold and KCD2MP.npcHold.takenCorpse[name]) then   -- KCT fix (icd14) C
         mp_wo102_resume(name, "dead-body")
         w.stats.deadResumed = w.stats.deadResumed + 1
         mp_log(string.format("WO137-DEAD resumed npc=%s -- a corpse is never paused: its own dead-body behaviour holds it where it lies", name))
@@ -8433,6 +8442,7 @@ function KCD2MP_W137TalkResume(name, via)
     KCD2MP_EmitEvent("w164_talk", "ask " .. name .. " " .. tostring(via) .. " " .. (wasPaused and "1" or "0"))   -- WO-164 T0
     if KCD2MP_W157TalkFree then KCD2MP_W157TalkFree(name) end   -- WO-157 3b.4: the copy free to talk (and to trade)
     if wasPaused then mp_wo102_resume(name, "w137-talk") end
+    if KCD2MP_NpcHandoverBegin then KCD2MP_NpcHandoverBegin(name, "talk") end   -- KCT fix (icd14) C: the conversation's handover (hard limit)
     w.stats.talks = w.stats.talks + 1
     -- WO-144 1.3: nothing is held on the key press. The host holds its NPC only once this
     -- conversation has really started (KCD2MP_W137TalkAttempt, the engine's own start line):
@@ -8606,6 +8616,7 @@ function KCD2MP_W137TalkEnd(name, why, keep)   -- keep (WO-167 T1): the copy is 
     if KCD2MP.w164 then KCD2MP.w164.lastEnd[name] = os.clock() end   -- WO-164 T2
     KCD2MP_EmitEvent("w164_talk", string.format("end %s %s %.1f", name, tostring(why), os.clock() - t.since))   -- WO-164 T0
     local p = KCD2MP.npcPuppets[name]
+    if not keep and KCD2MP_NpcHandoverEnd then KCD2MP_NpcHandoverEnd(name, "talk", why) end   -- KCT fix (icd14) C: taken back (the pause below)
     local how
     if p and keep then
         how = "kept running and free: talked to again at once (WO-167)"
@@ -8748,8 +8759,8 @@ function KCD2MP_W137HostHold(on, npc, peer, why)
     if KCD2MP.w123 and KCD2MP.w123.paused and KCD2MP.w123.npcs[npc] then
         exec = "left-to-the-join-pause"   -- a join paused the world meanwhile: its resume wakes it
     elseif h.paused then
-        local ok, err = pcall(System.ExecuteCommand, "wh_ai_ResumeNPC " .. npc)
-        exec = ok and "ok" or ("err:" .. tostring(err))
+        local ok, err, kept = KCD2MP_NpcUnhold(npc, "talk-hold")   -- KCT fix (icd14) B
+        exec = ok and (kept or "ok") or ("err:" .. tostring(err))
     else
         exec = "was-not-paused"
     end
@@ -8772,7 +8783,7 @@ function KCD2MP_W137HoldPause(npc, e, h)
         return string.format("block-only(why=%s,hold_freeze=off%s)", tostring(h.why), h.why == "talk" and ",mp_conv_hold=off" or "")
     end
     if busy then return "waits:in-a-conversation-here" end
-    local ok, err = pcall(System.ExecuteCommand, "wh_ai_PauseNPC " .. npc)
+    local ok, err = KCD2MP_NpcHold(npc, "talk-hold", true)   -- KCT fix (icd14) B (re-issued: a load forgets it)
     if ok then h.paused = true end
     return ok and "ok" or ("err:" .. tostring(err))
 end
@@ -9785,7 +9796,7 @@ function KCD2MP_NpcSyncTick()
                     -- out on the 2 s heartbeat (and on death / life changes),
                     -- so the joiner binds the host's real NPC there instead of
                     -- parking a copy it cannot see the truth of.
-                    local band = KCD2MP.w131 and KCD2MP.w122 and KCD2MP.w122.sharedWorld and KCD2MP.w131.farBandM or 0
+                    local band = KCD2MP.w131 and KCD2MP.w122 and KCD2MP.w122.sharedWorld and KCD2MP_W131FarBandM() or 0   -- KCT fix (icd14) E
                     local hbDue = not t.lastSentAt or (now - t.lastSentAt) >= KCD2MP.npcSync.heartbeatS
                     if dCull > band or not (hbDue or (dead and not t.sentDead) or (ko ~= (t.sentKo or false))) then
                         t.culled = true
@@ -18783,6 +18794,7 @@ function KCD2MP_W138PushTrack()
     local names = {}
     for name in pairs(KCD2MP.npcTracked or {}) do names[#names + 1] = name end
     table.sort(names)
+    if KCD2MP_NpcUntrackDiff then pcall(KCD2MP_NpcUntrackDiff, names) end   -- KCT fix (icd14) D: the partners hear who left the set
     local parts, cur = {}, {}
     local curLen = 0
     local keyParts = {}
@@ -18807,7 +18819,7 @@ function KCD2MP_W138PushTrack()
     -- The sender's settings ride with every set (the same values the Lua sender uses).
     local ns, c = KCD2MP.npcSync, KCD2MP.wo1025
     local shared = KCD2MP.w122 and KCD2MP.w122.sharedWorld
-    local farBand = (shared and KCD2MP.w131 and KCD2MP.w131.farBandM) or 0
+    local farBand = (shared and KCD2MP.w131 and KCD2MP_W131FarBandM()) or 0   -- KCT fix (icd14) E
     local cull = (KCD2MP.wo102 and KCD2MP.wo102.authorityHost and c and c.npcCull) and 1 or 0
     -- WO-201 B10 (mp_walk_from_host): a moving NPC goes out every emit tick (10 Hz) -- a walker below 0.5 m/s moved under 5 cm a tick
     -- and was sent every second or third one (the field: 0.9 rows per tracked NPC a second); a still one stays at the heartbeat
@@ -20453,6 +20465,7 @@ function KCD2MP_W139StopHeld(name)
     if not u then return false end
     if u ~= true and os.clock() > u then
         w.stopped[name] = nil
+        if KCD2MP_NpcUnhold and KCD2MP_NpcHeld(name, "guard-return") then KCD2MP_NpcUnhold(name, "guard-return") end   -- KCT fix (icd14) B
         mp_log(string.format("WO139-STOP return npc=%s -- the host's stream takes it back", name))
         return false
     end
@@ -20558,7 +20571,8 @@ function KCD2MP_W139Stop(id, guard, crimesCsv)
     KCD2MP._npcResumePending[guard] = nil
     w.stopped[guard] = true
     mp_wo102_resume(guard, "w139-stop")
-    pcall(System.ExecuteCommand, "wh_ai_ResumeNPC " .. guard)
+    KCD2MP_NpcReleaseAll(guard, "w139-stop")              -- KCT fix (icd14) B: the copy's reasons off, its brain back ...
+    KCD2MP_NpcHandoverBegin(guard, "guard-stop")          -- ... C: as a handover, with a hard limit; the stop's end takes it back
     pcall(function() e:Hide(0) end)
     local money = 0
     pcall(function() money = player.inventory:GetMoney() or 0 end)
@@ -20686,11 +20700,13 @@ function KCD2MP_W139StopEnd(why, result)
         local guard = s.guard
         w.stopped[guard] = true
         Script.SetTimer(4500, function()
-            pcall(System.ExecuteCommand, "wh_ai_PauseNPC " .. guard)
+            KCD2MP_NpcHandoverEnd(guard, "guard-stop", "stop-ended")   -- KCT fix (icd14) C
+            KCD2MP_NpcHold(guard, "guard-return")                     -- B: until the host's stream takes it back
             KCD2MP.w139.stopped[guard] = os.clock() + KCD2MP.w139.stopReturnS
         end)
     else
-        pcall(System.ExecuteCommand, "wh_ai_PauseNPC " .. s.guard)
+        KCD2MP_NpcHandoverEnd(s.guard, "guard-stop", "stop-ended")   -- KCT fix (icd14) C
+        KCD2MP_NpcHold(s.guard, "guard-return")                     -- B
         w.stopped[s.guard] = os.clock() + w.stopReturnS
     end
     if result == "paid" or result == "punished" or result == "persuaded" or result == "executed" then w.crimes = {} end
@@ -23250,7 +23266,8 @@ end
 function KCD2MP_W176Pause(name, on, why)
     local w = KCD2MP.w176
     if on == (w.paused[name] ~= nil) then return end
-    local ok, err = pcall(System.ExecuteCommand, (on and "wh_ai_PauseNPC " or "wh_ai_ResumeNPC ") .. tostring(name))
+    local ok, err   -- KCT fix (icd14) B
+    if on then ok, err = KCD2MP_NpcHold(name, "w176") else ok, err = KCD2MP_NpcUnhold(name, "w176") end
     if on then w.paused[name] = os.clock(); w.stats.pause = w.stats.pause + 1 else w.paused[name] = nil; w.stats.resume = w.stats.resume + 1 end
     mp_log(string.format("WO176-PAUSE figure=%s %s %s exec=%s -- %s", tostring(name), on and "on" or "off", tostring(why),
         ok and "ok" or ("err:" .. tostring(err)), on and "a quest's arranged fight is near: the figure's own brain stays out of it" or "no story fight near"))
@@ -23833,6 +23850,7 @@ do   -- WO-175's do-block
         if w.health then KCD2MP_EmitEvent("w175_check", "load") end
         if KCD2MP_W178AfterLoad then pcall(KCD2MP_W178AfterLoad, why) end   -- WO-178 0.c: the draw probe
         if KCD2MP_W201AfterLoad then pcall(KCD2MP_W201AfterLoad, why) end   -- WO-201: every load
+        if KCD2MP_NpcHoldAfterLoad then pcall(KCD2MP_NpcHoldAfterLoad, why) end   -- KCT fix (icd14) B: every hold re-asserted at once
     end
 
     -- Before a save (the mod's own, and the game's InitiateSaveGame line through the agent): partner-figure records out
@@ -23996,6 +24014,7 @@ do   -- WO-178's do-block
         local w = KCD2MP.w178
         w.stats.asked = w.stats.asked + 1
         if KCD2MP_W175BeforeSave then pcall(KCD2MP_W175BeforeSave, why) end   -- S4: the agent checks the file the engine writes
+        if KCD2MP_NpcBeforeSave then pcall(KCD2MP_NpcBeforeSave, why) end      -- KCT fix (icd14) A: no AI flag / hidden copy into the save
         if KCD2MP_W174Clean then pcall(KCD2MP_W174Clean, "save") end          -- WO-174: partner-figure fight records out before the save
         KCD2MP_EmitEvent("w178_save", tostring(why))
         mp_log("WO178-SAVE asked why=" .. tostring(why) .. " path=schnapps (the engine's ManualSave, no item used)")
@@ -25303,7 +25322,9 @@ function KCD2MP_W167FreshResume(name)
     W.talk.fresh[name] = nil
     if (os.clock() - at) > W.FRESH_S then return false end
     W.talk.stats.fresh = W.talk.stats.fresh + 1
-    if KCD2MP._npcPaused[name] == nil then w164_exec("wh_ai_ResumeNPC " .. tostring(name)) end
+    if KCD2MP._npcPaused[name] == nil then   -- KCT fix (icd14) B: and no other owner (a park, a join) holds it
+        if KCD2MP.npcHold.on then KCD2MP_NpcUnhold(name, "w167-fresh") else w164_exec("wh_ai_ResumeNPC " .. tostring(name)) end
+    end
     mp_log(string.format("WO167-T2 fresh-resume npc=%s after_s=%.1f -- the host used it last: resumed before this talk", tostring(name), os.clock() - at))
     return true
 end
@@ -26033,14 +26054,14 @@ function KCD2MP_W164EscortFollow(name, ghost, on)
         pcall(function() e = System.GetEntityByName(name) end)
         if not e then mp_log("WO164-ESCORT host: no NPC named " .. name .. " in this world -- nothing follows"); return false end
         w.escort[name] = { ghost = tonumber(ghost), since = os.clock() }
-        w164_exec("wh_ai_PauseNPC " .. name)
+        if KCD2MP.npcHold.on then KCD2MP_NpcHold(name, "escort") else w164_exec("wh_ai_PauseNPC " .. name) end   -- KCT fix (icd14) B
         mp_log(string.format("WO164-ESCORT host npc=%s ghost=%s on -- paused, walked behind the figure kcd2mp_%s", name, tostring(ghost), tostring(ghost)))
         return true
     end
     for nm, x in pairs(w.escort) do
         if (name == nil or nm == name) and (ghost == nil or x.ghost == tonumber(ghost)) then
             w.escort[nm] = nil
-            w164_exec("wh_ai_ResumeNPC " .. nm)
+            if KCD2MP.npcHold.on then KCD2MP_NpcUnhold(nm, "escort") else w164_exec("wh_ai_ResumeNPC " .. nm) end   -- KCT fix (icd14) B
             mp_log("WO164-ESCORT host npc=" .. nm .. " off -- its own brain again")
         end
     end
@@ -27509,7 +27530,7 @@ do
         KCD2MP._npcResumePending[name] = nil
         if p or wasParked or KCD2MP._npcPaused[name] then
             mp_wo102_resume(name, "ridden-by-avatar")
-            pcall(System.ExecuteCommand, "wh_ai_ResumeNPC " .. tostring(name))
+            KCD2MP_NpcReleaseAll(name, "ridden-by-avatar")   -- KCT fix (icd14) B
         end
         local e = w.body(name)
         if e then pcall(function() e:Hide(0) end) end
@@ -27608,7 +27629,11 @@ do
                 local guard = false
                 pcall(function() guard = e.soul:HasScriptContext("crime_isAuthority") == true end)
                 if not paused or guard then
-                    if paused then pcall(System.ExecuteCommand, "wh_ai_ResumeNPC " .. name); woke[#woke + 1] = name end
+                    if paused then   -- KCT fix (icd14) C: a 1.5 s handover (hard limit 5 s)
+                        local lent = KCD2MP_NpcHandoverBegin(name, "crime-forget")   -- resumes a body the registry holds
+                        if not (lent and KCD2MP_NpcHeld(name)) then pcall(System.ExecuteCommand, "wh_ai_ResumeNPC " .. name) end
+                        woke[#woke + 1] = name
+                    end
                     local t = nil
                     pcall(function() t = XGenAIModule.MakeTableFromType("crime:forgetCrimesData") end)
                     if t then
@@ -27622,7 +27647,9 @@ do
         if #woke > 0 then
             Script.SetTimer(1500, function()
                 for _, n in ipairs(woke) do
-                    if KCD2MP._npcPaused and KCD2MP._npcPaused[n] then pcall(System.ExecuteCommand, "wh_ai_PauseNPC " .. n) end
+                    local held = KCD2MP_NpcHeld(n)   -- KCT fix (icd14) C: the handover's end takes a held body back
+                    KCD2MP_NpcHandoverEnd(n, "crime-forget", "done")
+                    if not held and KCD2MP._npcPaused and KCD2MP._npcPaused[n] then pcall(System.ExecuteCommand, "wh_ai_PauseNPC " .. n) end
                 end
             end)
         end
@@ -27715,6 +27742,7 @@ do
         if (os.clock() - h.since) > W.sceneHoldMaxS then
             W.sceneHeld[name] = nil
             W.sceneStats.expired = W.sceneStats.expired + 1
+            if KCD2MP_NpcHandoverEnd then KCD2MP_NpcHandoverEnd(name, "scene", "expired") end   -- KCT fix (icd14) C
             return false
         end
         return true
@@ -27741,6 +27769,7 @@ do
             if not W.sceneHeld[name] then
                 W.sceneHeld[name] = { since = os.clock(), scene = tostring(scene) }
                 mp_wo102_resume(name, "w151-scene")
+                if KCD2MP_NpcHandoverBegin then KCD2MP_NpcHandoverBegin(name, "scene") end   -- KCT fix (icd14) C
                 W.sceneStats.copies = W.sceneStats.copies + 1
             end
         end
@@ -27755,6 +27784,7 @@ do
         local n, paused, parked = 0, 0, 0
         for name, h in pairs(W.sceneHeld) do
             W.sceneHeld[name] = nil
+            if KCD2MP_NpcHandoverEnd then KCD2MP_NpcHandoverEnd(name, "scene", why) end   -- KCT fix (icd14) C
             n = n + 1
             if not noPause then
                 local p = KCD2MP.npcPuppets[name]
@@ -29884,6 +29914,12 @@ local ok, err = pcall(function()
     -- WO-127: the leash recorder (off unless turned on; the tester page says: host, for the session).
     System.AddCCommand("mp_leash_trace",         'KCD2MP_SetLeashTrace(%line)',           "WO-127: record, once a second, every NPC within 200 m of either player and every simulation signal the game exposes cheaply, to a CSV beside agent.log (for WO-128): mp_leash_trace on|off; bare = report")
     -- WO-114: the leash (HOST values decide; default on, 600 m warning, 650 m pull).
+    -- KCT fix (icd14): NPC copies are pure puppets (A-E), each switchable, default on
+    System.AddCCommand("mp_npc_hold",            'KCD2MP_NpcHoldSet("on", %line)',        "KCT fix (icd14) B: one suspend registry -- an NPC is paused on its first owner's reason and resumed only when the last goes: mp_npc_hold on|off (default on; off gives every hold back); bare = report")
+    System.AddCCommand("mp_copy_ai_off",         'KCD2MP_NpcHoldSet("aiOff", %line)',     "KCT fix (icd14) A (JOINER): a held host copy is also AI-ignorant (never pulled into a fight here); off before every save, back on session end: mp_copy_ai_off on|off (default on)")
+    System.AddCCommand("mp_npc_handover",        'KCD2MP_NpcHoldSet("handover", %line)',  "KCT fix (icd14) C: a conversation / guard stop / scene / corpse runs the copy's brain as a handover with a hard time limit, taken back at its end: mp_npc_handover on|off (default on)")
+    System.AddCCommand("mp_npc_lease",           'KCD2MP_NpcHoldSet("lease", %line)',     "KCT fix (icd14) D: a copy is released only on the host's untrack or after 3 heartbeats of silence (6.5 s), then frozen in place, shown: mp_npc_lease on|off (default on; off = the 3 s rule)")
+    System.AddCCommand("mp_npc_band_match",      'KCD2MP_NpcHoldSet("bandMatch", %line)', "KCT fix (icd14) E (HOST): the far band streams out to the joiner's sweep radius (220 m, was 150): mp_npc_band_match on|off (default on)")
     System.AddCCommand("mp_npc_guard",           'KCD2MP_SetNpcGuard(%line)',             "WO-131 1a (JOINER): every NPC of the host's world is the host's stream or parked here (suspended + hidden) -- never a free copy: mp_npc_guard on|off (default on); bare = report")
     System.AddCCommand("mp_avatar_perceive",     'KCD2MP_SetAvatarPerceive(%line)',       "WO-131 1d (HOST of a shared world): the partner's avatar is always perceivable by NPCs (never AI-ignorant) and in the player's faction: mp_avatar_perceive on|off (default on); bare = report")
     System.AddCCommand("mp_avatar_quiet",        'KCD2MP_W135SetQuiet(%line)',            "WO-135 (host): the partner's avatar is a puppet -- which groups of its own reactions are off: 1 speech (barks, dialogue), 2 witness (crime), 4 react (perception, hits), 8 defence (its own blocks); mp_avatar_quiet 0..15|on|off (default 15 = all); bare = report")

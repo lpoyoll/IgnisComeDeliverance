@@ -93,6 +93,7 @@ player = {
 Player = { Client = { OnAction = function(...) ORIG_ONACTION_CALLS = ORIG_ONACTION_CALLS + 1 end } }
 
 -- @@KDCMP@@
+KCD2MP.npcHold.lease = false   -- KCT fix (icd14) D: this suite pins the pre-lease 3 s silence release (mp_npc_lease off); Test-Icd14NpcSynthetic.lua covers the lease
 
 -- WO-102: these scenarios pin the 0.23.2 CLAIM model, which now ships as `mp_authority_host_off`
 -- (host authority is the shipped default since WO-102; Test-WO102Synthetic.lua covers that side).

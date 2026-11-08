@@ -115,6 +115,7 @@ local function cmdCount(pat)
     return n
 end
 local function reset()
+    if KCD2MP.npcHold then KCD2MP.npcHold.held = {}; KCD2MP.npcHold.lent = {}; KCD2MP.npcHold.untracked = {}; KCD2MP.npcHold.takenCorpse = {}; KCD2MP.npcHold.saveUntil = nil end   -- KCT fix (icd14): a fresh suspend registry per scenario
     KCD2MP.npcPuppets = {}; KCD2MP.npcTracked = {}; KCD2MP.dragging = {}; KCD2MP.dragWatch = {}
     KCD2MP._npcPaused = {}; KCD2MP._npcResumePending = {}; KCD2MP._npcEverPaused = {}
     KCD2MP.ghosts = {}; KCD2MP.horseGhosts = {}
@@ -372,13 +373,13 @@ do -- (l) the host's far band
     KCD2MP.npcSync.enabled = true; KCD2MP.npcSyncRunning = true
     KCD2MP.wo1025.together = false; KCD2MP._togetherWantSince = nil; KCD2MP._colocatePendingRelease = {}
     local mid = mkEntity("l_mid", 100, 0, 0); ENTS["l_mid"] = mid
-    local far = mkEntity("l_far", 200, 0, 0); ENTS["l_far"] = far
+    local far = mkEntity("l_far", 240, 0, 0); ENTS["l_far"] = far   -- KCT fix (icd14) E: the band now covers the 220 m sweep (was 200 m against 150)
     local near = mkEntity("l_near", 30, 0, 0); ENTS["l_near"] = near
     SPHERE = { mid, far, near }
     NOW = 1000; KCD2MP._npcScanAt = 0; KCD2MP_NpcSyncTick()
     check("l: inside the cull radius: streamed", logCount("npc_state l_near") >= 1)
     check("l: 100 m (past the 60 m cull, inside the 150 m band): on the heartbeat", logCount("npc_state l_mid") == 1)
-    check("l: 200 m (owned, outside the band): not streamed", KCD2MP.npcTracked["l_far"] ~= nil and logCount("npc_state l_far") == 0)
+    check("l: 240 m (owned, outside the band -- 220 m since icd14 E): not streamed", KCD2MP.npcTracked["l_far"] ~= nil and logCount("npc_state l_far") == 0)
     mid.px = 101; NOW = 1000.5; KCD2MP_NpcSyncTick()
     check("l: a far-band NPC that moves is not sent at full rate", logCount("npc_state l_mid") == 1)
     NOW = 1002.5; KCD2MP_NpcSyncTick()
