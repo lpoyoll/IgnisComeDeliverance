@@ -226,6 +226,6 @@ public sealed class PipeHealth
     {
         var (p50, p95, max, _) = GateWait.Take();
         return string.Create(CultureInfo.InvariantCulture,
-            $"MP-HEALTH area=pipe sent={Interlocked.Exchange(ref _sent, 0)} replies={Interlocked.Exchange(ref _replies, 0)} stale_dropped={Interlocked.Exchange(ref _stale, 0)} oversize_refused={Interlocked.Exchange(ref _oversize, 0)} oversize_dll={Interlocked.Exchange(ref _oversizeDll, 0)} gate_wait_p50_ms={p50} gate_wait_p95_ms={p95} gate_wait_max_ms={max} reply_timeouts={Interlocked.Exchange(ref _timeouts, 0)} reconnects={Interlocked.Exchange(ref _reconnects, 0)} replayed_configs={Interlocked.Exchange(ref _replayed, 0)} reader_cb_queue_max={Interlocked.Exchange(ref _cbMax, 0)} connected={(connected ? 1 : 0)} gen={generation}");
+            $"MP-HEALTH area=pipe sent={Interlocked.Exchange(ref _sent, 0)} replies={Interlocked.Exchange(ref _replies, 0)} stale_dropped={Interlocked.Exchange(ref _stale, 0)} oversize_refused={Interlocked.Exchange(ref _oversize, 0)} oversize_dll={Interlocked.Exchange(ref _oversizeDll, 0)} gate_wait_p50={p50} gate_wait_p95={p95} gate_wait_max={max} reply_timeouts={Interlocked.Exchange(ref _timeouts, 0)} reconnects={Interlocked.Exchange(ref _reconnects, 0)} replayed_configs={Interlocked.Exchange(ref _replayed, 0)} reader_cb_queue_max={Interlocked.Exchange(ref _cbMax, 0)} connected={(connected ? 1 : 0)} gen={generation}");
     }
 }

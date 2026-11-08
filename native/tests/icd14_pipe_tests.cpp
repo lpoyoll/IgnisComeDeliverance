@@ -68,8 +68,8 @@ int icd14_pipe_tests(int* passed) {
     ICHECK(!due(h, 109.9) && due(h, 110.0), "every 10 s");
     char buf[400];
     format(h, 2, true, buf, sizeof buf);
-    ICHECK(std::strstr(buf, "MP-HEALTH area=native-pipe requests_per_frame_mean=4.00 max=8 oversize_skipped=2 budget_hits=1") == buf, "%s", buf);
-    ICHECK(std::strstr(buf, "lingers=2 linger_hits=1 pump_budget=on") != nullptr, "%s", buf);
+    ICHECK(std::strstr(buf, "MP-HEALTH area=native-pipe requests_per_frame_mean=4.00 requests_per_frame_max=8 oversize_skipped=2 budget_hits=1") == buf, "%s", buf);
+    ICHECK(std::strstr(buf, "lingers=2 linger_hits=1 pump_budget=1") != nullptr, "%s", buf);
     restart(h, 110.0);
     ICHECK(h.frames == 0 && h.startS == 110.0, "a new window");
 

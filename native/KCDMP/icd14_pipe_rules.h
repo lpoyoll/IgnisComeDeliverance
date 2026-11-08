@@ -90,10 +90,10 @@ inline bool due(const Health& h, double nowS) { return h.startS > 0 && nowS - h.
 inline double mean_per_frame(const Health& h) { return h.busyFrames ? static_cast<double>(h.items) / static_cast<double>(h.busyFrames) : 0.0; }
 inline int format(const Health& h, uint32_t oversizeSkipped, bool pumpOn, char* buf, size_t n) {
     return std::snprintf(buf, n,
-        "MP-HEALTH area=native-pipe requests_per_frame_mean=%.2f max=%u oversize_skipped=%u budget_hits=%u frames=%llu busy_frames=%llu "
-        "requests=%llu lingers=%u linger_hits=%u pump_budget=%s",
+        "MP-HEALTH area=native-pipe requests_per_frame_mean=%.2f requests_per_frame_max=%u oversize_skipped=%u budget_hits=%u frames=%llu busy_frames=%llu "
+        "requests=%llu lingers=%u linger_hits=%u pump_budget=%d",
         mean_per_frame(h), h.maxItems, oversizeSkipped, h.budgetHits, static_cast<unsigned long long>(h.frames),
-        static_cast<unsigned long long>(h.busyFrames), static_cast<unsigned long long>(h.items), h.lingers, h.lingerHits, pumpOn ? "on" : "off");
+        static_cast<unsigned long long>(h.busyFrames), static_cast<unsigned long long>(h.items), h.lingers, h.lingerHits, pumpOn ? 1 : 0);
 }
 inline void restart(Health& h, double nowS) { h = Health{}; h.startS = nowS; }
 
