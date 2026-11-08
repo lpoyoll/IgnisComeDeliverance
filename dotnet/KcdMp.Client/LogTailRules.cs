@@ -105,4 +105,7 @@ public static class LogLineFilter
 
     /// <summary>A line of the mod's own (its tags all start "[KCD2-MP").</summary>
     public static bool IsModLine(ReadOnlySpan<byte> line) => line.StartsWith("[KCD2-MP"u8);
+
+    /// <summary>A plain "[KCD2-MP] " line of the mod's (mp_log; not a DATA or EVT line).</summary>
+    public static bool IsModPlainLine(ReadOnlySpan<byte> line) => line.StartsWith("[KCD2-MP] "u8);
 }

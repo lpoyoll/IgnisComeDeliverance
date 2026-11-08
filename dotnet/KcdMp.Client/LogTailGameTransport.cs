@@ -73,6 +73,12 @@ public sealed class LogTailGameTransport : IGameTransport
     /// </summary>
     public event Action<string, string>? GameEvent;
 
+    /// <summary>
+    /// KCT fix (icd14): raised for every complete "[KCD2-MP] " line of kcd.log (the whole line, without its terminator), on the tail loop
+    /// in file order -- subscribers must not block. Costs one byte prefix check per line while nobody subscribes.
+    /// </summary>
+    public event Action<string>? ModLogLine;
+
     /// <summary>Events seen since start.</summary>
     public long EventsReceived { get; private set; }
 
@@ -140,6 +146,9 @@ public sealed class LogTailGameTransport : IGameTransport
     }
 
     public string LogPath => _logPath;
+
+    /// <summary>KCT fix (icd14): the tail loop alone (no emitter start) -- tests and tools that feed a log file of their own.</summary>
+    public void StartTail() => _tailTask ??= Task.Run(() => TailLoopAsync(_cts.Token), CancellationToken.None);
 
     /// <summary>
     /// Starts the tail loop and asks the mod to begin emitting. Safe to call
@@ -1038,6 +1047,7 @@ public sealed class LogTailGameTransport : IGameTransport
                                 Console.WriteLine($"MP-EVT-TAIL a new {Path.GetFileName(_logPath)} (another file, or the old one written again from the start): read from its beginning");
                             }
                             accLen = 0;
+                            EventSeq.Reset();   // another file (or the first open): its first event starts the count
                             earlyDone = null;
                         }
                         lastSwitchCheck = Environment.TickCount64;
@@ -1163,6 +1173,12 @@ public sealed class LogTailGameTransport : IGameTransport
         if (need > chars.Length) chars = new char[Math.Max(need, chars.Length * 2)];
         int n = Encoding.UTF8.GetChars(line, chars);
         var text = chars.AsSpan(0, n);
+        // KCT fix (icd14): the merge's hook -- every complete "[KCD2-MP] " line (a string only when someone listens)
+        if (ModLogLine is { } hook && LogLineFilter.IsModPlainLine(line))
+        {
+            try { hook(text.ToString()); }
+            catch (Exception ex) { Console.WriteLine($"[logtail] ModLogLine handler threw: {ex.Message}"); }
+        }
         // WO-124: the event line already delivered before its terminator arrived
         if (earlyDone is null || !text.SequenceEqual(earlyDone.AsSpan().TrimEnd('\r'))) ProcessLine(text);
         earlyDone = null;
