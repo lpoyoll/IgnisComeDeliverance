@@ -16,7 +16,9 @@ namespace KcdMp.Client;
 //                   hard set over Icd14Rules.HardSetOverS (forward: Calendar.SetWorldTime; back: the WO-140 native pull), never in a skip,
 //                   its arbitration, a cutscene, a load or the host's pause.
 //   3/4             the crime ledger and the area snapshot live in kdcmp.lua (KCD2MP.icd14); this side carries the snapshot's messages.
-// MP-HEALTH area=world lines: part=clock (every 10 s), part=quest (every 30 s); the Lua prints part=crime / part=snapshot.
+// MP-HEALTH area=world lines every 10 s: part=clock, part=quest (the agent); part=lua (crime and snapshot, kdcmp.lua).
+// Joiner-local quest timers: not suppressed here -- WO-200 quiet clocks already drop a joiner timer pulse in a joined world; what a
+// host timer does arrives as the State changes it makes (and, if missed, as this push's correction).
 public partial class GameBridge
 {
     private readonly ConcurrentDictionary<string, bool> _icd14On = new(StringComparer.Ordinal);
@@ -61,7 +63,7 @@ public partial class GameBridge
             _icdHealthClockMs = now;
             if (W137Host || W137Joiner) Console.WriteLine(Icd14HealthClock());
         }
-        if (now - _icdHealthQuestMs >= Icd14Rules.QuestPushEveryS * 1000L)
+        if (now - _icdHealthQuestMs >= 10_000)
         {
             _icdHealthQuestMs = now;
             if (W137Host || W137Joiner) Console.WriteLine(Icd14HealthQuest());
@@ -208,7 +210,7 @@ public partial class GameBridge
                 else Icd14Refuse("write:" + result);
                 Console.WriteLine($"ICD14-QUEST correct key={key} old={lv ?? "-"} new={hv ?? "-"} type={typeDef ?? "?"} result={result} applied={(ok ? "yes" : "no")} age_s={now - seen.FirstAt:F0}");
             }
-            // a memory of keys no longer differing in any asked bucket is dropped after a minute without a sighting
+            // a memory of keys no longer differing in any asked bucket is dropped ten minutes after it was first seen
             foreach (var (k, s) in _icdQSeen.ToArray()) if (now - s.FirstAt > 600) _icdQSeen.TryRemove(k, out _);
         }
         catch (Exception ex) { Console.WriteLine($"ICD14-QUEST bucket {bucket} not judged: {ex.GetType().Name}: {ex.Message}"); }
@@ -231,8 +233,10 @@ public partial class GameBridge
         switch (act)
         {
             case Icd14Rules.ClockAct.None:
-                if (held) Interlocked.Increment(ref _icdClockHeld);
-                return held || Math.Abs(err) > Icd14Rules.HardSetOverS;   // a cooldown: no slew over a set that is still landing
+                // held (a skip, its arbitration, a cutscene, a join): no set -- the WO-200/201 slew goes on as it did before icd14.
+                // Not held: the cooldown after a set -- no slew over a set that is still landing.
+                if (held) { Interlocked.Increment(ref _icdClockHeld); return false; }
+                return Math.Abs(err) > Icd14Rules.HardSetOverS;
             case Icd14Rules.ClockAct.Slew:
                 if (Math.Abs(err) >= 4) Interlocked.Increment(ref _icdClockSlews);
                 return false;

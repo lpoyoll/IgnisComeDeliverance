@@ -7,7 +7,7 @@ using System.Text;
 namespace KcdMp.Client;
 
 /// <summary>
-/// KCT fix (icd14): the pure rules of the host-authoritative world pushes (GameBridge.Icd14.cs). The switches, the quest push's buckets,
+/// KCT fix (icd14): the pure rules of the host-authoritative world pushes (GameBridge.Icd14World.cs). The switches, the quest push's buckets,
 /// texts and its allowlist, the clock follower's decision and the area snapshot's retry rule.
 /// </summary>
 public static class Icd14Rules

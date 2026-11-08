@@ -15761,7 +15761,7 @@ end
 KCD2MP_W177CorpseArm()
 
 -- ===== KCT fix (icd14): one world, the host's -- the crime ledger, the area snapshot, the switches =====
--- The joiner's world is corrected from the host's, not only checked (the agent: GameBridge.Icd14.cs, the pure rules Icd14World.cs).
+-- The joiner's world is corrected from the host's, not only checked (the agent: GameBridge.Icd14World.cs, the pure rules Icd14World.cs).
 --   mp_icd_quest_push    (on)  host -> joiner every 30 s: the digest quest map compared bucket by bucket; a differing int/bool/uint quest
 --                              State that stood 20 s is written to the host's value by path (the agent and the DLL; ICD14-QUEST lines)
 --   mp_icd_clock_follow  (on)  joiner: the host's clock followed continuously -- a slew under 150 game s, a set above (ICD14-CLOCK)
@@ -15929,7 +15929,7 @@ do
             if #out >= 30 then break end
             local dead, nm = false, nil
             if KCD2MP_W177IsDeadNpc then dead, nm = KCD2MP_W177IsDeadNpc(e) end
-            if dead and nm then out[#out + 1] = nm end
+            if dead and nm and tostring(nm):match("^[%w_%-]+$") then out[#out + 1] = nm end   -- a wire word only
         end
         table.sort(out)
         return out
@@ -15973,10 +15973,10 @@ do
         for _, e in ipairs(ents) do
             local dead, nm = false, nil
             if KCD2MP_W177IsDeadNpc then dead, nm = KCD2MP_W177IsDeadNpc(e) end
-            local p = dead and pos(e)
+            local p = dead and nm and tostring(nm):match("^[%w_%-]+$") and pos(e)   -- a wire word only
             if p then items[#items + 1] = string.format("C:%s:%.1f:%.1f:%.1f", nm, p.x, p.y, p.z) end
         end
-        for nm in string.gmatch(tostring(corpsesCsv or ""), "[%w_]+") do
+        for nm in string.gmatch(tostring(corpsesCsv or ""), "[%w_%-]+") do
             local e = nil
             pcall(function() e = System.GetEntityByName(nm) end)
             local p = e and e.actor and not isDead(e) and pos(e)
@@ -16078,7 +16078,7 @@ do
         local k, dir, lk, x, y, z = tok:match("^D:(d%x+):(%-?%d+):([01]):" .. NUM .. ":" .. NUM .. ":" .. NUM .. "$")
         if k then return { kind = "D", key = k, dir = tonumber(dir), locked = lk == "1", x = tonumber(x), y = tonumber(y), z = tonumber(z) } end
         local kind, nm
-        kind, nm, x, y, z = tok:match("^([CA]):([%w_]+):" .. NUM .. ":" .. NUM .. ":" .. NUM .. "$")
+        kind, nm, x, y, z = tok:match("^([CA]):([%w_%-]+):" .. NUM .. ":" .. NUM .. ":" .. NUM .. "$")
         if kind then return { kind = kind, npc = nm, x = tonumber(x), y = tonumber(y), z = tonumber(z) } end
         return nil
     end
