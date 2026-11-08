@@ -11,6 +11,9 @@ namespace KcdMp.Client;
 //                                      (0x41 / 0x43 and a gone peer's clear), combat actions (0x3C's dispatch and the NPC resync burst),
 //                                      combat cues (0x2D, the WO-214 pre-draw before its draw), and the join channel (WO-123's frames) --
 //                                      go to a lane per kind, each in order on its own task. The processor goes on to the next frame.
+//                                      The join lane has its own switch too (mp_proc_side_join).
+//   every switch is a WO-213 name (W213.NAMES in the mod: mp_<name> on|off; the bench's twin KCDMP_TEST_W213_OFF), default on;
+//   mp_pipe_oversize_skip / mp_pipe_pump_budget are the DLL's (bits 0x1000 / 0x2000 of the WO-213 word, native icd14_pipe_rules.h)
 //   stale drop (mp_proc_drop_stale)    a droppable event (IcdFrameRules) older than Protocol.EventStaleMs at dequeue is dropped, counted
 //   newest per NPC (mp_lane_newest_per_npc)  the anim and activity lanes keep only each NPC's newest waiting state (IcdCoalescingLane)
 //   the pipe's switches                mp_pipe_oversize_guard, mp_pipe_poll_age, mp_pipe_cb_lane, mp_pipe_config_replay (CombatPipe)
