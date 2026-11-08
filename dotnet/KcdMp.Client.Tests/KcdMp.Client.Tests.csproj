@@ -43,6 +43,7 @@
     <Compile Include="..\..\KCDMP_launcher\Models\ModSettingsReport.cs" Link="Launcher\ModSettingsReport.cs" />
     <!-- WO-159: the main menu's Start Game / Join Game (the model, the menu's choices, the joiner's words). -->
     <Compile Include="..\..\KCDMP_launcher\Models\MenuTakeover.cs" Link="Launcher\MenuTakeover.cs" />
+    <Compile Include="..\..\KCDMP_launcher\Models\CoopOptions.cs" Link="Launcher\CoopOptions.cs" />
     <!-- WO-175 S2: the rolling saves backups and their restore. -->
     <Compile Include="..\..\KCDMP_launcher\Models\Wo175Backup.cs" Link="Launcher\Wo175Backup.cs" />
   </ItemGroup>

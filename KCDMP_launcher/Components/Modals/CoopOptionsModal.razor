@@ -1,0 +1,81 @@
+@* Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
+   GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
+   content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
+   KCT QoL (IgnisComeDeliverance): the co-op options as switches, before a session -- the in-game mod menu's own choices. *@
+@inherits ModalBase
+@using KCDMP_launcher.Models
+
+@if (IsVisible)
+{
+    <div class="modal-overlay @(isClosing ? "closing" : "")">
+        <div class="modal-box coop-box" @onclick:stopPropagation="true">
+            <div class="modal-frame-top modal-frame-bg"></div>
+
+            <div class="modal-content" style="text-align: left;">
+                <div class="modal-title" style="text-align: center;">CO-OP OPTIONS</div>
+                <div class="kcd-hint coop-intro">
+                    These apply from your next session. You can also change them during play in the mod menu (Insert).
+                    The <b>World rules</b> are the host's: they apply to everyone when you host.
+                </div>
+
+                <div class="coop-scroll">
+                    <div class="coop-group">
+                        <div class="coop-group-title">Launching</div>
+                        <label class="coop-row">
+                            <input type="checkbox" @bind="Settings.AutoConnect" />
+                            <span class="coop-text">
+                                <span class="coop-label">Connect automatically</span>
+                                <span class="kcd-hint">Click Host or Join and you're in. The host connects once their world has loaded;
+                                    a joiner with a character joins with it as soon as the host is ready.</span>
+                            </span>
+                        </label>
+                    </div>
+
+                    @foreach (var group in CoopOptions.Groups)
+                    {
+                        <div class="coop-group">
+                            <div class="coop-group-title">@group @(group == "World rules" ? " (host)" : "")</div>
+                            @foreach (var opt in CoopOptions.All.Where(o => o.Group == group))
+                            {
+                                var key = opt.Key;
+                                <label class="coop-row">
+                                    <input type="checkbox" checked="@Values[key]" @onchange="e => Values[key] = e.Value is true" />
+                                    <span class="coop-text">
+                                        <span class="coop-label">@opt.Label</span>
+                                        <span class="kcd-hint">@opt.Help</span>
+                                    </span>
+                                </label>
+                            }
+                        </div>
+                    }
+                </div>
+
+                @if (!string.IsNullOrEmpty(Error))
+                {
+                    <div class="kcd-hint" style="color: var(--kcd-warn);">@Error</div>
+                }
+
+                <div class="modal-actions">
+                    <button class="kcd-btn primary" @onclick="OnSave">SAVE & CLOSE</button>
+                    <button class="kcd-btn" @onclick="ResetDefaults">DEFAULTS</button>
+                    <button class="kcd-btn" @onclick="CloseModalAsync">CANCEL</button>
+                </div>
+            </div>
+
+            <div class="modal-frame-bottom modal-frame-bg"></div>
+        </div>
+    </div>
+}
+
+@code {
+    [Parameter] public AppSettings Settings { get; set; } = new();
+    [Parameter] public Dictionary<string, bool> Values { get; set; } = CoopOptions.Read(null);
+    [Parameter] public string? Error { get; set; }
+    [Parameter] public EventCallback OnSave { get; set; }
+
+    private void ResetDefaults()
+    {
+        foreach (var o in CoopOptions.All) Values[o.Key] = o.Default;
+        Settings.AutoConnect = true;
+    }
+}

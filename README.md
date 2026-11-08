@@ -31,6 +31,8 @@ the cause of each bug: [docs/KCT-FIXES-sync-tpose.md](docs/KCT-FIXES-sync-tpose.
 - **Less rubber-banding:** a figure that runs out of updates waits and then catches up at 1.2x instead of jumping.
 - **Quiet console:** the mod's routine lines stay out of the ~ console (errors still show); `mp_quiet off` to see all.
 - **Partner badge:** a small marker coloured by their health instead of a name and numbers (`mp_badge_icon off` for the old one).
+- **Auto-join:** click Join in the launcher and you join your host as soon as they're ready, no CONNECT and no second click in game.
+- **Co-op options:** every co-op setting (friendly fire, crime, fast travel, badges...) as switches on the start screen.
 - **Launcher:** opens on two plain choices, **Host a game** and **Join a friend**, with the steps for each.
 - **Name:** IgnisComeDeliverance (window, installer, shortcuts, About box).
 

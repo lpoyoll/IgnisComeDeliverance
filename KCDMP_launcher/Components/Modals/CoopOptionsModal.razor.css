@@ -1,0 +1,39 @@
+.coop-box { width: min(760px, 94vw); }
+
+.coop-intro { margin: -6px 0 14px; text-align: center; }
+.coop-intro b { color: var(--kcd-parchment); font-weight: normal; }
+
+.coop-scroll {
+    max-height: 56vh;
+    overflow-y: auto;
+    padding-right: 8px;
+}
+
+.coop-group { margin-bottom: 16px; }
+
+.coop-group-title {
+    font-family: var(--kcd-font-special);
+    color: var(--kcd-gold);
+    font-size: 15px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    border-bottom: 1px solid var(--kcd-oak);
+    padding-bottom: 4px;
+    margin-bottom: 8px;
+}
+
+.coop-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 6px 4px;
+    cursor: pointer;
+}
+
+.coop-row:hover { background: rgba(217, 173, 77, 0.06); }
+
+.coop-row input { margin-top: 3px; flex: none; }
+
+.coop-text { display: flex; flex-direction: column; gap: 2px; }
+
+.coop-label { color: var(--kcd-parchment); font-size: 15px; }

@@ -139,3 +139,23 @@ old name and numbers.
 
 **Rename.** The mod menu title, the mod's toasts, the "could not connect" and "did not load" messages and Discord
 presence say IgnisComeDeliverance.
+
+## icd6: auto-join and the Co-op options window
+
+**Auto-join** (`AutoConnect` in the launcher's settings, on; "Connect automatically" in Co-op options). The launcher
+already pressed CONNECT itself when the host loaded a world through the mod's Start Game, and when a joiner pressed Join
+Game on the game's menu (WO-159). What was left: a joiner who had already pressed **Join** in the launcher still had to
+press Join Game again in the game. Now the launcher's Join is the join: a joiner with a character to bring waits for the
+host from the start and joins with that character the moment the host is ready (Cancel on the game's menu, then Join
+Game, to start fresh instead). A joiner with no character of their own still picks a new one on the game's menu.
+`MenuTakeoverRule.JoinerPreArm`.
+
+**Co-op options window** (start screen: "Co-op options"). Every choice the in-game mod menu remembers, as switches with
+a line of explanation each, in three groups: World rules (the host's: friendly fire, shared crime, fast travel, keep
+players together, quicksave), Playing together, On screen. It reads and writes the agent's own `mod-settings.json` (the
+same file the in-game menu writes), keeping every other key, so the two never disagree; changes apply at the next
+session. Defaults are the mod's own. `Models/CoopOptions.cs`, `Components/Modals/CoopOptionsModal.razor`; a test keeps
+its list identical to the agent's `Wo154MenuRules.Settings`.
+
+The ~130 engineering switches (`mp_...` commands) are not on this page: they are for testing a fix, not for playing
+(see docs/SWITCH-AUDIT.md).

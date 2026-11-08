@@ -53,6 +53,8 @@
     </div>
 
     <div class="hub-direct">
+        <span class="hub-link" @onclick="OnCoopOptions">Co-op options</span>
+        <span class="hub-sep">·</span>
         <span class="hub-link" @onclick="ToggleDirect">@(ShowDirect ? "▾" : "▸") Direct connect (LAN / VPN / an address)</span>
     </div>
 </div>
@@ -66,6 +68,7 @@
     [Parameter] public EventCallback OnJoin { get; set; }
     [Parameter] public EventCallback OnCheckSetup { get; set; }
     [Parameter] public EventCallback OnRestoreSaves { get; set; }
+    [Parameter] public EventCallback OnCoopOptions { get; set; }   // KCT QoL: the co-op options window
 
     private Task ToggleDirect() => ShowDirectChanged.InvokeAsync(!ShowDirect);
 }

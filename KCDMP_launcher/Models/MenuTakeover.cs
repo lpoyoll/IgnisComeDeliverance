@@ -169,6 +169,10 @@ namespace KCDMP_launcher.Models
         /// a moment before the gate opened was refused ("CONNECT not taken") and never tried again (0.45.6, live). A save
         /// loaded any other way keeps the button the player presses.
         /// </summary>
+        /// <summary>KCT QoL: the launcher's Join already said "join": a joiner with a character to bring is waiting for the host at once.</summary>
+        public static bool JoinerPreArm(bool autoConnect, bool hosting, bool bringPossible, string joinState) =>
+            autoConnect && !hosting && bringPossible && joinState == "idle";
+
         public static bool HostAutoConnect(bool hosting, bool menuLoad, GameStage stage, double worldSinceS, double nowS, bool waitingForConnect, bool gateOpen) =>
             hosting && menuLoad && waitingForConnect && gateOpen && stage == GameStage.World
             && !double.IsNaN(worldSinceS) && nowS - worldSinceS >= ConnectGateRule.SettleS;

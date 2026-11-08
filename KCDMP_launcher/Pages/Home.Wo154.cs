@@ -70,6 +70,45 @@ namespace KCDMP_launcher.Pages
             showSettings = true;
         }
 
+        // ------------------------------------------------------------ KCT QoL: the co-op options window
+
+        private bool showCoopOptions;
+        private Dictionary<string, bool> coopValues = CoopOptions.Read(null);
+        private string? coopError;
+
+        /// <summary>mod-settings.json beside the agent (where the agent reads and writes the in-game menu's choices).</summary>
+        private string CoopOptionsPath() =>
+            Path.Combine(Path.GetDirectoryName(ResolveAgainstLauncher(settings.AgentPath)) ?? AppContext.BaseDirectory, CoopOptions.FileName);
+
+        private void OpenCoopOptions()
+        {
+            settingsStore.Refresh(settings);
+            coopValues = CoopOptions.Load(CoopOptionsPath());
+            coopError = null;
+            showCoopOptions = true;
+        }
+
+        private void SaveCoopOptions()
+        {
+            string path = CoopOptionsPath();
+            if (!CoopOptions.Save(path, coopValues, out var err))
+            {
+                coopError = "Could not save the co-op options: " + err;
+                Log.Warning("MP-COOP-OPTIONS not saved to {Path}: {Why}", path, err);
+                return;
+            }
+            WriteSettings("the co-op options window");   // Connect automatically
+            Log.Information("MP-COOP-OPTIONS saved to {Path}: {Values}", path,
+                string.Join(' ', coopValues.Select(kv => $"{kv.Key}={(kv.Value ? "on" : "off")}")) + $" AutoConnect={(settings.AutoConnect ? "on" : "off")}");
+            showCoopOptions = false;
+        }
+
+        private void CancelCoopOptions()
+        {
+            settingsStore.Revert(settings);
+            showCoopOptions = false;
+        }
+
         /// <summary>The settings window closes without SAVE: its unsaved edits go back.</summary>
         private void CancelSettings()
         {

@@ -36,7 +36,8 @@
              OnHost="@OpenHostModal"
              OnJoin="@OpenJoinSteam"
              OnCheckSetup="@OpenSetupChecklist"
-             OnRestoreSaves="@(() => showRestoreSaves = true)" />
+             OnRestoreSaves="@(() => showRestoreSaves = true)"
+             OnCoopOptions="@OpenCoopOptions" />
 
     <div class="main-window @(isFilterOpen ? "shifted" : "") @(showDirectConnect ? "" : "hub-hidden")">
 
@@ -177,6 +178,13 @@
 <ExitModal  IsVisible="@showExitConfirm"
             OnConfirm="@ConfirmExit"
             OnClose="@(() => showExitConfirm = false)" />
+
+<CoopOptionsModal IsVisible="@showCoopOptions"
+                  Settings="@settings"
+                  Values="@coopValues"
+                  Error="@coopError"
+                  OnSave="@SaveCoopOptions"
+                  OnClose="@CancelCoopOptions" />
 
 <SettingsModal  IsVisible="@showSettings"
                 Settings="@settings"

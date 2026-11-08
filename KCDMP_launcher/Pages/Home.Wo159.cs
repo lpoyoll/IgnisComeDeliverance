@@ -142,6 +142,14 @@ namespace KCDMP_launcher.Pages
             string pushed = "";
             bool loadIssued = false, armedLogged = false, choicePosted = false, menuLoad = false, hostConnectTried = false;
             bool recapPending = false, recapSent = false;
+            // KCT QoL (AutoConnect): the launcher's Join was the "join" -- with a character to bring, wait for the host at once (no click in game)
+            var (bringOk, _) = MenuTakeoverRule.JoinChoice(w159Saves?.Usable.Count ?? 0, w159Saves?.HiddenRegular ?? 0, w159Saves?.HiddenCopies ?? 0);
+            if (MenuTakeoverRule.JoinerPreArm(settings.AutoConnect, hosting, bringOk, w159JoinState))
+            {
+                w159JoinChoice = "bring";
+                w159JoinState = "waiting";
+                Log.Information("MP-W159 auto-join: the launcher's Join, with this player's character -- joining as soon as the host is ready");
+            }
             GameStage lastStage = GameStage.Starting;
             DateTime connectedAt = DateTime.MinValue;
             Log.Information("MP-W159 menu driver on ({Role})", hosting ? "host" : "joiner");
@@ -236,7 +244,8 @@ namespace KCDMP_launcher.Pages
                     }
 
                     // the host: CONNECT pressed by the launcher once the world Start Game loaded has settled (no Alt+Tab)
-                    if (w159Takeover && !hostConnectTried && MenuTakeoverRule.HostAutoConnect(hosting, menuLoad, stage,
+                    if (w159Takeover && !hostConnectTried && MenuTakeoverRule.HostAutoConnect(hosting, menuLoad || settings.AutoConnect, stage,   // KCT: any load, with AutoConnect
+                           
                             follower?.State.WorldSinceS ?? double.NaN, now, launchStage == LaunchStage.WaitingForConnect, ConnectEnabled))
                     {
                         hostConnectTried = true;

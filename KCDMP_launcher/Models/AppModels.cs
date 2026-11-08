@@ -228,6 +228,11 @@ namespace KCDMP_launcher.Models
         // game's own menu. false = the game's own menu here too (the CONNECT flow as before).
         public bool MenuTakeover { get; set; } = true;
 
+        // KCT QoL: click Host or Join and you are in -- no CONNECT. The host connects once its world has loaded and settled (however the
+        // save was loaded); a joiner with a character to bring joins with it as soon as the host is ready (Cancel on the game's menu to
+        // start fresh instead). Needs MenuTakeover. false = the CONNECT button as before.
+        public bool AutoConnect { get; set; } = true;
+
         // WO-159: the bundled start save (a folder holding one save, or the file) a host's New adventure starts
         // from. Relative = next to the launcher, where Setup puts it.
         public string StartSavePath { get; set; } = "start-save";
