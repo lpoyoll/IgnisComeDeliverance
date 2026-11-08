@@ -4689,7 +4689,7 @@ end
 -- A: the AI flag follows the reasons (and the handover).
 local function npc_hold_apply_ai(name, h)
     local H = KCD2MP.npcHold
-    local base = H.aiOff and H.saveUntil == nil and KCD2MP.hitSensorOn ~= true and H.lent[name] == nil and npc_hold_copy_reason(h)
+    local base = H.aiOff and H.saveUntil == nil and not H.ending and KCD2MP.hitSensorOn ~= true and H.lent[name] == nil and npc_hold_copy_reason(h)
     if not base then npc_hold_set_ai(name, h, false, "apply"); return end
     if h.ai then return end
     local e = npc_hold_body(name)
@@ -4986,6 +4986,16 @@ function KCD2MP_NpcBeforeSave(why)
 end
 
 -- Everything back (session end, disconnect, the guard inactive, mp_resume_all, a switch off): AI flags off, engine resumed.
+-- The end begins: every AI flag back now (counted ai_restored_on_end); none set again until the end is over.
+function KCD2MP_NpcHoldAiEnd(why)
+    local H = KCD2MP.npcHold
+    H.ending = true
+    local n = 0
+    for name, h in pairs(H.held) do if h.ai then npc_hold_set_ai(name, h, false, "end"); n = n + 1 end end
+    H.stats.aiRestoredOnEnd = H.stats.aiRestoredOnEnd + n
+    return n
+end
+
 -- keepStream: the copy guard went inactive while the session may go on -- the stream's own reasons (puppet, released) stay with
 -- their copies (the puppet layer still believes them paused; the lease gives a silent one back), everything else goes.
 function KCD2MP_NpcHoldRestoreAll(why, keepStream)
@@ -5228,11 +5238,13 @@ local function mp_wo102_release(name, why)
 end
 
 local function mp_wo102_resume_all(why)
+    if KCD2MP_NpcHoldAiEnd then KCD2MP_NpcHoldAiEnd(why) end   -- KCT fix (icd14) A: every AI flag back first (counted)
     local names = {}
     for name in pairs(KCD2MP._npcPaused) do names[#names + 1] = name end
     for _, name in ipairs(names) do mp_wo102_resume(name, why) end
     if KCD2MP_W131UnparkAll then KCD2MP_W131UnparkAll(why) end   -- WO-131
-    if KCD2MP_NpcHoldRestoreAll then KCD2MP_NpcHoldRestoreAll(why) end   -- KCT fix (icd14) A/B: every hold and AI flag back
+    if KCD2MP_NpcHoldRestoreAll then KCD2MP_NpcHoldRestoreAll(why) end   -- KCT fix (icd14) A/B: every remaining hold and handover back
+    if KCD2MP.npcHold then KCD2MP.npcHold.ending = nil end
 end
 
 -- Every KCD2MP_NpcSyncTick (100 ms): dwell deadlines.
