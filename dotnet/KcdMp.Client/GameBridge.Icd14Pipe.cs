@@ -71,12 +71,12 @@ public partial class GameBridge
     }
 
     /// <summary>mp_proc_drop_stale: a droppable event (IcdFrameRules) that waited longer than Protocol.EventStaleMs is dropped at dequeue.</summary>
-    private bool IcdDropStaleAtDequeue(int type, long arrival)
+    private bool IcdDropStaleAtDequeue(int type, byte[] payload, long arrival)
     {
         if (arrival <= 0) return false;
         long wait = (Stopwatch.GetTimestamp() - arrival) * 1000 / Stopwatch.Frequency;
         _procHealth.NoteProcessorWait(wait);
-        if (!W213On("proc_drop_stale") || !IcdFrameRules.DropAtDequeue(type, wait)) return false;
+        if (!W213On("proc_drop_stale") || !IcdFrameRules.DropAtDequeue(type, payload, wait)) return false;
         _procHealth.NoteDroppedStale(type);
         Wo207Trace.Dropped(type);
         long n = Interlocked.Increment(ref _icdStaleDropped);

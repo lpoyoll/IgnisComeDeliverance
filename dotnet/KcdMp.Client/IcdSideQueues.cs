@@ -252,9 +252,24 @@ public static class IcdFrameRules
         return Kind.Droppable;
     }
 
+    /// <summary>
+    /// The kind of this frame: as <see cref="Of(int)"/>, except a combat cue's draw or sheathe (0x2D event 0 / 1) -- the figure's
+    /// weapon state, never a moment: a lost one leaves the figure armed or bare until the next.
+    /// </summary>
+    public static Kind Of(int type, ReadOnlySpan<byte> payload)
+    {
+        if (type == Protocol.CombatEventDown && payload.Length >= 2
+            && payload[1] is Protocol.CombatEventWeaponDrawn or Protocol.CombatEventWeaponSheathed) return Kind.NeverDrop;
+        return Of(type);
+    }
+
     /// <summary>Dropped at dequeue: a droppable kind that waited longer than <paramref name="staleMs"/>.</summary>
     public static bool DropAtDequeue(int type, long waitedMs, int staleMs = Protocol.EventStaleMs) =>
         waitedMs > staleMs && Of(type) == Kind.Droppable;
+
+    /// <summary>Dropped at dequeue: this frame is droppable (<see cref="Of(int, ReadOnlySpan{byte})"/>) and waited longer than <paramref name="staleMs"/>.</summary>
+    public static bool DropAtDequeue(int type, ReadOnlySpan<byte> payload, long waitedMs, int staleMs = Protocol.EventStaleMs) =>
+        waitedMs > staleMs && Of(type, payload) == Kind.Droppable;
 }
 
 /// <summary>KCT fix (icd14): the side lanes' and the processor's counters for the 10 s <c>MP-HEALTH area=proc</c> line.</summary>

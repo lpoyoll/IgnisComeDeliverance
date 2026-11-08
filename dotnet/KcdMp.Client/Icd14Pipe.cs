@@ -67,10 +67,10 @@ public static class PipeRules
     private static readonly HashSet<byte> StickyTypes = [SetSession, SetRespawn, NpcConfig, MotionConfig, HitsConfig, SetPartner];
     private static readonly Dictionary<byte, HashSet<int>> StickyOps = new()
     {
-        [Wo132] = [15, 16],                          // mp_skirmish_keep, mp_plan_in_fight (GameBridge.Wo207PushNativeSwitchAsync)
+        [Wo132] = [13, 15, 16],                      // mp_host_target (Wo154PushNativeAsync), mp_skirmish_keep, mp_plan_in_fight (Wo207PushNativeSwitchAsync)
         [Wo137] = [1],
         [Wo138] = [Wo138Codec.OpConfig, Wo138Codec.OpLevers],
-        [Wo139] = [1],
+        [Wo139] = [1, 5],                            // the crime config, the punishment time-set switch
         [Wo140] = [1],                               // the sleep gate
         [Wo141] = [1],
         [Wo143] = [1],
