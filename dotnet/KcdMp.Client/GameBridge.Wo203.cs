@@ -98,6 +98,8 @@ public partial class GameBridge
                 Wo203JoinOnFrame(src, m); break;
             case Protocol.W203Behind:   // KCT QoL
                 Wo203CatchUpOnFrame(src, m); break;
+            case Protocol.W203Health:   // KCT diag (icd14)
+                IcdHealthOnPeer(src, m); break;
             case Protocol.W203FocusEdge:
                 Wo203QuestOnFrame(src, m); break;
             case Protocol.W203DigestCheckpoint:   // WO-206 C

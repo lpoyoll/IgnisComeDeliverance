@@ -1,4 +1,4 @@
-﻿// Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 namespace KcdMp.Wire;
@@ -92,7 +92,8 @@ public static partial class Protocol
                       W203DigestCheckpoint = 10,   // WO-206 C (ProtocolWo206.cs)
                       W203Epoch = 11,   // WO-206 E
                       W203FigureHand = 12,   // WO-214 F (ProtocolWo214.cs)
-                      W203Behind = 13;      // KCT QoL: the joiner's "ms behind" (IcdCatchUpRules), every 2 s
+                      W203Behind = 13,      // KCT QoL: the joiner's "ms behind" (IcdCatchUpRules), every 2 s
+                      W203Health = 14;      // KCT diag (icd14): one area of the sender's MP-HEALTH (HealthHub.PeerText), every 30 s
 
     public static string W203KindName(byte k) => k switch
     {
@@ -101,6 +102,7 @@ public static partial class Protocol
         W203FocusEdge => "focus-edge", W203TravelRoute => "travel-route", W203DigestCheckpoint => "digest-checkpoint", W203Epoch => "epoch",
         W203FigureHand => "figure-hand",
         W203Behind => "behind",
+        W203Health => "health",
         _ => $"unknown-{k}",
     };
 

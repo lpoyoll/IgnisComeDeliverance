@@ -51,7 +51,7 @@ public partial class GameBridge
         {
             try { await Task.Delay(1000, ct); } catch { break; }
             try { Wo204HeartbeatOnce(); } catch (Exception ex) { Console.WriteLine($"MP-W204 heartbeat: {ex.GetType().Name}: {ex.Message}"); }
-            try { IcdCatchUpReportTick(); IcdCatchUpHostTick(); } catch (Exception ex) { Console.WriteLine($"MP-CATCHUP tick: {ex.GetType().Name}: {ex.Message}"); }   // KCT QoL
+            try { IcdCatchUpReportTick(); IcdCatchUpHostTick(); IcdHealthTick(); } catch (Exception ex) { Console.WriteLine($"MP-CATCHUP tick: {ex.GetType().Name}: {ex.Message}"); }   // KCT QoL
         }
     }
 

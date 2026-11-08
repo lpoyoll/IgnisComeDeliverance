@@ -58,6 +58,7 @@ public sealed class TeeTextWriter(TextWriter primary, TextWriter secondary) : Te
     public override void WriteLine(string? value)
     {
         System.Threading.Interlocked.Increment(ref LinesWritten);
+        HealthHub.Observe("agent", value);   // KCT diag (icd14)
         primary.WriteLine(value);
         if (_secondaryDead) return;
         try
