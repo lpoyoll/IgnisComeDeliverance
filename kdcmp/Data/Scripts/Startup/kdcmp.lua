@@ -35265,6 +35265,7 @@ do
         figure_playout = "mp_figure_playout",
         figure_band = "mp_figure_band",
         catch_up = "mp_catch_up",
+        pure_copy = "mp_pure_copy",   -- KCT fix (icd14) A
         line_latency = "mp_line_latency",
         link_toast = "mp_link_toast",
     }
@@ -35281,6 +35282,7 @@ do
         figure_playout = "E.5: (both) the partner's figure on the same play-out as the copies",
         figure_band = "D.4: (both) the figures in the top band: this player's position is read every frame it moves, never behind NPC states",
         catch_up = "KCT: (joiner) a body that runs out of samples waits, then replays the gap at 1.2x instead of jumping (rubber-banding)",
+        pure_copy = "KCT fix (icd14) A: (joiner) a host copy is a pure puppet: its loaded NPC state (the planner's demand) is written once, not on every activity change",
         line_latency = "E.4: (both) a joined conversation's late line keeps its voice inside its window and never cuts the one before",
         link_toast = "G: (joiner) a plain word when the link to the host is poor for 10 s",
     }
