@@ -1945,6 +1945,7 @@ public partial class GameBridge(ClientConfig config)
             tailForPause.SceneStage += Wo167OnSceneStage;            // WO-167 T4: a conversation's scene
             tailForPause.ModInitDetected += OnModInitDetected;       // WO-98 Phase 7
             tailForPause.QuietProbeSeen += OnQuietProbeSeen;         // KCT QoL: the quiet console
+            tailForPause.ModLogLine += line => HealthHub.Observe("lua", line);   // KCT diag (icd14): the mod's MP-HEALTH lines
             tailForPause.GameplayStarted += Wo122OnGameplayStarted;  // WO-122
             tailForPause.AutoSaveRefused += Wo122OnAutoSaveRefused;  // WO-122
             tailForPause.GameplayStarted += Wo123OnGameplayStarted;  // WO-123: a host load ends a join

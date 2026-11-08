@@ -9,12 +9,12 @@ namespace KcdMp.Client;
 // since the agent started (a reader takes differences); the *_ms quantiles, *_max and bytes_per_s are of the last window only.
 
 /// <summary>A small window of millisecond samples (quantiles on take); thread-safe.</summary>
-public sealed class MsWindow
+public sealed class LuaMsWindow
 {
     private readonly object _lock = new();
     private readonly List<double> _v = new(256);
     private readonly int _cap;
-    public MsWindow(int cap = 4096) => _cap = cap;
+    public LuaMsWindow(int cap = 4096) => _cap = cap;
 
     public void Add(double ms) { lock (_lock) if (_v.Count < _cap) _v.Add(ms); }
 
@@ -34,7 +34,7 @@ public sealed class MsWindow
 public sealed class LuaHealth
 {
     public long SentBatches, BatchTimeouts, RecoveryDrains;
-    public readonly MsWindow AnswerMs = new();
+    public readonly LuaMsWindow AnswerMs = new();
 
     public void Sent(double answerMs) { Interlocked.Increment(ref SentBatches); AnswerMs.Add(answerMs); }
 
