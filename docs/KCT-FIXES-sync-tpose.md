@@ -176,3 +176,18 @@ agent would have been dropped. Now:
 The same evening's join itself worked end to end: the joiner's launcher Join auto-connected from the main menu, the
 host's world arrived in 6 s, the load took 118 s (106 s of it the game reading the save), and the joiner was placed 3.4 m
 beside the host.
+
+## icd9: the let-go loop that flooded NPC animation queues (a regression from this fork's first pass)
+
+Live, 2026-11-08 (joiner, 3 minutes after joining): the game stopped answering the agent (its queue 150 s behind, ping
+20 ms), kcd.log grew to 32 MB with `Mannequin Error, attempting to queue too many actions on entity 'ttkc_man_31' (queue
+size = 459, but only up to 10 allowed)` and each queue listed, for every copy of the host's NPCs nearby; the native log
+had 5,507 `WO208-OWN let go ... (the host's stream is quiet)`, the same copy about 50 times a second.
+
+Cause: two of this fork's first-pass fixes together. `oc.lastState` became the newest state's arrival (so a copy the host
+stopped streaming is let go), and the let-go gives a copy with no base a neutral idle. But a copy's state queue always
+keeps its picked entry: the tick after the let-go owned the copy again from that same old state, found it quiet, let it go
+and queued another idle -- every frame. Fixed:
+
+- a quiet let-go drops the copy's states too (`g_copyStates.erase`): only a new state from the host owns it again;
+- the let-go's base is given at most once per copy every 10 s, whatever loop ever lets a copy go again and again.

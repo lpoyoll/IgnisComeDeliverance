@@ -1071,7 +1071,14 @@ void own_release(uint32_t eid, OwnCopy& oc, double now, const char* why, uint8_t
         oc.host = keep; oc.hostHave = keepHave;
         // KCT fix (WO-214 C.1 owner_base, which was never wired to the let-go): the hand-over can refuse (a long queue) and leave
         // nothing -- once let go the copy leaves g_owned, so neither rule 1 nor the watchdog would ever give it a base again
-        if (!handed && !oc.baseAct && wo214::on(wo214rules::kBitOwnerBase)) {
+        // KCT fix: at most one such base per copy every 10 s -- whatever loop ever lets a copy go again and again, it can never fill
+        // the engine's action queue (10 allowed; the icd8 live churn queued 460)
+        static std::unordered_map<uint32_t, double> s_letGoBaseAt;
+        auto lg = s_letGoBaseAt.find(eid);
+        const bool letGoBaseDue = lg == s_letGoBaseAt.end() || now - lg->second >= 10.0;
+        if (!handed && !oc.baseAct && letGoBaseDue && wo214::on(wo214rules::kBitOwnerBase)) {
+            s_letGoBaseAt[eid] = now;
+            if (s_letGoBaseAt.size() > 4096) s_letGoBaseAt.clear();
             HostScope b{};
             bool given = false;
             const bool nk = neutral_idle(eid, &b);
@@ -1268,7 +1275,14 @@ void owner_tick(double now) {
     // a copy the stream has not spoken of for 3 s is let go (its own engine and the old writers again)
     for (auto it = g_owned.begin(); it != g_owned.end();) {
         // 2.5 resends (5 s): one lost 2 s heartbeat never lets a standing copy go
-        if (now - it->second.lastState > 2.5 * wo208rules::kResendS || !engine::entity_by_id(it->first)) { own_release(it->first, it->second, now, "the host's stream is quiet", wo210rules::kPathFar); it = g_owned.erase(it); }
+        if (now - it->second.lastState > 2.5 * wo208rules::kResendS || !engine::entity_by_id(it->first)) {
+            own_release(it->first, it->second, now, "the host's stream is quiet", wo210rules::kPathFar);
+            // KCT fix (icd8 live: 5,507 let-gos, Mannequin queues of 300-460): the state queue keeps its picked entry, so the next tick
+            // re-owned the copy from that same old state, found it quiet again and let it go again -- every frame, a base queued each
+            // time. Its states go with it: only a NEW state from the host owns it again.
+            g_copyStates.erase(it->first);
+            it = g_owned.erase(it);
+        }
         else ++it;
     }
 }
