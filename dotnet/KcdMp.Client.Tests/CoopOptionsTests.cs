@@ -76,3 +76,16 @@ public class CoopOptionsTests
     public void Join_waits_for_the_host_at_once_only_with_a_character_to_bring(bool auto, bool hosting, bool bring, string state, bool expected) =>
         Assert.Equal(expected, MenuTakeoverRule.JoinerPreArm(auto, hosting, bring, state));
 }
+
+public class HostingLaunchTests
+{
+    [Theory]
+    [InlineData(true, null, "127.0.0.1", 7777, 7777, true)]       // the Host button: this PC's relay, its own address and port
+    [InlineData(true, "ABCD-1234", "", 0, 7777, false)]            // a Steam join to a friend while this PC's relay still runs: NOT hosting
+    [InlineData(true, null, "203.0.113.5", 7777, 7777, false)]     // a direct join to a friend's address while the relay runs
+    [InlineData(true, null, "127.0.0.1", 7790, 7777, false)]       // another relay port on this PC (a second install's)
+    [InlineData(false, null, "127.0.0.1", 7777, 7777, false)]      // the relay is not running: nothing to host on
+    [InlineData(true, null, "localhost", 7777, 7777, true)]
+    public void Only_a_launch_to_this_PCs_own_running_relay_is_the_hosts(bool relay, string? steam, string ip, int port, int hostPort, bool expected) =>
+        Assert.Equal(expected, ConnectGateRule.IsHostingLaunch(relay, steam, ip, port, hostPort));
+}

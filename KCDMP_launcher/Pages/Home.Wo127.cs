@@ -282,7 +282,7 @@ namespace KCDMP_launcher.Pages
             string agentPath = ResolveAgainstLauncher(settings.AgentPath);
             // WO-50: --hosting is also WO-127's host claim (the relay makes this agent
             // the authority whatever order people connect in).
-            bool isHosting = hostedRelayProcess != null && !hostedRelayProcess.HasExited;
+            bool isHosting = HostingLaunch(server);   // KCT fix: this launch is the host's, not merely "a relay runs here"
             string target = server.SteamCode is { } code
                 ? $"--steam \"{code}\" --steam-app {settings.SteamAppId}{SteamGameArg}"
                 : $"--host {server.Ip} --port {server.Port}";

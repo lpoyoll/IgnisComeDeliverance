@@ -495,7 +495,7 @@ namespace KCDMP_launcher.Pages
             await Wo175BackupBeforeSessionAsync();
 
             // WO-159: the first-run pages (read only), the host's start save staged, the player's worlds listed
-            if (!await Wo159BeforeLaunchAsync(hostedRelayProcess != null && !hostedRelayProcess.HasExited))
+            if (!await Wo159BeforeLaunchAsync(HostingLaunch(server)))
                 return;
 
             try
@@ -527,8 +527,8 @@ namespace KCDMP_launcher.Pages
                 launchStage = LaunchStage.WaitingForConnect;
                 launchStatusMessage = "Waiting for the game to start...";
                 // WO-154: CONNECT waits until it can work (the host's world, the joiner's host), with the reason shown.
-                StartConnectGate(hostedRelayProcess != null && !hostedRelayProcess.HasExited, server, gameStartLocal);
-                Wo159StartDriver(gameProcess, hostedRelayProcess != null && !hostedRelayProcess.HasExited, gameStartLocal);   // WO-159
+                StartConnectGate(HostingLaunch(server), server, gameStartLocal);
+                Wo159StartDriver(gameProcess, HostingLaunch(server), gameStartLocal);   // WO-159
                 StateHasChanged();
 
                 if (!await WaitForInjectableAsync(gameProcess, settings.InjectDelaySeconds))
@@ -546,7 +546,7 @@ namespace KCDMP_launcher.Pages
                 pendingGameExe = settings.GamePath;   // WO-157: the load checks it is this game
                 // WO-140: the joiner's flow is the main menu (a joiner who loads his own save plays alone,
                 // in a separate world -- the field trap); only the host loads a save first.
-                bool hostingNow = hostedRelayProcess != null && !hostedRelayProcess.HasExited;
+                bool hostingNow = HostingLaunch(server);
                 launchStatusMessage = hostingNow
                     ? (w159Takeover ? (settings.AutoConnect ? "Press Start Game on the game's main menu and pick your world. You connect automatically once you're in." : "Press Start Game on the game's main menu. The launcher connects by itself once your world has loaded.")
                                     : "Load into your save, then click CONNECT once you can see and move your character.")
@@ -943,6 +943,10 @@ namespace KCDMP_launcher.Pages
                 return true;
             }
         }
+
+        /// <summary>KCT fix: this launch goes to this PC's own running relay (Models/ConnectGate.cs IsHostingLaunch).</summary>
+        private bool HostingLaunch(ServerInfo s) =>
+            ConnectGateRule.IsHostingLaunch(hostedRelayProcess != null && !hostedRelayProcess.HasExited, s.SteamCode, s.Ip, s.Port, settings.HostPort);
 
         private Task LaunchAsHost()
         {

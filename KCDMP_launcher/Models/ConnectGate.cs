@@ -45,6 +45,16 @@ namespace KCDMP_launcher.Models
     /// </summary>
     public static class ConnectGateRule
     {
+        /// <summary>
+        /// KCT fix: is THIS launch the host's? Only when this PC's relay is running AND the launch goes to it (the Host button's
+        /// 127.0.0.1:HostPort). "The relay is running" alone made a Join to a friend -- after hosting earlier, or with a relay
+        /// reused from an earlier launcher -- the host's launch: "Load your save first", the save loaded alone, and the agent
+        /// started with --hosting, claiming the host's authority on the friend's relay.
+        /// </summary>
+        public static bool IsHostingLaunch(bool relayRunning, string? steamCode, string? ip, int port, int hostPort) =>
+            relayRunning && steamCode is null && port == hostPort
+            && ip is "127.0.0.1" or "localhost" or "::1" or "[::1]";
+
         public const double SettleS = 10;
         public const double UnreadableOpenAfterS = 45;
 
