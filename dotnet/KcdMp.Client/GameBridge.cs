@@ -6345,6 +6345,9 @@ public partial class GameBridge(ClientConfig config)
             case string w214 when w214.StartsWith("w214_", StringComparison.Ordinal):   // WO-214: the switches, the status, F's hands
                 Wo214OnEvent(name, arg);
                 return;
+            case string icd14 when icd14.StartsWith("icd14_", StringComparison.Ordinal):   // KCT fix (icd14): switches, status, the area snapshot
+                Icd14OnEvent(name, arg);
+                return;
             case "w206_cfg":         // WO-206 E: mp_epoch_check, mp_research_death_from_health
             case "w206_status":      // WO-206 E: mp_w206_status
                 Wo206OnEvent(name, arg);

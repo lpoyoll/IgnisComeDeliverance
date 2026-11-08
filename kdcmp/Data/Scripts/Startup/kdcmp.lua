@@ -15760,6 +15760,407 @@ function KCD2MP_W177CorpseAnswer(text)
 end
 KCD2MP_W177CorpseArm()
 
+-- ===== KCT fix (icd14): one world, the host's -- the crime ledger, the area snapshot, the switches =====
+-- The joiner's world is corrected from the host's, not only checked (the agent: GameBridge.Icd14.cs, the pure rules Icd14World.cs).
+--   mp_icd_quest_push    (on)  host -> joiner every 30 s: the digest quest map compared bucket by bucket; a differing int/bool/uint quest
+--                              State that stood 20 s is written to the host's value by path (the agent and the DLL; ICD14-QUEST lines)
+--   mp_icd_clock_follow  (on)  joiner: the host's clock followed continuously -- a slew under 150 game s, a set above (ICD14-CLOCK)
+--   mp_icd_crime_ledger  (on)  joiner, in a session: the host's crime ledger is the only one. This world's own witnesses forget what they
+--                              perceived (the game's crime:forgetCrimesData, the mechanism WO-151 5.3 already uses: no Lua setter for the
+--                              crime_disableReport context exists on this build, WO-65) -- after each of the joiner's crimes (now, 2 s and
+--                              6 s later) and every 10 s; a guard copy's stop forgets what the stop planted when it ends. Off, or the
+--                              session's end: nothing is sent any more (nothing else was changed -- the game's own crime runs as before)
+--   mp_icd_area_snapshot (on)  joiner: at a join or load, after a jump of 80 m (fast travel) and every 30 s, the host sends the doors
+--                              (open / locked), its corpses and which of the joiner's corpses live there, within 60 m of the joiner;
+--                              a door or body not here yet is tried again (5 times, 6 s apart) -- ICD14-SNAP lines
+--   mp_icd_corpse_revive (OFF) joiner: a body dead here that the host's world has alive gets the engine's actor:Revive(false) -- WO-135's
+--                              verb, observed for a knockout only, never for a death; off it is counted and logged (revive_wanted)
+-- MP-HEALTH area=world part=lua every 10 s (the dashboard).
+do
+    local I = KCD2MP.icd14 or {}
+    KCD2MP.icd14 = I
+    I.NAMES = { quest_push = "mp_icd_quest_push", clock_follow = "mp_icd_clock_follow", crime_ledger = "mp_icd_crime_ledger",
+                area_snapshot = "mp_icd_area_snapshot", corpse_revive = "mp_icd_corpse_revive" }
+    I.HELP = {
+        quest_push = "(both) the host's quest values pushed every 30 s; a differing int/bool/uint quest State written to the host's",
+        clock_follow = "(joiner) the host's clock followed continuously: a slew for a small error, a set above 150 game s",
+        crime_ledger = "(joiner) the host's crime ledger is the only one: this world's witnesses forget, a stop forgets what it planted",
+        area_snapshot = "(both) doors, corpses and the living around the joiner from the host's world at a join, a jump and every 30 s",
+        corpse_revive = "(joiner) a body dead here but alive in the host's world is revived (the engine's Revive; unverified for a death)",
+    }
+    I.DEFAULT_OFF = { corpse_revive = true }
+    I.on = I.on or {}
+    I.st = I.st or { crimeSuppressed = 0, crimePlanted = 0, crimeCleared = 0, crimeSweeps = 0, snapAsks = 0, snapBuilt = 0, snapParts = 0,
+                     snapApplied = 0, snapRetries = 0, snapNotFound = 0, doorsFixed = 0, corpsesFixed = 0, revives = 0, reviveWanted = 0 }
+    I.gen = I.gen or 0
+    I.tickS = 2
+    I.crimeRadiusM, I.crimeEveryS = 40, 10
+    I.snapRadiusM, I.snapEveryS, I.snapMoveM, I.snapMaxTries, I.snapRetryS = 60, 30, 80, 5, 6
+    I.healthEveryS, I.cfgEveryS = 10, 30
+    I.later = I.later or {}        -- "D:<key>" / "C:<npc>" -> { it = item, tries = n, dueAt = t }
+    I.killAsked = I.killAsked or {}
+    I.crimeFollow = I.crimeFollow or {}
+
+    function KCD2MP_Icd14IsOn(k)
+        if I.on[k] == nil then return not I.DEFAULT_OFF[k] end
+        return I.on[k] == true
+    end
+
+    function KCD2MP_Icd14Set(k, arg)
+        local label = I.NAMES[tostring(k)]
+        if not label then mp_log("ICD14-TOGGLE unknown switch '" .. tostring(k) .. "'"); return false end
+        local v = KCD2MP_Wo122ParseBool(arg)
+        if v == "bad" then mp_log(label .. ": expected on|off, got '" .. tostring(arg) .. "'"); return false end
+        if v ~= nil then
+            I.on[k] = v
+            if k == "area_snapshot" and not v then I.later = {} end
+        end
+        local on = KCD2MP_Icd14IsOn(k)
+        mp_log("ICD14-TOGGLE " .. label .. " " .. (on and "on" or "off"))
+        KCD2MP_EmitEvent("icd14_cfg", tostring(k) .. "=" .. (on and "on" or "off"))
+        return true
+    end
+
+    local function joiner() return KCD2MP_W134JoinerActive ~= nil and KCD2MP_W134JoinerActive() == true end
+    local function host() return KCD2MP_W134HostActive ~= nil and KCD2MP_W134HostActive() == true end
+    local function crimeSession() return KCD2MP_W139JoinerActive ~= nil and KCD2MP_W139JoinerActive() == true end
+    local function pos(e)
+        local p = nil
+        pcall(function() p = e:GetWorldPos() end)
+        return p
+    end
+    local function name(e)
+        local n = nil
+        pcall(function() n = e:GetName() end)
+        return n
+    end
+    local function isDead(e)
+        local d = false
+        pcall(function() d = e.actor ~= nil and e.actor:IsDead() == true end)
+        return d
+    end
+
+    function KCD2MP_Icd14Health()
+        local pending = 0
+        for _ in pairs(I.later) do pending = pending + 1 end
+        local s = I.st
+        local line = string.format("MP-HEALTH area=world part=lua role=%s crime_ledger=%s crime_local_suppressed=%d crime_sweeps=%d crime_planted=%d crime_cleared=%d area_snapshot=%s snapshot_asks=%d snapshot_built=%d snapshot_parts=%d snapshot_applied=%d snapshot_retries=%d snapshot_not_found=%d snapshot_pending=%d doors_fixed=%d corpses_fixed=%d revives=%d revive_wanted=%d corpse_revive=%s",
+            joiner() and "joiner" or host() and "host" or "none", KCD2MP_Icd14IsOn("crime_ledger") and "on" or "off", s.crimeSuppressed, s.crimeSweeps,
+            s.crimePlanted, s.crimeCleared, KCD2MP_Icd14IsOn("area_snapshot") and "on" or "off", s.snapAsks, s.snapBuilt, s.snapParts, s.snapApplied,
+            s.snapRetries, s.snapNotFound, pending, s.doorsFixed, s.corpsesFixed, s.revives, s.reviveWanted, KCD2MP_Icd14IsOn("corpse_revive") and "on" or "off")
+        mp_log(line)
+        return line
+    end
+
+    function KCD2MP_Icd14Status()
+        local parts = {}
+        for k, label in pairs(I.NAMES) do parts[#parts + 1] = label .. "=" .. (KCD2MP_Icd14IsOn(k) and "on" or "off") end
+        table.sort(parts)
+        mp_log("ICD14-STATUS " .. table.concat(parts, " "))
+        KCD2MP_Icd14Health()
+        KCD2MP_EmitEvent("icd14_status", "")
+        return true
+    end
+
+    -- ---- 3. the crime ledger (joiner) ----------------------------------------------------------------------------
+    -- The game's own forgetting to every NPC near this player whose brain runs here (a suspended copy perceives nothing; the guard of a
+    -- running stop keeps what the stop planted; a stopped guard's return is left alone).
+    function KCD2MP_Icd14CrimeSweep(why)
+        if not (KCD2MP_Icd14IsOn("crime_ledger") and crimeSession()) then return 0 end
+        local w = KCD2MP.w139
+        local pp = pos(player)
+        if not pp then return 0 end
+        local ents = {}
+        pcall(function() ents = System.GetEntitiesInSphere(pp, I.crimeRadiusM) or {} end)
+        local sent = 0
+        for _, e in ipairs(ents) do
+            if (e.class == "NPC" or e.class == "NPC_Female") and e.this and e ~= player and not (KCD2MP_W139IsAvatar and KCD2MP_W139IsAvatar(e)) then
+                local n = name(e)
+                local skip = n == nil or (KCD2MP._npcPaused and KCD2MP._npcPaused[n]) or (w and w.stop and w.stop.guard == n) or (w and w.stopped and w.stopped[n])
+                if not skip and not isDead(e) then
+                    local t = nil
+                    pcall(function() t = XGenAIModule.MakeTableFromType("crime:forgetCrimesData") end)
+                    if t then
+                        pcall(function() t.self = e.this.id end)
+                        if pcall(function() XGenAIModule.SendMessageToEntityData(e.this.id, "crime:forgetCrimesData", t) end) then sent = sent + 1 end
+                    end
+                end
+            end
+        end
+        I.st.crimeSweeps = I.st.crimeSweeps + 1
+        I.st.crimeLastSweepAt = os.clock()
+        I.st.crimeSuppressed = I.st.crimeSuppressed + sent
+        if sent > 0 and (I.st.crimeSweeps <= 20 or I.st.crimeSweeps % 50 == 0 or string.find(tostring(why), "crime:", 1, true)) then
+            mp_log(string.format("ICD14-CRIME suppressed why=%s npcs=%d radius_m=%d -- this world's witnesses forget; the host's ledger is the only one",
+                tostring(why), sent, I.crimeRadiusM))
+        end
+        return sent
+    end
+
+    -- WO-139's report of the joiner's own crime (sent to the host's ledger): this world's witnesses forget it now and as their perception lands.
+    function KCD2MP_Icd14CrimeSeen(kind)
+        if not (KCD2MP_Icd14IsOn("crime_ledger") and crimeSession()) then return end
+        KCD2MP_Icd14CrimeSweep("crime:" .. tostring(kind))
+        local now = os.clock()
+        I.crimeFollow = { now + 2, now + 6 }
+    end
+
+    -- WO-139's stop ends: the guard copy forgets what the stop planted (true = sent: its suspension waits 1.5 s for its brain to take it).
+    function KCD2MP_Icd14StopConsumed(e, s, result)
+        if not KCD2MP_Icd14IsOn("crime_ledger") or not (e and e.this) then return false end
+        local t = nil
+        pcall(function() t = XGenAIModule.MakeTableFromType("crime:forgetCrimesData") end)
+        if not t then return false end
+        pcall(function() t.self = e.this.id end)
+        local ok = pcall(function() XGenAIModule.SendMessageToEntityData(e.this.id, "crime:forgetCrimesData", t) end)
+        local n = #((s and s.planted) or {})
+        if ok then I.st.crimeCleared = I.st.crimeCleared + n end
+        mp_log(string.format("ICD14-CRIME stop-consumed guard=%s id=%s planted=%d result=%s sent=%s -- the copy forgets the stop's crimes; the host's ledger keeps what still stands",
+            tostring(s and s.guard), tostring(s and s.id), n, tostring(result), tostring(ok)))
+        return ok
+    end
+
+    -- ---- 4. the area snapshot ------------------------------------------------------------------------------------
+    local function localCorpses(pp, r)
+        local out = {}
+        local ents = {}
+        pcall(function() ents = System.GetEntitiesInSphere(pp, r) or {} end)
+        for _, e in ipairs(ents) do
+            if #out >= 30 then break end
+            local dead, nm = false, nil
+            if KCD2MP_W177IsDeadNpc then dead, nm = KCD2MP_W177IsDeadNpc(e) end
+            if dead and nm then out[#out + 1] = nm end
+        end
+        table.sort(out)
+        return out
+    end
+
+    function KCD2MP_Icd14SnapAsk(why)
+        if not (KCD2MP_Icd14IsOn("area_snapshot") and joiner()) then return false end
+        local pp = pos(player)
+        if not pp then return false end
+        local c = localCorpses(pp, I.snapRadiusM)
+        I.lastAskAt, I.lastAskPos = os.clock(), { x = pp.x, y = pp.y, z = pp.z }
+        I.st.snapAsks = I.st.snapAsks + 1
+        KCD2MP_EmitEvent("icd14_snap_ask", string.format("%.1f %.1f %.1f %d %s %s", pp.x, pp.y, pp.z, I.snapRadiusM, tostring(why),
+            #c > 0 and table.concat(c, ",") or "-"))
+        return true
+    end
+
+    -- Host: what this world has around the joiner's spot, in parts the agent sends him (icd14_snap_part <peer> <sid> <part> <n> <items>).
+    --   D:<door key>:<dir>:<locked 0|1>:<x>:<y>:<z>   C:<npc>:<x>:<y>:<z> (dead here)   A:<npc>:<x>:<y>:<z> (one he asked about, alive here)
+    function KCD2MP_Icd14SnapBuild(peer, sid, x, y, z, r, why, corpsesCsv)
+        if not (KCD2MP_Icd14IsOn("area_snapshot") and host()) then return 0 end
+        local W = KCD2MP.w151
+        local c = { x = tonumber(x) or 0, y = tonumber(y) or 0, z = tonumber(z) or 0 }
+        r = math.min(tonumber(r) or I.snapRadiusM, 100)
+        local items = {}
+        if W and W.doorNameHash and W.doorState then
+            local doors = {}
+            pcall(function() doors = System.GetEntitiesInSphereByClass(c, r, "AnimDoor") or {} end)
+            for _, d in ipairs(doors) do
+                local n, p = name(d), pos(d)
+                if n and n ~= "" and p then
+                    local dir, locked = W.doorState(d)
+                    if dir == 1 or dir == -1 then
+                        items[#items + 1] = string.format("D:%s:%d:%d:%.1f:%.1f:%.1f", W.doorNameHash(n), dir, locked and 1 or 0, p.x, p.y, p.z)
+                    end
+                end
+            end
+        end
+        local ents = {}
+        pcall(function() ents = System.GetEntitiesInSphere(c, r) or {} end)
+        for _, e in ipairs(ents) do
+            local dead, nm = false, nil
+            if KCD2MP_W177IsDeadNpc then dead, nm = KCD2MP_W177IsDeadNpc(e) end
+            local p = dead and pos(e)
+            if p then items[#items + 1] = string.format("C:%s:%.1f:%.1f:%.1f", nm, p.x, p.y, p.z) end
+        end
+        for nm in string.gmatch(tostring(corpsesCsv or ""), "[%w_]+") do
+            local e = nil
+            pcall(function() e = System.GetEntityByName(nm) end)
+            local p = e and e.actor and not isDead(e) and pos(e)
+            if p then items[#items + 1] = string.format("A:%s:%.1f:%.1f:%.1f", nm, p.x, p.y, p.z) end
+        end
+        local parts, cur, size = {}, {}, 0
+        for _, it in ipairs(items) do
+            if size + #it + 1 > 900 and #cur > 0 then parts[#parts + 1] = cur; cur, size = {}, 0 end
+            cur[#cur + 1] = it
+            size = size + #it + 1
+        end
+        parts[#parts + 1] = cur
+        for i, p in ipairs(parts) do
+            KCD2MP_EmitEvent("icd14_snap_part", string.format("%s %s %d %d %s", tostring(peer), tostring(sid), i, #parts, table.concat(p, " ")))
+        end
+        I.st.snapBuilt = I.st.snapBuilt + 1
+        if I.st.snapBuilt <= 20 or I.st.snapBuilt % 50 == 0 then
+            mp_log(string.format("ICD14-SNAP host: snapshot #%s for ghost %s why=%s at=(%.0f,%.0f,%.0f) r=%.0f items=%d parts=%d",
+                tostring(sid), tostring(peer), tostring(why), c.x, c.y, c.z, r, #items, #parts))
+        end
+        return #items
+    end
+
+    local function later(key, it, tries)
+        tries = (tries or 0) + 1
+        if tries > I.snapMaxTries then
+            I.later[key] = nil
+            I.st.snapNotFound = I.st.snapNotFound + 1
+            mp_log(string.format("ICD14-SNAP not found here after %d tries: %s -- left as it is", I.snapMaxTries, key))
+            return
+        end
+        I.later[key] = { it = it, tries = tries, dueAt = os.clock() + I.snapRetryS }
+    end
+
+    local applyItem   -- forward
+
+    local function applyDoor(it, tries)
+        local W = KCD2MP.w151
+        if not (W and W.findDoor and W.setDoor and W.doorState) then return end
+        local key = "D:" .. it.key
+        local door = W.findDoor(it.key, it.x, it.y, it.z)
+        if not door then later(key, it, tries); return end
+        I.later[key] = nil
+        local cur, curLocked = W.doorState(door)
+        if cur == it.dir and curLocked == it.locked then return end
+        if door.w151OwnAt and (os.clock() - door.w151OwnAt) < 3.0 then later(key, it, tries); return end   -- this player's own swing first
+        local ok = W.setDoor(door, it.dir, it.locked)
+        if ok then I.st.doorsFixed = I.st.doorsFixed + 1 end
+        mp_log(string.format("ICD14-SNAP door %s old=dir:%d,locked:%s new=dir:%d,locked:%s %s -- the host's world's door",
+            it.key, cur, tostring(curLocked), it.dir, tostring(it.locked), ok and "set" or "FAILED"))
+    end
+
+    local function applyDead(it, tries)
+        local key = "C:" .. it.npc
+        local e = nil
+        pcall(function() e = System.GetEntityByName(it.npc) end)
+        if not e then later(key, it, tries); return end
+        I.later[key] = nil
+        if isDead(e) or mp_is_excluded_npc_name(it.npc) or mp_is_mod_entity(e) then return end
+        if KCD2MP.npcDeathSync == false then return end   -- mp_npc_deathsync off: no death is applied from a peer
+        local now = os.clock()
+        if I.killAsked[it.npc] and (now - I.killAsked[it.npc]) < 20 then return end
+        I.killAsked[it.npc] = now
+        I.st.corpsesFixed = I.st.corpsesFixed + 1
+        mp_log(string.format("ICD14-SNAP corpse npc=%s old=alive new=dead at=(%.1f,%.1f,%.1f) -- dead in the host's world: its death is applied here",
+            it.npc, it.x, it.y, it.z))
+        KCD2MP_EmitEvent("icd14_kill", it.npc)
+    end
+
+    local function applyAlive(it)
+        local e = nil
+        pcall(function() e = System.GetEntityByName(it.npc) end)
+        if not (e and e.actor) or not isDead(e) then return end
+        if mp_is_excluded_npc_name(it.npc) or mp_is_mod_entity(e) then return end
+        if not KCD2MP_Icd14IsOn("corpse_revive") then
+            I.st.reviveWanted = I.st.reviveWanted + 1
+            if I.st.reviveWanted <= 20 or I.st.reviveWanted % 50 == 0 then
+                mp_log(string.format("ICD14-SNAP revive-wanted npc=%s old=dead new=alive -- alive in the host's world; mp_icd_corpse_revive is off: left dead here", it.npc))
+            end
+            return
+        end
+        local ok = pcall(function() e.actor:Revive(false) end)
+        local alive = not isDead(e)
+        if ok and alive then
+            I.st.revives = I.st.revives + 1
+            KCD2MP._npcDeathRemote[it.npc] = nil
+            KCD2MP._npcDeathAnnounced[it.npc] = nil
+            KCD2MP._npcDeathDiverged[it.npc] = nil
+        end
+        mp_log(string.format("ICD14-SNAP revive npc=%s old=dead new=%s ok=%s -- alive in the host's world (the engine's Revive)", it.npc, alive and "alive" or "dead", tostring(ok)))
+    end
+
+    applyItem = function(it, tries)
+        if it.kind == "D" then applyDoor(it, tries) elseif it.kind == "C" then applyDead(it, tries) elseif it.kind == "A" then applyAlive(it) end
+    end
+
+    local NUM = "(%-?[%d%.]+)"
+    local function parseItem(tok)
+        local k, dir, lk, x, y, z = tok:match("^D:(d%x+):(%-?%d+):([01]):" .. NUM .. ":" .. NUM .. ":" .. NUM .. "$")
+        if k then return { kind = "D", key = k, dir = tonumber(dir), locked = lk == "1", x = tonumber(x), y = tonumber(y), z = tonumber(z) } end
+        local kind, nm
+        kind, nm, x, y, z = tok:match("^([CA]):([%w_]+):" .. NUM .. ":" .. NUM .. ":" .. NUM .. "$")
+        if kind then return { kind = kind, npc = nm, x = tonumber(x), y = tonumber(y), z = tonumber(z) } end
+        return nil
+    end
+
+    -- Joiner: one part of the host's snapshot (the agent: only in this world, never in a load, a skip or a cutscene).
+    function KCD2MP_Icd14SnapApply(sid, part, nparts, items)
+        if not (KCD2MP_Icd14IsOn("area_snapshot") and joiner()) then return 0 end
+        I.st.snapParts = I.st.snapParts + 1
+        local n = 0
+        for tok in string.gmatch(tostring(items or ""), "%S+") do
+            local it = parseItem(tok)
+            if it then applyItem(it, 0); n = n + 1 end
+        end
+        if tonumber(part) == tonumber(nparts) then I.st.snapApplied = I.st.snapApplied + 1 end
+        return n
+    end
+
+    -- WO-151's door apply found no such door: kept for a retry (it may stream in later).
+    function KCD2MP_Icd14DoorLater(key, dir, locked, x, y, z)
+        if not (KCD2MP_Icd14IsOn("area_snapshot") and joiner()) or not tostring(key):match("^d%x+$") then return end
+        local k = "D:" .. tostring(key)
+        if I.later[k] then return end
+        later(k, { kind = "D", key = tostring(key), dir = tonumber(dir) or 0, locked = locked == true, x = x, y = y, z = z }, 0)
+    end
+
+    local function retries(now)
+        for k, l in pairs(I.later) do
+            if now >= l.dueAt then
+                I.st.snapRetries = I.st.snapRetries + 1
+                I.later[k] = nil
+                applyItem(l.it, l.tries)
+            end
+        end
+    end
+
+    function KCD2MP_Icd14Tick(gen)
+        if gen and gen ~= I.gen then return end
+        local now = os.clock()
+        local isJ, isH = joiner(), host()
+        if isJ and KCD2MP_Icd14IsOn("area_snapshot") then
+            local pp = pos(player)
+            local why = nil
+            if not I.wasJoiner then why = "join"
+            elseif pp and I.lastAskPos and ((pp.x - I.lastAskPos.x) ^ 2 + (pp.y - I.lastAskPos.y) ^ 2) > I.snapMoveM * I.snapMoveM then why = "moved"
+            elseif now - (I.lastAskAt or -1e9) >= I.snapEveryS then why = "periodic" end
+            if why then KCD2MP_Icd14SnapAsk(why) end
+            retries(now)
+        elseif not isJ then
+            I.later = {}
+        end
+        I.wasJoiner = isJ
+        if KCD2MP_Icd14IsOn("crime_ledger") and crimeSession() then
+            local due = now - (I.st.crimeLastSweepAt or -1e9) >= I.crimeEveryS
+            for i = #I.crimeFollow, 1, -1 do if now >= I.crimeFollow[i] then table.remove(I.crimeFollow, i); due = true end end
+            if due then KCD2MP_Icd14CrimeSweep("periodic") end
+        else
+            I.crimeFollow = {}
+        end
+        if (isJ or isH) and now - (I.healthAt or -1e9) >= I.healthEveryS then I.healthAt = now; KCD2MP_Icd14Health() end
+        if (isJ or isH) and now - (I.cfgAt or -1e9) >= I.cfgEveryS then
+            I.cfgAt = now
+            for k in pairs(I.NAMES) do KCD2MP_EmitEvent("icd14_cfg", k .. "=" .. (KCD2MP_Icd14IsOn(k) and "on" or "off")) end
+        end
+        Script.SetTimer(I.tickS * 1000, function() KCD2MP_Icd14Tick(gen) end)
+    end
+
+    -- A load re-creates the world: nothing asked or kept before it counts, and the next tick asks again ("join").
+    function KCD2MP_Icd14Arm()
+        I.gen = I.gen + 1
+        I.later, I.killAsked, I.crimeFollow, I.wasJoiner = {}, {}, {}, false
+        KCD2MP_Icd14Tick(I.gen)
+    end
+
+    System.AddCCommand("mp_icd_status", "KCD2MP_Icd14Status()", "KCT fix (icd14): the switches and the MP-HEALTH numbers of the host-authoritative world")
+    for k, label in pairs(I.NAMES) do
+        local fname = "KCD2MP_Icd14Set_" .. k
+        _G[fname] = function(arg) return KCD2MP_Icd14Set(k, arg) end
+        System.AddCCommand(label, fname .. "(%line)", "KCT fix (icd14) " .. (I.HELP[k] or k) .. " (default " .. (I.DEFAULT_OFF[k] and "off" or "on") .. "): " .. label .. " on|off")
+    end
+    KCD2MP_Icd14Arm()
+end
+
 -- ===== WO-177 B3: a working NPC's tool swing is no damage on a partner's figure =====
 -- The tester (0.48.6): the blacksmith used the anvil at the same time as the guest and his hammer hurt the guest. The hammer's blow reaches the
 -- hit chokepoint like any weapon's (an NPC's hit on a figure, measured and put back by the DLL, then forwarded to the partner). A fight is what
@@ -19605,6 +20006,7 @@ function KCD2MP_W139Report(kind, x, y, z, victim, cls, where)
     mp_log(string.format("WO139-CRIME %s where=%s victim=%s item=%s at=(%.1f,%.1f,%.1f) -- sent to the host's world",
         kind, tostring(where), victim, cls, x, y, z))
     KCD2MP_EmitEvent("w139_crime", string.format("%s %.2f %.2f %.2f %s %s %s", kind, x, y, z, victim, cls, tostring(where)))
+    if KCD2MP_Icd14CrimeSeen then pcall(KCD2MP_Icd14CrimeSeen, kind) end   -- KCT fix (icd14): the host's ledger only -- this world's witnesses forget it
     return true
 end
 
@@ -19977,6 +20379,7 @@ function KCD2MP_W139Stop(id, guard, crimesCsv)
         if what then planted[#planted + 1] = what end
     end
     w.stop.planted = planted
+    if KCD2MP.icd14 then KCD2MP.icd14.st.crimePlanted = KCD2MP.icd14.st.crimePlanted + #planted end   -- KCT fix (icd14)
     mp_log(string.format("WO139-STOP planted guard=%s id=%s %s -- in the guard's own memory (the local player's crimes)",
         guard, tostring(id), #planted > 0 and table.concat(planted, ",") or "NOTHING (no crime the guard's tree can hold)"))
     if #planted == 0 then KCD2MP_W139StopEnd("nothing-planted", "nostop") end
@@ -20063,6 +20466,8 @@ function KCD2MP_W139StopEnd(why, result)
     local fighting = false
     pcall(function() fighting = e.soul:IsInCombatMode() == true end)
     local ended = ""
+    -- KCT fix (icd14): the stop consumes what it planted -- the guard copy forgets it (the host's ledger keeps what still stands)
+    local consumed = KCD2MP_Icd14StopConsumed and KCD2MP_Icd14StopConsumed(e, s, result) or false
     if e and (fighting or result == "fled" or result == "fought" or result == "attacked" or result == "died") then
         local t = W139.stim("stopFight")
         if t then
@@ -20073,6 +20478,14 @@ function KCD2MP_W139StopEnd(why, result)
         local guard = s.guard
         w.stopped[guard] = true
         Script.SetTimer(4500, function()
+            pcall(System.ExecuteCommand, "wh_ai_PauseNPC " .. guard)
+            KCD2MP.w139.stopped[guard] = os.clock() + KCD2MP.w139.stopReturnS
+        end)
+    elseif consumed then
+        -- KCT fix (icd14): its brain takes the forgetting first (1.5 s, WO-151 5.3's wake), then it is suspended
+        local guard = s.guard
+        w.stopped[guard] = true
+        Script.SetTimer(1500, function()
             pcall(System.ExecuteCommand, "wh_ai_PauseNPC " .. guard)
             KCD2MP.w139.stopped[guard] = os.clock() + KCD2MP.w139.stopReturnS
         end)
@@ -23216,6 +23629,7 @@ do   -- WO-175's do-block
         KCD2MP_W175Tick()
         if KCD2MP_W176Arm then KCD2MP_W176Arm() end   -- WO-176 A1: the figures' brain pause near a story fight
         if KCD2MP_W177CorpseArm then KCD2MP_W177CorpseArm() end
+        if KCD2MP_Icd14Arm then KCD2MP_Icd14Arm() end   -- KCT fix (icd14): the snapshot / crime chain (a load kills timer chains)
         if KCD2MP_W177CalmArm then KCD2MP_W177CalmArm() end   -- WO-177 B3: the calm-NPC list for the tool-swing gate   -- WO-177 B2: the corpse census chain (a load kills the timer chains)
         if w.health then KCD2MP_EmitEvent("w175_check", "load") end
         if KCD2MP_W178AfterLoad then pcall(KCD2MP_W178AfterLoad, why) end   -- WO-178 0.c: the draw probe
@@ -27293,6 +27707,7 @@ do
         W.doorApplying = false
         return ok
     end
+    W.setDoor = setDoor   -- KCT fix (icd14): the area snapshot's door apply (KCD2MP_Icd14SnapApply)
 
     -- Joiner: the host's door state.
     function KCD2MP_W151DoorApply(name, dir, locked, x, y, z, tries)
@@ -27301,6 +27716,8 @@ do
         if not door then
             W.doorStats.notFound = W.doorStats.notFound + 1
             if W.doorStats.notFound <= 10 then mp_log("WO151-DOOR the host's " .. tostring(name) .. ": no such door here") end
+            -- KCT fix (icd14): the door may stream in later -- kept for the area snapshot's retries (mp_icd_area_snapshot)
+            if KCD2MP_Icd14DoorLater then pcall(KCD2MP_Icd14DoorLater, tostring(name), tonumber(dir) or 0, tonumber(locked) == 1, tonumber(x) or 0, tonumber(y) or 0, tonumber(z) or 0) end
             return
         end
         -- this player's own swing still runs: the host's answer settles after it (at most 3 s)

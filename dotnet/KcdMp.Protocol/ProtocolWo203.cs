@@ -101,6 +101,8 @@ public static partial class Protocol
         W203FocusEdge => "focus-edge", W203TravelRoute => "travel-route", W203DigestCheckpoint => "digest-checkpoint", W203Epoch => "epoch",
         W203FigureHand => "figure-hand",
         W203Behind => "behind",
+        W203IcdQuestPush => "icd-quest-push", W203IcdQuestWant => "icd-quest-want", W203IcdQuestEntries => "icd-quest-entries",   // KCT fix (icd14)
+        W203IcdSnapAsk => "icd-snap-ask", W203IcdSnapPart => "icd-snap-part",
         _ => $"unknown-{k}",
     };
 
